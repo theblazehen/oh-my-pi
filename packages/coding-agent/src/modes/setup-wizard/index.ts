@@ -86,6 +86,7 @@ export async function runSetupWizard(
 		anchor: "top-left",
 		margin: 0,
 		fullscreen: true,
+		mouseTracking: "motion",
 	});
 	try {
 		await component.run();

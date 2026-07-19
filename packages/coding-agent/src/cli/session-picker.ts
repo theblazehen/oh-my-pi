@@ -103,6 +103,7 @@ export async function selectSession(
 		maxHeight: "100%",
 		margin: 0,
 		fullscreen: true,
+		mouseTracking: "motion",
 	});
 	ui.setFocus(selector);
 	ui.start();

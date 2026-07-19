@@ -115,6 +115,7 @@ export interface InteractiveModeContext {
 	modelCycleContainer: Container;
 	editor: CustomEditor;
 	editorContainer: Container;
+	hookWidgetContainerHud: Container;
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
 	statusLine: StatusLineComponent;

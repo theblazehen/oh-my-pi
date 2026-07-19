@@ -392,11 +392,15 @@ describe("SelectList.routeMouse", () => {
 
 	const baseEvent: SgrMouseEvent = {
 		button: 0,
+		buttonId: 0,
 		col: 0,
 		row: 0,
 		release: false,
 		wheel: null,
 		motion: false,
+		shift: false,
+		alt: false,
+		ctrl: false,
 		leftClick: false,
 	};
 

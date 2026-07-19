@@ -114,12 +114,10 @@ import { BUILTIN_SLASH_COMMAND_RESERVED_NAMES, buildTuiBuiltinSlashCommands } fr
 import { formatDuration } from "../slash-commands/helpers/format";
 import { STTController, type SttState } from "../stt";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
-import { formatTaskId } from "../task/render";
 import type { ConfiguredThinkingLevel } from "../thinking";
 import { tinyTitleClient } from "../tiny/title-client";
 import type { LspStartupServerInfo } from "../tools";
 import { normalizeLocalScheme } from "../tools/path-utils";
-import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
 import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
 import {
 	formatPhaseDisplayName,
@@ -156,11 +154,13 @@ import { CustomEditor } from "./components/custom-editor";
 import { DynamicBorder } from "./components/dynamic-border";
 import { ErrorBannerComponent } from "./components/error-banner";
 import type { EvalExecutionComponent } from "./components/eval-execution";
+import { FullscreenChatLayout, FullscreenTranscriptAggregate } from "./components/fullscreen-chat-layout";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent, HookSelectorSlider } from "./components/hook-selector";
 import { type PlanReviewAnnotationState, PlanReviewOverlay } from "./components/plan-review-overlay";
 import { StatusLineComponent } from "./components/status-line";
+import { renderSubagentHudLines, SubagentHudComponent } from "./components/subagent-hud";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import { TranscriptContainer } from "./components/transcript-container";
 import { WelcomeComponent, type LspServerInfo as WelcomeLspServerInfo } from "./components/welcome";
@@ -188,11 +188,7 @@ import {
 } from "./loop-limit";
 import { OAuthManualInputManager } from "./oauth-manual-input";
 import { countRunningSubagentBadgeAgents, getRunningSubagentBadgeRegistry } from "./running-subagent-badge";
-import {
-	type ObservableSession,
-	type SessionObserverChangeKind,
-	SessionObserverRegistry,
-} from "./session-observer-registry";
+import { type SessionObserverChangeKind, SessionObserverRegistry } from "./session-observer-registry";
 import { createSessionTeardown, type SessionTeardown } from "./session-teardown";
 import { runProviderSetupWizard } from "./setup-wizard/lazy";
 import { interruptHint } from "./shared";
@@ -377,58 +373,9 @@ class AnchoredLiveContainer extends Container implements NativeScrollbackLiveReg
  *  before it auto-clears, mirroring the todo HUD's auto-clear timer. */
 const MODEL_CYCLE_TRACK_CLEAR_MS = 4000;
 
-const SUBAGENT_HUD_VISIBLE_LIMIT = 8;
 const SUBAGENT_OBSERVER_UI_COALESCE_MS = 100;
 
-/**
- * Build the anchored subagent HUD block: a bold accent "Subagents" header plus
- * a bounded set of running-agent rows in the same `Id: description` shape the
- * inline task rows use (muted task preview when no description was given).
- * Layout mirrors the Todos HUD exactly: unindented header, then
- * `renderTreeList` rows (dim connectors) shifted right by one space.
- * Only detached background spawns are listed: a sync task call blocks the
- * parent turn and its inline tool block already renders progress live, and
- * eval `agent()` spawns are rendered by their own eval cell tree.
- * Returns an empty array when nothing is running so the container can clear.
- */
-export function renderSubagentHudLines(sessions: ObservableSession[], columns: number): string[] {
-	const running = sessions.filter(
-		session => session.kind === "subagent" && session.status === "active" && session.detached === true,
-	);
-	if (running.length === 0) return [];
-
-	const dot = theme.styledSymbol("status.done", "accent");
-	const visible = running.slice(0, SUBAGENT_HUD_VISIBLE_LIMIT);
-	const hiddenCount = running.length - visible.length;
-	const rows = renderTreeList(
-		{
-			items: visible,
-			expanded: true,
-			renderItem: session => {
-				const displayId = formatTaskId(session.id);
-				let line = `${dot} ${theme.fg("accent", theme.bold(displayId))}`;
-				const description = session.description?.trim() || session.progress?.description?.trim();
-				if (description) {
-					const budget = Math.max(TRUNCATE_LENGTHS.SHORT, columns - visibleWidth(displayId) - 10);
-					line += `${theme.fg("accent", ":")} ${theme.fg("accent", truncateToWidth(replaceTabs(description), budget))}`;
-				} else {
-					// No spawn description: fall back to a muted task preview, same as
-					// the inline task rows when a row has no label.
-					const taskPreview = session.progress?.task?.trim();
-					if (taskPreview) {
-						line += ` ${theme.fg("muted", truncateToWidth(replaceTabs(taskPreview), TRUNCATE_LENGTHS.SHORT))}`;
-					}
-				}
-				return line;
-			},
-		},
-		theme,
-	);
-	if (hiddenCount > 0) {
-		rows.push(theme.fg("dim", `… ${hiddenCount} more running — open Agent Hub for full list`));
-	}
-	return ["", theme.bold(theme.fg("accent", "Subagents")), ...rows.map(line => ` ${line}`)];
-}
+export { renderSubagentHudLines };
 
 const CTRL_L_APPEARANCE_RESPONSE_DEADLINE_MS = 2000;
 
@@ -445,13 +392,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	pendingMessagesContainer: Container;
 	statusContainer: Container;
 	todoContainer: Container;
-	subagentContainer: Container;
+	subagentContainer: SubagentHudComponent;
 	btwContainer: Container;
 	omfgContainer: Container;
 	errorBannerContainer: Container;
 	modelCycleContainer: Container;
 	editor: CustomEditor;
 	editorContainer: Container;
+	hookWidgetContainerHud: Container;
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
 	statusLine: StatusLineComponent;
@@ -667,6 +615,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#mcpConnectedServers = new Set<string>();
 	#mcpFailedServers = new Map<string, string>();
 	#welcomeComponent?: WelcomeComponent;
+	#fullscreenChatLayout?: FullscreenChatLayout;
+	#fullscreenChatOverlayHandle?: OverlayHandle;
 	readonly #chatHost: ChatBlockHost = { requestRender: () => this.ui.requestRender() };
 
 	constructor(
@@ -723,7 +673,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.pendingMessagesContainer = new AnchoredLiveContainer();
 		this.statusContainer = new AnchoredLiveContainer();
 		this.todoContainer = new AnchoredLiveContainer();
-		this.subagentContainer = new AnchoredLiveContainer();
+		this.subagentContainer = new SubagentHudComponent({
+			onAgent: id => {
+				void this.focusAgentSession(id).catch(error =>
+					this.showError(error instanceof Error ? error.message : String(error)),
+				);
+			},
+			onManager: () => this.showAgentHub(),
+		});
 		this.btwContainer = new AnchoredLiveContainer();
 		this.omfgContainer = new AnchoredLiveContainer();
 		this.errorBannerContainer = new AnchoredLiveContainer();
@@ -753,6 +710,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		} catch (error) {
 			logger.warn("History storage unavailable", { error: String(error) });
 		}
+		this.hookWidgetContainerHud = new Container();
 		this.hookWidgetContainerAbove = new Container();
 		this.hookWidgetContainerAbove.addChild(new Spacer(1));
 		this.hookWidgetContainerBelow = new Container();
@@ -931,9 +889,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		const startupQuiet = settings.get("startup.quiet");
 		this.#welcomeComponent = undefined;
 
+		const fullscreenChat = settings.get("tui.screenMode") === "fullscreen";
+		const transcriptRegion = new Container();
+		const mountTranscript = (component: Component): void => {
+			if (fullscreenChat) transcriptRegion.addChild(component);
+			else this.ui.addChild(component);
+		};
+
 		for (const warning of this.session.configWarnings) {
-			this.ui.addChild(new Text(theme.fg("warning", `Warning: ${warning}`), 1, 0));
-			this.ui.addChild(new Spacer(1));
+			mountTranscript(new Text(theme.fg("warning", `Warning: ${warning}`), 1, 0));
+			mountTranscript(new Spacer(1));
 		}
 
 		if (!startupQuiet) {
@@ -947,49 +912,91 @@ export class InteractiveMode implements InteractiveModeContext {
 			);
 
 			// Setup UI layout
-			this.ui.addChild(new Spacer(1));
-			this.ui.addChild(this.#welcomeComponent);
-			this.ui.addChild(new Spacer(1));
+			mountTranscript(new Spacer(1));
+			mountTranscript(this.#welcomeComponent);
+			mountTranscript(new Spacer(1));
 			if (!options.suppressWelcomeIntro) {
 				this.playWelcomeIntro();
 			}
 
 			// Add changelog if provided
 			if (this.#startupChangelog && settings.get("startup.changelogMode") !== "hidden") {
-				this.ui.addChild(new DynamicBorder());
-				this.ui.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
-				this.ui.addChild(new Spacer(1));
+				mountTranscript(new DynamicBorder());
+				mountTranscript(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
+				mountTranscript(new Spacer(1));
 				if (settings.get("startup.changelogMode") === "summary") {
 					const summary = formatStartupChangelogSummary(this.#startupChangelog).replace(
 						/\/changelog(?: full)?/g,
 						command => theme.bold(command),
 					);
-					this.ui.addChild(new Text(summary, 1, 0));
+					mountTranscript(new Text(summary, 1, 0));
 				} else {
-					this.ui.addChild(new Markdown(this.#startupChangelog.markdown?.trim() ?? "", 1, 0, getMarkdownTheme()));
+					mountTranscript(new Markdown(this.#startupChangelog.markdown?.trim() ?? "", 1, 0, getMarkdownTheme()));
 				}
-				this.ui.addChild(new Spacer(1));
-				this.ui.addChild(new DynamicBorder());
+				mountTranscript(new Spacer(1));
+				mountTranscript(new DynamicBorder());
 			}
 		}
 
-		this.ui.addChild(this.chatContainer);
-		this.ui.addChild(this.pendingMessagesContainer);
-		this.ui.addChild(this.todoContainer);
-		this.ui.addChild(this.subagentContainer);
-		this.ui.addChild(this.btwContainer);
-		this.ui.addChild(this.omfgContainer);
-		this.ui.addChild(this.errorBannerContainer);
-		this.ui.addChild(this.modelCycleContainer);
-		// Working loader / transient status sits below the sticky todo + subagent
-		// HUDs, just above the editor's hook-widget top margin — so it reads next to
-		// the prompt while keeping the one-line gap above the editor.
-		this.ui.addChild(this.statusContainer);
-		this.ui.addChild(this.statusLine); // Only renders hook statuses (main status in editor border)
-		this.ui.addChild(this.hookWidgetContainerAbove);
-		this.ui.addChild(this.editorContainer);
-		this.ui.addChild(this.hookWidgetContainerBelow);
-		this.ui.setFocus(this.editor);
+		if (fullscreenChat) {
+			transcriptRegion.addChild(this.chatContainer);
+			this.#fullscreenChatLayout = new FullscreenChatLayout({
+				transcript: new FullscreenTranscriptAggregate(transcriptRegion.children),
+				maxTranscriptRows: settings.get("tui.maxTranscriptRows"),
+				wheelScrollRows: settings.get("tui.wheelScrollRows"),
+				copyText: text => {
+					void copyToClipboard(text);
+					this.showStatus(`Copied ${text.length.toLocaleString()} characters`);
+				},
+				beforeEditor: [
+					this.pendingMessagesContainer,
+					this.todoContainer,
+					this.hookWidgetContainerHud,
+					this.subagentContainer,
+					this.btwContainer,
+					this.omfgContainer,
+					this.errorBannerContainer,
+					this.modelCycleContainer,
+					this.statusContainer,
+					this.statusLine,
+					this.hookWidgetContainerAbove,
+				],
+				editorHost: this.editorContainer,
+				isEditorHostFocusTarget: (component: Component) => this.editorContainer.children.includes(component),
+				editor: this.editor,
+				afterEditor: [this.hookWidgetContainerBelow],
+				getTerminalRows: () => this.ui.terminal.rows,
+				requestRender: () => this.ui.requestRender(),
+			});
+			this.#fullscreenChatOverlayHandle = this.ui.showOverlay(this.#fullscreenChatLayout, {
+				anchor: "top-left",
+				width: "100%",
+				maxHeight: "100%",
+				margin: 0,
+				fullscreen: true,
+				mouseTracking: "drag",
+			});
+		} else {
+			transcriptRegion.addChild(this.chatContainer);
+			transcriptRegion.addChild(this.pendingMessagesContainer);
+			transcriptRegion.addChild(this.todoContainer);
+			transcriptRegion.addChild(this.hookWidgetContainerHud);
+			transcriptRegion.addChild(this.subagentContainer);
+			transcriptRegion.addChild(this.btwContainer);
+			transcriptRegion.addChild(this.omfgContainer);
+			transcriptRegion.addChild(this.errorBannerContainer);
+			transcriptRegion.addChild(this.modelCycleContainer);
+			this.ui.addChild(transcriptRegion);
+			// Working loader / transient status sits below the sticky todo + subagent
+			// HUDs, just above the editor's hook-widget top margin — so it reads next to
+			// the prompt while keeping the one-line gap above the editor.
+			this.ui.addChild(this.statusContainer);
+			this.ui.addChild(this.statusLine); // Only renders hook statuses (main status in editor border)
+			this.ui.addChild(this.hookWidgetContainerAbove);
+			this.ui.addChild(this.editorContainer);
+			this.ui.addChild(this.hookWidgetContainerBelow);
+		}
+		this.ui.setFocus(this.#fullscreenChatLayout ?? this.editor);
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
@@ -2179,10 +2186,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * the "active" state.
 	 */
 	#renderSubagentList(): void {
-		this.subagentContainer.clear();
-		const lines = renderSubagentHudLines(this.#observerRegistry.getSessions(), this.ui.terminal.columns);
-		if (lines.length === 0) return;
-		this.subagentContainer.addChild(new Text(lines.join("\n"), 1, 0));
+		this.subagentContainer.update(this.#observerRegistry.getSessions(), this.ui.terminal.columns);
 	}
 
 	async #loadTodoList(): Promise<void> {
@@ -3968,6 +3972,8 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	stop(): void {
 		this.#appearanceRefreshRequest = undefined;
+		this.#fullscreenChatOverlayHandle?.hide();
+		this.#fullscreenChatOverlayHandle = undefined;
 		if (this.loadingAnimation) {
 			this.#stopLoadingAnimation(false);
 		}
@@ -4116,7 +4122,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.editorContainer.clear();
 		this.editor = nextEditor;
 		this.editorContainer.addChild(nextEditor);
-		this.ui.setFocus(nextEditor);
+		this.#fullscreenChatLayout?.setEditor(nextEditor);
+		this.ui.setFocus(this.#fullscreenChatLayout ?? nextEditor);
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();

@@ -78,7 +78,7 @@ describe("emergencyTerminalRestore alt-screen gating", () => {
 		expect(restored).not.toContain("\x1b[?1049l");
 		expect(restored).toContain("\x1b[?1006l");
 		expect(restored).toContain("\x1b[?1003l");
-		expect(restored).toContain("\x1b[?1000l");
+		expect(restored).toContain("\x1b[?1002l");
 		// Still performs the blind restore itself (cursor visibility proves the branch ran).
 		expect(restored).toContain("\x1b[?25h");
 	});
@@ -96,7 +96,7 @@ describe("emergencyTerminalRestore alt-screen gating", () => {
 		expect(firstRestore.indexOf("\x1b[<u", altExit + 1)).toBeGreaterThan(altExit);
 		expect(firstRestore).toContain("\x1b[?1006l");
 		expect(firstRestore).toContain("\x1b[?1003l");
-		expect(firstRestore).toContain("\x1b[?1000l");
+		expect(firstRestore).toContain("\x1b[?1002l");
 
 		// State was consumed: a second restore must not leave the (now main) buffer again.
 		writes.length = 0;
@@ -112,7 +112,7 @@ describe("emergencyTerminalRestore alt-screen gating", () => {
 		expect(inactiveRestore).not.toContain("\x1b[?1049l");
 		expect(inactiveRestore).toContain("\x1b[?1006l");
 		expect(inactiveRestore).toContain("\x1b[?1003l");
-		expect(inactiveRestore).toContain("\x1b[?1000l");
+		expect(inactiveRestore).toContain("\x1b[?1002l");
 
 		const active = startCapturedTerminal();
 		setAltScreenActive(true);
@@ -122,7 +122,7 @@ describe("emergencyTerminalRestore alt-screen gating", () => {
 		expect(activeRestore).toContain("\x1b[?1049l");
 		expect(activeRestore).toContain("\x1b[?1006l");
 		expect(activeRestore).toContain("\x1b[?1003l");
-		expect(activeRestore).toContain("\x1b[?1000l");
+		expect(activeRestore).toContain("\x1b[?1002l");
 	});
 	it("pops keyboard enhancement frames on both screens when crashing from a fullscreen overlay", () => {
 		const { terminal, writes } = startCapturedTerminal();

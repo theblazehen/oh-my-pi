@@ -5,6 +5,9 @@ import {
 	type Component,
 	CURSOR_MARKER,
 	type Focusable,
+	ImageProtocol,
+	renderKittyPlaceholderLines,
+	setTerminalImageProtocol,
 	setTerminalScreenToScrollback,
 	TERMINAL,
 	TUI,
@@ -3255,6 +3258,62 @@ describe("TUI terminal-state regressions", () => {
 	});
 
 	describe("fullscreen overlay alt-screen", () => {
+		it("passes terminal image rows through the fullscreen compositor byte-exact", async () => {
+			const previousProtocol = TERMINAL.imageProtocol;
+			setTerminalImageProtocol(ImageProtocol.Kitty);
+			const [imageLine] = renderKittyPlaceholderLines({ imageId: 17, placementId: 4, columns: 2, rows: 1 });
+			const term = new VirtualTerminal(20, 3, 20);
+			const writes = captureWrites(term);
+			const tui = new TUI(term);
+			const imageComponent: Component = { render: () => [imageLine], invalidate: () => {} };
+
+			try {
+				tui.start();
+				const showFrom = writes.length;
+				tui.showOverlay(imageComponent, {
+					row: 0,
+					col: 0,
+					width: "100%",
+					maxHeight: "100%",
+					margin: 0,
+					fullscreen: true,
+				});
+				await settle(term);
+
+				const paint = writes.slice(showFrom).join("");
+				expect(TERMINAL.isImageLine(imageLine)).toBeTrue();
+				// The compositor may frame a row with EL and CRLF, but the image line
+				// itself must remain the exact contiguous payload returned by render().
+				expect(paint).toContain(`\x1b[2K${imageLine}\r\n`);
+			} finally {
+				tui.stop();
+				setTerminalImageProtocol(previousProtocol);
+			}
+		});
+
+		it("positions and shows the hardware cursor for a focused fullscreen editor", async () => {
+			const term = new VirtualTerminal(40, 8, 200);
+			const tui = new TUI(term);
+			const editor = new MutableLinesComponent([`prompt>abc${CURSOR_MARKER}`]);
+
+			try {
+				tui.start();
+				tui.showOverlay(editor, {
+					anchor: "bottom-center",
+					width: "100%",
+					maxHeight: "100%",
+					margin: 0,
+					fullscreen: true,
+					mouseTracking: "motion",
+				});
+				await settle(term);
+
+				expect(term.getCursor()).toEqual({ row: 7, col: 10 });
+			} finally {
+				tui.stop();
+			}
+		});
+
 		it("enters the alt buffer on show, leaves it on hide, and emits no ED3 while modal", async () => {
 			const term = new VirtualTerminal(40, 8, 200);
 			const writes = captureWrites(term);
@@ -3272,6 +3331,7 @@ describe("TUI terminal-state regressions", () => {
 					maxHeight: "100%",
 					margin: 0,
 					fullscreen: true,
+					mouseTracking: "motion",
 				});
 				await settle(term);
 
@@ -3282,10 +3342,11 @@ describe("TUI terminal-state regressions", () => {
 				// is per-screen, so without this Esc reverts to legacy bare \x1b
 				// inside fullscreen overlays (settings Esc bug).
 				expect(modalWrites).toContain("\x1b[?1049h\x1b[>1u");
-				// … enabled mouse tracking for click/scroll/hover support …
-				expect(modalWrites).toContain("\x1b[?1000h");
+				// … enabled any-motion tracking for click/scroll/hover support …
 				expect(modalWrites).toContain("\x1b[?1003h"); // any-motion tracking drives hover
 				expect(modalWrites).toContain("\x1b[?1006h");
+				expect(modalWrites).not.toContain("\x1b[?1000h");
+				expect(modalWrites).not.toContain("\x1b[?1002h");
 				// … and never erased scrollback (ED3) or otherwise touched the transcript.
 				expect(modalWrites).not.toContain("\x1b[3J");
 				expect(visible(term).some(line => line.includes("MODAL-0"))).toBeTrue();
@@ -3301,7 +3362,7 @@ describe("TUI terminal-state regressions", () => {
 				// Mouse tracking is disabled again so the rest of the app keeps native
 				// terminal selection.
 				expect(hideWrites).toContain("\x1b[?1003l"); // motion tracking torn down too
-				expect(hideWrites).toContain("\x1b[?1000l");
+				expect(hideWrites).toContain("\x1b[?1002l");
 				// Transcript is back on the normal screen after leaving the alt buffer.
 				expect(visible(term).some(line => line.includes("base-"))).toBeTrue();
 				expect(visible(term).some(line => line.includes("MODAL-0"))).toBeFalse();
@@ -3347,6 +3408,95 @@ describe("TUI terminal-state regressions", () => {
 				expect(hideWrites).not.toContain("\x1b[?1000l");
 				expect(hideWrites).not.toContain("\x1b[?1003l");
 				expect(hideWrites).not.toContain("\x1b[?1006l");
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("switches exact mouse modes as nested fullscreen overlays change", async () => {
+			const term = new VirtualTerminal(40, 8, 200);
+			const writes = captureWrites(term);
+			const tui = new TUI(term);
+
+			try {
+				tui.start();
+				const drag = tui.showOverlay(new MutableLinesComponent(["DRAG"]), {
+					fullscreen: true,
+					mouseTracking: "drag",
+				});
+				await settle(term);
+				const dragEnter = writes.join("");
+				expect(dragEnter).toContain("\x1b[?1049h\x1b[>1u\x1b[?1002h\x1b[?1006h");
+				expect(dragEnter).not.toContain("\x1b[?1003h");
+
+				const motionFrom = writes.length;
+				const motion = tui.showOverlay(new MutableLinesComponent(["MOTION"]), {
+					fullscreen: true,
+					mouseTracking: "motion",
+				});
+				await settle(term);
+				const motionEnter = writes.slice(motionFrom).join("");
+				expect(motionEnter).toContain("\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1003h\x1b[?1006h");
+				expect(motionEnter).not.toContain("\x1b[?1049h");
+
+				const resumeFrom = writes.length;
+				motion.hide();
+				await settle(term);
+				const resumeDrag = writes.slice(resumeFrom).join("");
+				expect(resumeDrag).toContain("\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1002h\x1b[?1006h");
+				expect(resumeDrag).not.toContain("\x1b[?1049l");
+
+				const exitFrom = writes.length;
+				drag.hide();
+				await settle(term);
+				const exit = writes.slice(exitFrom).join("");
+				expect(exit).toContain("\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[<u\x1b[?1049l");
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("tears down drag tracking before leaving the alternate screen on stop", async () => {
+			const term = new VirtualTerminal(40, 8, 200);
+			const writes = captureWrites(term);
+			const tui = new TUI(term);
+			tui.start();
+			tui.showOverlay(new MutableLinesComponent(["DRAG"]), {
+				fullscreen: true,
+				mouseTracking: "drag",
+			});
+			await settle(term);
+
+			const stopFrom = writes.length;
+			tui.stop();
+			const stopWrites = writes.slice(stopFrom).join("");
+			expect(stopWrites).toContain("\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[<u\x1b[?1049l");
+			expect(stopWrites).not.toContain("\x1b[?1000l");
+		});
+
+		it("brackets fullscreen component rendering with an image budget pass", async () => {
+			const term = new VirtualTerminal(40, 8, 200);
+			const tui = new TUI(term);
+			const calls: string[] = [];
+			vi.spyOn(tui.imageBudget, "beginPass").mockImplementation(() => calls.push("begin"));
+			vi.spyOn(tui.imageBudget, "endPass").mockImplementation(() => {
+				calls.push("end");
+				return false;
+			});
+			const component: Component = {
+				render: () => {
+					calls.push("render");
+					return ["IMAGE FRAME"];
+				},
+				invalidate: () => {},
+			};
+
+			try {
+				tui.start();
+				calls.length = 0;
+				tui.showOverlay(component, { fullscreen: true });
+				await settle(term);
+				expect(calls).toEqual(["begin", "render", "end"]);
 			} finally {
 				tui.stop();
 			}

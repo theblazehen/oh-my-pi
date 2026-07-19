@@ -963,6 +963,53 @@ export const SETTINGS_SCHEMA = {
 				"Wrap paths and URLs in OSC 8 hyperlinks for terminal-native click-to-open (auto: detect support; off: never; always: unconditional)",
 		},
 	},
+	"tui.screenMode": {
+		type: "enum",
+		values: ["retained", "fullscreen"] as const,
+		default: "retained",
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Screen Mode",
+			description:
+				"Fullscreen uses the alternate screen with app-owned scrolling and a pinned editor; retained preserves native terminal scrollback. Applies to the next session.",
+		},
+	},
+	"tui.maxTranscriptRows": {
+		type: "number",
+		default: 10_000,
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Fullscreen Transcript Rows",
+			description: "Maximum rendered physical rows retained in the fullscreen transcript",
+			options: [
+				{ value: "2000", label: "2,000 rows" },
+				{ value: "5000", label: "5,000 rows" },
+				{ value: "10000", label: "10,000 rows", description: "Default" },
+				{ value: "20000", label: "20,000 rows" },
+				{ value: "50000", label: "50,000 rows" },
+			],
+		},
+	},
+	"tui.wheelScrollRows": {
+		type: "number",
+		default: 2,
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Fullscreen Wheel Speed",
+			description: "Physical transcript rows scrolled per mouse-wheel event in fullscreen mode",
+			options: [
+				{ value: "1", label: "1 rendered line" },
+				{ value: "2", label: "2 rendered lines", description: "Default" },
+				{ value: "3", label: "3 rendered lines" },
+				{ value: "5", label: "5 rendered lines" },
+				{ value: "9", label: "9 rendered lines" },
+				{ value: "10", label: "10 rendered lines" },
+			],
+		},
+	},
 	"tui.tight": {
 		type: "boolean",
 		default: false,

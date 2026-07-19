@@ -47,6 +47,7 @@
     "gen:native:reset": "bun --cwd=../natives run gen:native:reset",
     "prepack": "bun run gen:tool-views && bun run gen:bundle",
     "bench:guard": "bun scripts/bench-guard.ts"
+    ,"test:screenshot:fullscreen": "vhs scripts/fullscreen-chat.tape"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "catalog:",

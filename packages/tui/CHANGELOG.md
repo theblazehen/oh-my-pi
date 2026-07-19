@@ -190,6 +190,14 @@
 - Fixed an issue where streamed diff code fences retained unhighlighted rows in native scrollback when long transient blocks left the viewport before finalization ([#5126](https://github.com/can1357/oh-my-pi/issues/5126)).
 - Fixed native Windows Terminal sessions failing to detect mid-run light/dark theme changes when Mode 2031 appearance notifications are unavailable ([#5091](https://github.com/can1357/oh-my-pi/issues/5091)).
 - Hid empty HTML comment separators in Markdown-rendered TUI output instead of displaying them literally ([#4911](https://github.com/can1357/oh-my-pi/issues/4911)).
+### Fixed
+
+- Fixed fullscreen alternate-screen views discarding focused component cursor markers, which left text editors without a visible hardware cursor.
+- Fixed render requests arriving during terminal settle being dropped until the next input event.
+
+### Changed
+
+- Added per-overlay drag or motion mouse tracking, richer SGR button/modifier events, and fullscreen image-budget accounting so persistent chat can select text without enabling idle hover traffic.
 
 ## [16.5.0] - 2026-07-13
 

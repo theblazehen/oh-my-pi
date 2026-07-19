@@ -1,4 +1,5 @@
 import { matchesKey } from "../keys";
+import { TERMINAL } from "../terminal-capabilities";
 import type { Component } from "../tui";
 import { Ellipsis, replaceTabs, truncateToWidth, visibleWidth } from "../utils";
 
@@ -189,6 +190,12 @@ export class ScrollView implements Component {
 		for (let row = 0; row < this.#height; row++) {
 			const sourceIndex = this.#totalRows === undefined ? this.#scrollOffset + row : row;
 			const source = this.#lines[sourceIndex] ?? "";
+			// Terminal image rows are indivisible protocol payloads. Width fitting,
+			// tab expansion, padding, or a scrollbar suffix corrupts their bytes.
+			if (TERMINAL.isImageLine(source)) {
+				lines.push(source);
+				continue;
+			}
 			const truncated = truncateToWidth(replaceTabs(source), contentWidth, this.#ellipsis);
 			if (!showScrollbar) {
 				lines.push(truncated);

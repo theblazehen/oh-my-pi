@@ -63,6 +63,7 @@ function toWireSelectOptions(options: ExtensionUISelectItem[]): CollabUiSelectIt
 
 export class ExtensionUiController {
 	#extensionTerminalInputUnsubscribers = new Set<() => void>();
+	#hookWidgetsHud = new Map<string, ExtensionUiComponent>();
 	#hookWidgetsAbove = new Map<string, ExtensionUiComponent>();
 	#hookWidgetsBelow = new Map<string, ExtensionUiComponent>();
 	// Single-file dialog surface (`editorContainer` + focus) is shared by the
@@ -307,6 +308,7 @@ export class ExtensionUiController {
 
 	setHookWidget(key: string, content: ExtensionWidgetContent, options?: ExtensionWidgetOptions): void {
 		const placement = options?.placement ?? "aboveEditor";
+		this.#removeHookWidget(this.#hookWidgetsHud, key);
 		this.#removeHookWidget(this.#hookWidgetsAbove, key);
 		this.#removeHookWidget(this.#hookWidgetsBelow, key);
 
@@ -315,7 +317,7 @@ export class ExtensionUiController {
 			return;
 		}
 
-		const target = placement === "belowEditor" ? this.#hookWidgetsBelow : this.#hookWidgetsAbove;
+		const target = placement === "hud" ? this.#hookWidgetsHud : placement === "belowEditor" ? this.#hookWidgetsBelow : this.#hookWidgetsAbove;
 		target.set(key, this.#createHookWidget(content));
 		this.#rebuildHookWidgets();
 	}
@@ -344,6 +346,7 @@ export class ExtensionUiController {
 	}
 
 	#rebuildHookWidgets(): void {
+		this.#renderHookWidgetContainer(this.ctx.hookWidgetContainerHud, this.#hookWidgetsHud, false, false, true);
 		this.#renderHookWidgetContainer(this.ctx.hookWidgetContainerAbove, this.#hookWidgetsAbove, true, true);
 		this.#renderHookWidgetContainer(this.ctx.hookWidgetContainerBelow, this.#hookWidgetsBelow, false, false);
 		this.ctx.ui.requestRender();
@@ -354,6 +357,7 @@ export class ExtensionUiController {
 		widgets: Map<string, ExtensionUiComponent>,
 		spacerWhenEmpty: boolean,
 		leadingSpacer: boolean,
+		trailingSpacer = false,
 	): void {
 		container.clear();
 
@@ -370,6 +374,7 @@ export class ExtensionUiController {
 		for (const widget of widgets.values()) {
 			container.addChild(widget);
 		}
+		if (trailingSpacer) container.addChild(new Spacer(1));
 	}
 
 	initializeHookRunner(uiContext: ExtensionUIContext, _hasUI: boolean): void {
@@ -1108,12 +1113,16 @@ export class ExtensionUiController {
 	}
 
 	clearHookWidgets(): void {
+		for (const widget of this.#hookWidgetsHud.values()) {
+			widget.dispose?.();
+		}
 		for (const widget of this.#hookWidgetsAbove.values()) {
 			widget.dispose?.();
 		}
 		for (const widget of this.#hookWidgetsBelow.values()) {
 			widget.dispose?.();
 		}
+		this.#hookWidgetsHud.clear();
 		this.#hookWidgetsAbove.clear();
 		this.#hookWidgetsBelow.clear();
 		this.#rebuildHookWidgets();

@@ -31,6 +31,7 @@ function restorePlatform(): void {
 
 class TallContent implements Component {
 	#lines: string[];
+	onRender: (() => void) | undefined;
 
 	constructor(rowCount: number) {
 		this.#lines = Array.from({ length: rowCount }, (_v, i) => `transcript row ${i.toString().padStart(5, "0")}`);
@@ -39,7 +40,50 @@ class TallContent implements Component {
 	invalidate(): void {}
 
 	render(width: number): string[] {
-		return this.#lines.map(line => line.slice(0, width));
+		const rendered = this.#lines.map(line => line.slice(0, width));
+		this.onRender?.();
+		return rendered;
+	}
+
+	setLastLine(line: string): void {
+		this.#lines[this.#lines.length - 1] = line;
+	}
+}
+
+class DeferredRenderScheduler implements RenderScheduler {
+	nowMs = 0;
+	readonly immediates: Array<() => void> = [];
+	readonly timers: Array<{ callback: () => void; delayMs: number; canceled: boolean }> = [];
+
+	now(): number {
+		return this.nowMs;
+	}
+
+	scheduleImmediate(callback: () => void): void {
+		this.immediates.push(callback);
+	}
+
+	scheduleRender(callback: () => void, delayMs: number): RenderTimer {
+		const timer = { callback, delayMs, canceled: false };
+		this.timers.push(timer);
+		return {
+			cancel: () => {
+				timer.canceled = true;
+			},
+		};
+	}
+
+	runImmediate(): void {
+		this.immediates.shift()?.();
+	}
+
+	runNextActiveTimer(): void {
+		let timer = this.timers.shift();
+		while (timer?.canceled) timer = this.timers.shift();
+		if (timer) {
+			this.nowMs += timer.delayMs;
+			timer.callback();
+		}
 	}
 }
 
@@ -78,6 +122,49 @@ describe("issue #2095: ConPTY post-full-paint settle prevents viewport drift", (
 		if (originalWslInterop === undefined) delete Bun.env.WSL_INTEROP;
 		else Bun.env.WSL_INTEROP = originalWslInterop;
 		vi.restoreAllMocks();
+	});
+
+	it("repaints changed content requested during settle without later input", () => {
+		setPlatform("win32");
+		const term = new VirtualTerminal(80, 24, 4096);
+		const scheduler = new DeferredRenderScheduler();
+		const content = new TallContent(200);
+		const tui = new TUI(term, undefined, { renderScheduler: scheduler });
+		tui.addChild(content);
+
+		try {
+			tui.start();
+			scheduler.runImmediate();
+			scheduler.runNextActiveTimer();
+
+			// The initial paint is exempt from settling. Force a subsequent
+			// overflowing full paint, which deterministically opens the window.
+			tui.requestRender(true, { clearScrollback: true });
+			scheduler.runImmediate();
+
+			// Re-enter a full paint while the first settle timer exists. During
+			// composition, snapshot the old content, then mutate and request an
+			// ordinary follow-up. The current paint therefore cannot show the
+			// mutation. Arming its extended settle cancels the original timer, so
+			// the ordinary scheduler flag must remember why a replacement is needed.
+			content.onRender = () => {
+				content.onRender = undefined;
+				content.setLastLine("changed during settle");
+				tui.requestRender();
+			};
+			tui.resetDisplay();
+			expect(term.getViewport().at(-1)?.trim()).not.toBe("changed during settle");
+
+			// The settle timer must retain the request and feed it back through
+			// the ordinary immediate/throttled scheduler, with no input afterward.
+			scheduler.runNextActiveTimer();
+			scheduler.runImmediate();
+			scheduler.runNextActiveTimer();
+
+			expect(term.getViewport().at(-1)?.trim()).toBe("changed during settle");
+		} finally {
+			tui.stop();
+		}
 	});
 
 	it("coalesces a 30 Hz spinner storm after a big sessionReplace paint into one trailing render on win32", async () => {

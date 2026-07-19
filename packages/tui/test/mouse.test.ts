@@ -18,25 +18,44 @@ describe("parseSgrMouse", () => {
 		const event = parseSgrMouse("\x1b[<0;5;9M");
 		expect(event).toEqual({
 			button: 0,
+			buttonId: 0,
 			col: 4,
 			row: 8,
 			release: false,
 			wheel: null,
 			motion: false,
+			shift: false,
+			alt: false,
+			ctrl: false,
 			leftClick: true,
 		});
 	});
 
-	it("decodes releases as non-clicks", () => {
-		const event = parseSgrMouse("\x1b[<0;5;9m");
-		expect(event?.release).toBe(true);
-		expect(event?.leftClick).toBe(false);
+	it("preserves button identity from press through drag and release", () => {
+		const press = parseSgrMouse("\x1b[<0;5;9M");
+		const drag = parseSgrMouse("\x1b[<32;7;10M");
+		const release = parseSgrMouse("\x1b[<0;7;10m");
+		expect(press).toMatchObject({ buttonId: 0, motion: false, release: false, leftClick: true });
+		expect(drag).toMatchObject({ buttonId: 0, motion: true, release: false, leftClick: false });
+		expect(release).toMatchObject({ buttonId: 0, motion: false, release: true, leftClick: false });
 	});
 
 	it("decodes wheel direction from the low button bit", () => {
 		expect(parseSgrMouse("\x1b[<64;1;1M")?.wheel).toBe(-1);
 		expect(parseSgrMouse("\x1b[<65;1;1M")?.wheel).toBe(1);
 		expect(parseSgrMouse("\x1b[<65;1;1M")?.leftClick).toBe(false);
+		expect(parseSgrMouse("\x1b[<65;1;1M")?.buttonId).toBeNull();
+	});
+
+	it("decodes modifiers independently of button and motion bits", () => {
+		const event = parseSgrMouse("\x1b[<61;10;3M"); // middle drag + shift + alt + ctrl
+		expect(event).toMatchObject({
+			buttonId: 1,
+			motion: true,
+			shift: true,
+			alt: true,
+			ctrl: true,
+		});
 	});
 
 	it("decodes motion reports without treating them as clicks", () => {
@@ -87,11 +106,15 @@ describe("routeSelectListMouse", () => {
 
 	const baseEvent: SgrMouseEvent = {
 		button: 0,
+		buttonId: 0,
 		col: 0,
 		row: 0,
 		release: false,
 		wheel: null,
 		motion: false,
+		shift: false,
+		alt: false,
+		ctrl: false,
 		leftClick: false,
 	};
 

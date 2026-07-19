@@ -12,6 +12,8 @@
 export interface SgrMouseEvent {
 	/** Raw button code (bit 32 = motion, bit 64 = wheel, low bits = button). */
 	button: number;
+	/** Physical button identity (0 left, 1 middle, 2 right), or null for wheel/no-button motion. */
+	buttonId: 0 | 1 | 2 | null;
 	/** 0-based column of the event. */
 	col: number;
 	/** 0-based row of the event. */
@@ -22,6 +24,10 @@ export interface SgrMouseEvent {
 	wheel: -1 | 1 | null;
 	/** True when the pointer moved (hover or drag) rather than clicked. */
 	motion: boolean;
+	/** Modifier state carried in the SGR button code. */
+	shift: boolean;
+	alt: boolean;
+	ctrl: boolean;
 	/** True for a left-button press (not motion, not release, not wheel). */
 	leftClick: boolean;
 }
@@ -40,8 +46,13 @@ export function parseSgrMouse(data: string): SgrMouseEvent | null {
 	const release = match[4] === "m";
 	const wheel = button & 64 ? ((button & 1 ? 1 : -1) as 1 | -1) : null;
 	const motion = (button & 32) !== 0 && wheel === null;
-	const leftClick = !release && wheel === null && !motion && (button & 3) === 0;
-	return { button, col, row, release, wheel, motion, leftClick };
+	const rawButtonId = button & 3;
+	const buttonId = wheel === null && rawButtonId < 3 ? (rawButtonId as 0 | 1 | 2) : null;
+	const shift = (button & 4) !== 0;
+	const alt = (button & 8) !== 0;
+	const ctrl = (button & 16) !== 0;
+	const leftClick = !release && wheel === null && !motion && buttonId === 0;
+	return { button, buttonId, col, row, release, wheel, motion, shift, alt, ctrl, leftClick };
 }
 
 /** Handler invoked with a decoded SGR event; returning `false` reports unhandled. */
