@@ -346,6 +346,7 @@ export class DebugSelectorComponent extends OverlayPanel {
 				maxHeight: "100%",
 				margin: 0,
 				fullscreen: true,
+				mouseTracking: "motion",
 			});
 			this.ctx.ui.setFocus(viewer);
 		} catch (err) {
@@ -377,6 +378,7 @@ export class DebugSelectorComponent extends OverlayPanel {
 			maxHeight: "100%",
 			margin: 0,
 			fullscreen: true,
+			mouseTracking: "motion",
 		});
 		this.ctx.ui.setFocus(viewer);
 		this.ctx.ui.requestRender();

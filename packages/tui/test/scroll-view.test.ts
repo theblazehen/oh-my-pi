@@ -1,5 +1,7 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { ScrollView } from "@oh-my-pi/pi-tui/components/scroll-view";
+import { renderKittyPlaceholderLines } from "@oh-my-pi/pi-tui/kitty-graphics";
+import { ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import { Ellipsis, visibleWidth } from "@oh-my-pi/pi-tui/utils";
 
 const theme = {
@@ -7,7 +9,24 @@ const theme = {
 	thumb: () => "B",
 };
 
+const originalImageProtocol = TERMINAL.imageProtocol;
+
+afterEach(() => {
+	setTerminalImageProtocol(originalImageProtocol);
+});
+
 describe("ScrollView", () => {
+	it("passes terminal image rows through byte-exact", () => {
+		setTerminalImageProtocol(ImageProtocol.Kitty);
+		const [imageLine] = renderKittyPlaceholderLines({ imageId: 7, placementId: 3, columns: 2, rows: 1 });
+		// Overflow engages the scrollbar path while a one-column viewport would
+		// otherwise truncate the payload to an ellipsis and append a bar glyph.
+		const view = new ScrollView([imageLine, "tail"], { height: 1, theme });
+
+		expect(TERMINAL.isImageLine(imageLine)).toBeTrue();
+		expect(view.render(1)).toEqual([imageLine]);
+	});
+
 	it("renders a fixed-height viewport and omits auto scrollbar when content fits", () => {
 		const view = new ScrollView(["one", "two"], { height: 3, theme });
 

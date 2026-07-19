@@ -80,13 +80,13 @@ const PAINT_BEGIN = `${HIDE_CURSOR}${SYNC_OUTPUT_BEGIN}${DISABLE_AUTOWRAP}`;
 const PAINT_END = `${ENABLE_AUTOWRAP}${SYNC_OUTPUT_END}`;
 const PAINT_BEGIN_NO_SYNC = `${HIDE_CURSOR}${DISABLE_AUTOWRAP}`;
 const PAINT_END_NO_SYNC = ENABLE_AUTOWRAP;
-// Mouse reporting is scoped to fullscreen overlays that opt into pointer
-// interaction. 1000h = button click tracking, 1003h = any-motion tracking for
-// hover targets, and 1006h = SGR extended coordinates past column/row 223.
-// Selection-first overlays leave these modes disabled so the terminal retains
-// native text selection.
-const MOUSE_TRACKING_ON = "\x1b[?1000h\x1b[?1003h\x1b[?1006h";
-const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1000l";
+// Mouse reporting is scoped to the top fullscreen overlay so the rest of the
+// app keeps native terminal selection. 1002 reports button press/drag/release;
+// 1003 additionally reports no-button hover motion. 1006 carries extended SGR
+// coordinates and button/modifier identity.
+const MOUSE_TRACKING_DRAG = "\x1b[?1002h\x1b[?1006h";
+const MOUSE_TRACKING_MOTION = "\x1b[?1003h\x1b[?1006h";
+const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1002l";
 
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
@@ -378,10 +378,11 @@ export interface OverlayOptions {
 	 */
 	fullscreen?: boolean;
 	/**
-	 * Enable terminal mouse reporting while fullscreen. Defaults on; disable it
-	 * when native terminal text selection takes precedence over pointer events.
+	 * Mouse reports requested while this fullscreen overlay is topmost. Defaults
+	 * to motion tracking; `true` retains that legacy default, while `false`
+	 * leaves native terminal text selection available.
 	 */
-	mouseTracking?: boolean;
+	mouseTracking?: boolean | "drag" | "motion";
 }
 
 /**
@@ -815,7 +816,6 @@ export class TUI extends Container {
 	// untouched, so exiting reconciles cleanly against the terminal-restored
 	// normal screen. #altPreviousLines is the last alt frame, for repaint-skip.
 	#altActive = false;
-	#altMouseTrackingActive = false;
 	#altPreviousLines: string[] = [];
 	#altEnterWidth = 0;
 	#altEnterHeight = 0;
@@ -824,6 +824,7 @@ export class TUI extends Container {
 	#suppressResizeUntil = 0;
 	#resizeScrollbackMode: ResizeScrollbackMode = TUI.#initialResizeScrollbackMode();
 	#resizeReplaySize: string | undefined;
+	#altMouseTracking: "drag" | "motion" | undefined;
 	// Holds an alternate-screen exit until its replacement full paint can emit it
 	// atomically. It must survive a deferred Ghostty image frame.
 	#pendingAltExit = "";
@@ -1647,12 +1648,12 @@ export class TUI extends Container {
 			setAltScreenActive(false);
 		}
 		if (this.#altActive || this.#pendingAltExit) {
-			const mouseExit = this.#altMouseTrackingActive ? MOUSE_TRACKING_OFF : "";
+			const mouseExit = this.#altMouseTracking ? MOUSE_TRACKING_OFF : "";
 			const exitSequence = this.#pendingAltExit || `${mouseExit}${this.#keyboardEnhancementExit()}\x1b[?1049l`;
 			this.terminal.write(exitSequence);
 			setAltScreenActive(false);
 			this.#altActive = false;
-			this.#altMouseTrackingActive = false;
+			this.#altMouseTracking = undefined;
 			this.#altPreviousLines = [];
 			this.#pendingAltExit = "";
 		}
@@ -2169,6 +2170,9 @@ export class TUI extends Container {
 		overlayWidth: number,
 		totalWidth: number,
 	): string {
+		// Image rows are indivisible terminal protocol payloads. An image overlay
+		// replaces the row; it must not be spliced with resets or padding.
+		if (TERMINAL.isImageLine(overlayLine)) return overlayLine;
 		if (TERMINAL.isImageLine(baseLine)) {
 			// Full-width overlays such as /switch are opaque: replace the
 			// Unicode placeholder cells so the image cannot cover the modal.
@@ -2591,25 +2595,33 @@ export class TUI extends Container {
 		// modal there; the normal screen and all accounting stay untouched.
 		const topOverlay = this.#getTopmostVisibleOverlay();
 		const wantAlt = topOverlay?.options?.fullscreen === true;
-		const wantMouseTracking = wantAlt && topOverlay.options?.mouseTracking !== false;
+		const requestedMouseTracking = topOverlay?.options?.mouseTracking;
+		const wantMouseTracking = wantAlt
+			? requestedMouseTracking === false
+				? undefined
+				: requestedMouseTracking === "drag"
+					? "drag"
+					: "motion"
+			: undefined;
 		if (wantAlt && !this.#altActive) {
 			// Enhanced keyboard modes can be buffer-local: re-push the active
 			// modified-key reporting sequence on the freshly entered alternate
 			// screen, or Esc/modified keys revert to legacy encoding inside
 			// fullscreen overlays (Ghostty/kitty/iTerm2).
-			const mouseEnter = wantMouseTracking ? MOUSE_TRACKING_ON : "";
-			this.terminal.write(`\x1b[?1049h${this.#keyboardEnhancementEnter()}${mouseEnter}`);
+			this.terminal.write(
+				`\x1b[?1049h${this.#keyboardEnhancementEnter()}${this.#mouseTrackingSequence(wantMouseTracking)}`,
+			);
 			setAltScreenActive(true);
 			this.terminal.hideCursor();
 			this.#forgetHardwareCursorState();
 			this.#recordHardwareCursorHidden();
 			this.#altActive = true;
-			this.#altMouseTrackingActive = wantMouseTracking;
 			this.#altPreviousLines = [];
 			this.#altEnterWidth = width;
 			this.#altEnterHeight = height;
+			this.#altMouseTracking = wantMouseTracking;
 		} else if (!wantAlt && this.#altActive) {
-			const mouseExit = this.#altMouseTrackingActive ? MOUSE_TRACKING_OFF : "";
+			const mouseExit = this.#altMouseTracking ? MOUSE_TRACKING_OFF : "";
 			const enhancementExit = this.#keyboardEnhancementExit();
 			const exitSequence = `${mouseExit}${enhancementExit}\x1b[?1049l`;
 			// Session replacement finishes while its fullscreen selector still
@@ -2623,7 +2635,7 @@ export class TUI extends Container {
 			}
 			this.#forgetHardwareCursorState();
 			this.#altActive = false;
-			this.#altMouseTrackingActive = false;
+			this.#altMouseTracking = undefined;
 			this.#altPreviousLines = [];
 			// The alt-buffer restore put the pre-overlay normal screen back. If
 			// that buffer resized while covered, its cursor moved with width
@@ -2637,9 +2649,9 @@ export class TUI extends Container {
 				}
 				this.#forceViewportRepaintOnNextRender = true;
 			}
-		} else if (wantMouseTracking !== this.#altMouseTrackingActive) {
-			this.terminal.write(wantMouseTracking ? MOUSE_TRACKING_ON : MOUSE_TRACKING_OFF);
-			this.#altMouseTrackingActive = wantMouseTracking;
+		} else if (wantAlt && this.#altActive && wantMouseTracking !== this.#altMouseTracking) {
+			this.terminal.write(`${MOUSE_TRACKING_OFF}${this.#mouseTrackingSequence(wantMouseTracking)}`);
+			this.#altMouseTracking = wantMouseTracking;
 		}
 		if (this.#altActive) {
 			this.#renderAltFrame(width, height);
@@ -2954,27 +2966,39 @@ export class TUI extends Container {
 		return this.terminal.kittyEnableSequence ? "\x1b[<u" : "";
 	}
 
+	#mouseTrackingSequence(mode: "drag" | "motion" | undefined): string {
+		if (mode === "drag") return MOUSE_TRACKING_DRAG;
+		if (mode === "motion") return MOUSE_TRACKING_MOTION;
+		return "";
+	}
 	/**
 	 * Compose and paint a single fullscreen overlay frame on the alt buffer.
-	 * Cursor markers are stripped (the modal draws its own in-band caret and
-	 * keeps the hardware cursor hidden), and only the modal is composited over a
-	 * blank base — the transcript is never touched while the alt buffer is up.
+	 * Cursor markers are stripped and the bottom-most visible marker positions
+	 * the hardware cursor. Modals without markers keep it hidden. Only the modal
+	 * is composited over a blank base — the transcript is never touched while
+	 * the alt buffer is up.
 	 */
 	#renderAltFrame(width: number, height: number): void {
 		// oxlint-disable-next-line unicorn/no-new-array -- alt-frame length preallocation
 		const base: string[] = new Array(Math.max(0, height)).fill("");
-		let lines = this.#compositeOverlaysIntoWindow(base, width, height);
-		this.#extractCursorMarkers(lines);
+		this.#imageBudget.beginPass();
+		let lines: string[];
+		try {
+			lines = this.#compositeOverlaysIntoWindow(base, width, height);
+		} finally {
+			this.#imageBudget.endPass();
+		}
+		const cursorPos = this.#extractCursorMarkers(lines)[0] ?? null;
 		lines = this.#prepareLinesArray(lines, width);
-		this.#emitAltFrame(lines, width, height);
+		this.#emitAltFrame(lines, width, height, cursorPos);
 	}
 
 	/**
 	 * Full per-row viewport rewrite on the alt buffer. Emits only sync-output
 	 * brackets, a cursor home, and per-row rewrites — never ED3 or any
-	 * native-scrollback byte. The hardware cursor stays hidden here.
+	 * native-scrollback byte.
 	 */
-	#emitAltFrame(lines: string[], width: number, height: number): void {
+	#emitAltFrame(lines: string[], width: number, height: number, cursorPos: { row: number; col: number } | null): void {
 		// oxlint-disable-next-line unicorn/no-new-array -- alt-frame length preallocation
 		const fitted: string[] = new Array(height);
 		for (let r = 0; r < height; r++) fitted[r] = lines[r] ?? "";
@@ -2996,6 +3020,10 @@ export class TUI extends Container {
 		// corrupted modal even when our cached frame is byte-identical.
 		const force = this.#forceViewportRepaintOnNextRender;
 		this.#forceViewportRepaintOnNextRender = false;
+		const target = this.#targetHardwareCursorState(cursorPos, height);
+		const cursorSequence = target
+			? `\x1b[${target.row + 1};${target.col + 1}H${target.visible ? "\x1b[?25h" : "\x1b[?25l"}`
+			: HIDE_CURSOR;
 		if (!force && this.#altPreviousLines.length === height) {
 			let same = true;
 			for (let r = 0; r < height; r++) {
@@ -3004,17 +3032,37 @@ export class TUI extends Container {
 					break;
 				}
 			}
-			if (same) return;
+			if (same) {
+				const previous = this.#hardwareCursorState;
+				if (target
+					? !previous || target.row !== previous.row || target.col !== previous.col || target.visible !== previous.visible
+					: previous?.visible !== false) {
+					this.terminal.write(HIDE_CURSOR + cursorSequence);
+					if (target) this.#recordHardwareCursorState(target);
+					else this.#recordHardwareCursorHidden();
+				}
+				this.#debugPaint = {
+					lines: fitted, windowTop: 0, altScreen: true,
+					...(target === null ? {} : { cursor: { x: target.col, y: target.row, visible: target.visible } }),
+				};
+				return;
+			}
 		}
 		let buffer = `${this.#paintBeginSequence}\x1b[H`;
 		for (let r = 0; r < height; r++) {
 			if (r > 0) buffer += "\r\n";
 			buffer += this.#lineRewriteSequence(fitted[r], width, r, -1, -1, this.#osc66SpacerGlyphWidth(fitted, r));
 		}
+		buffer += cursorSequence;
 		buffer += this.#paintEndSequence;
 		this.terminal.write(buffer);
+		if (target) this.#recordHardwareCursorState(target);
+		else this.#recordHardwareCursorState({ row: Math.max(0, height - 1), col: 0, visible: false });
 		this.#altPreviousLines = fitted;
-		this.#debugPaint = { lines: fitted, windowTop: 0, altScreen: true };
+		this.#debugPaint = {
+			lines: fitted, windowTop: 0, altScreen: true,
+			...(target === null ? {} : { cursor: { x: target.col, y: target.row, visible: target.visible } }),
+		};
 		this.#fullRedrawCount += 1;
 	}
 }

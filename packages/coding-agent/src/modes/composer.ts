@@ -514,6 +514,11 @@ export class Composer implements TerminalFrameProvider {
 		return this.#editor;
 	}
 
+	/** Stable header component shared with the fullscreen transcript surface. */
+	get header(): Component {
+		return this.#header;
+	}
+
 	/** The welcome component currently mounted in the header, if quiet mode is off. */
 	get welcome(): WelcomeComponent | undefined {
 		return this.#welcome;

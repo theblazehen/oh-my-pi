@@ -120,8 +120,6 @@ import { formatDuration } from "../slash-commands/helpers/format";
 import { STTController, type SttState } from "../stt";
 import { resolveCliEntryCmd } from "../subprocess/worker-client";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
-import { labelEchoesHandle } from "../task/label";
-import { agentTypeBadge, formatTaskId } from "../task/render";
 import type { ConfiguredThinkingLevel } from "../thinking";
 import { tinyTitleClient } from "../tiny/title-client";
 import { isMCPToolName } from "../tools/builtin-names";
@@ -170,6 +168,7 @@ import { DynamicBorder } from "./components/dynamic-border";
 import { EditorTopGap } from "./components/editor-top-gap";
 import { ErrorBannerComponent } from "./components/error-banner";
 import type { EvalExecutionComponent } from "./components/eval-execution";
+import { FullscreenChatLayout, FullscreenTranscriptAggregate } from "./components/fullscreen-chat-layout";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
 import type { HookSelectorComponent, HookSelectorSlider } from "./components/hook-selector";
@@ -177,6 +176,7 @@ import { type PlanReviewAnnotationState, PlanReviewOverlay } from "./components/
 import { PlanSaveOverlay, type PlanSaveOverlayResult } from "./components/plan-save-overlay";
 import { SessionInfoOverlay } from "./components/session-info-overlay";
 import { StatusLineComponent } from "./components/status-line";
+import { renderSubagentHudLines, SubagentHudComponent } from "./components/subagent-hud";
 import { stopSharedSpinnerTicker, type ToolExecutionHandle } from "./components/tool-execution";
 import { TranscriptContainer } from "./components/transcript-container";
 import type { LspServerInfo as WelcomeLspServerInfo } from "./components/welcome";
@@ -209,7 +209,6 @@ import {
 import { OAuthManualInputManager } from "./oauth-manual-input";
 import { getRunningSubagentBadgeAgentIds, getRunningSubagentBadgeRegistry } from "./running-subagent-badge";
 import {
-	type ObservableSession,
 	type SessionObserverChangeKind,
 	SessionObserverRegistry,
 } from "./session-observer-registry";
@@ -491,67 +490,9 @@ const DEFERRED_PREVIEW_VIEWPORT_FRACTION = 0.4;
  *  before it auto-clears, mirroring the todo HUD's auto-clear timer. */
 const MODEL_CYCLE_TRACK_CLEAR_MS = 4000;
 
-const SUBAGENT_HUD_VISIBLE_LIMIT = 8;
 const SUBAGENT_OBSERVER_UI_COALESCE_MS = 100;
 
-/**
- * Build the anchored subagent HUD block: a bold accent "Subagents" header plus
- * a bounded set of running-agent rows in the same `Id ⟨role⟩: description` shape
- * the inline task rows use (muted task preview when no description was given).
- * Layout mirrors the Todos HUD exactly: unindented header, then
- * `renderTreeList` rows (dim connectors) shifted right by one space.
- * Only detached background spawns are listed: a sync task call blocks the
- * parent turn and its inline tool block already renders progress live, and
- * eval `agent()` spawns are rendered by their own eval cell tree.
- * Returns an empty array when nothing is running so the container can clear.
- */
-export function renderSubagentHudLines(sessions: ObservableSession[], columns: number): string[] {
-	const running = sessions.filter(
-		session => session.kind === "subagent" && session.status === "active" && session.detached === true,
-	);
-	if (running.length === 0) return [];
-
-	const dot = theme.styledSymbol("status.done", "accent");
-	const visible = running.slice(0, SUBAGENT_HUD_VISIBLE_LIMIT);
-	const hiddenCount = running.length - visible.length;
-	const rows = renderTreeList(
-		{
-			items: visible,
-			expanded: true,
-			renderItem: session => {
-				const displayId = formatTaskId(session.id);
-				const role = session.agent ?? session.progress?.agent;
-				const badge = agentTypeBadge(role, theme);
-				let line = `${dot} ${theme.fg("accent", theme.bold(displayId))}${badge}`;
-				const description = session.description?.trim() || session.progress?.description?.trim();
-				const distinctDescription =
-					description && !labelEchoesHandle(session.id, description) ? description : undefined;
-				if (distinctDescription) {
-					const budget = Math.max(
-						TRUNCATE_LENGTHS.SHORT,
-						columns - visibleWidth(displayId) - visibleWidth(Bun.stripANSI(badge)) - 10,
-					);
-					const formatted = replaceTabs(distinctDescription).replace(/\s*[\r\n]+\s*/g, " ↵ ");
-					line += `${theme.fg("accent", ":")} ${theme.fg("accent", truncateToWidth(formatted, budget))}`;
-				} else {
-					// No spawn description: fall back to a muted task preview, same as
-					// the inline task rows when a row has no label.
-					const taskPreview = session.progress?.task?.trim();
-					if (taskPreview && !labelEchoesHandle(session.id, taskPreview)) {
-						const formatted = replaceTabs(taskPreview).replace(/\s*[\r\n]+\s*/g, " ↵ ");
-						line += ` ${theme.fg("muted", truncateToWidth(formatted, TRUNCATE_LENGTHS.SHORT))}`;
-					}
-				}
-				return line;
-			},
-		},
-		theme,
-	);
-	if (hiddenCount > 0) {
-		rows.push(theme.fg("dim", `… ${hiddenCount} more running — open Agent Hub for full list`));
-	}
-	return ["", theme.bold(theme.fg("accent", "Subagents")), ...rows.map(line => ` ${line}`)];
-}
+export { renderSubagentHudLines };
 
 const CTRL_L_APPEARANCE_RESPONSE_DEADLINE_MS = 2000;
 
@@ -573,7 +514,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Whether {@link statusContainer} rendered lines in the latest frame; the band composer's editor top gap collapses only then. */
 	statusRowOccupied = false;
 	todoContainer: Container;
-	subagentContainer: Container;
+	subagentContainer: SubagentHudComponent;
 	btwContainer: Container;
 	omfgContainer: Container;
 	cleanseContainer: Container;
@@ -584,6 +525,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	editorContainer: Container;
 	/** Composer attachment band (chip cards) rendered directly above the prompt box. */
 	attachmentChipsContainer: Container;
+	hookWidgetContainerHud: Container;
 	hookWidgetContainerAbove: Container;
 	hookWidgetContainerBelow: Container;
 	statusLine: StatusLineComponent;
@@ -838,6 +780,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#mcpPendingServers = new Set<string>();
 	#mcpConnectedServers = new Set<string>();
 	#mcpFailedServers = new Map<string, { error: string; sourcePath?: string }>();
+	#fullscreenChatLayout?: FullscreenChatLayout;
+	#fullscreenChatOverlayHandle?: OverlayHandle;
 	readonly #chatHost: ChatBlockHost = { requestRender: () => this.ui.requestRender() };
 
 	/** Root-scoped bus carrying this session tree's `task:subagent:*` frames. */
@@ -939,7 +883,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.pendingMessagesContainer = new AnchoredLiveContainer();
 		this.statusContainer = new StatusHudContainer(this);
 		this.todoContainer = new TodoHudContainer(this);
-		this.subagentContainer = new AnchoredLiveContainer();
+		this.subagentContainer = new SubagentHudComponent({
+			onAgent: id => {
+				void this.focusAgentSession(id).catch(error =>
+					this.showError(error instanceof Error ? error.message : String(error)),
+				);
+			},
+			onManager: () => this.showAgentHub(),
+		});
 		this.btwContainer = new AnchoredLiveContainer();
 		this.omfgContainer = new AnchoredLiveContainer();
 		this.cleanseContainer = new AnchoredLiveContainer();
@@ -972,6 +923,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		} catch (error) {
 			logger.warn("History storage unavailable", { error: String(error) });
 		}
+		this.hookWidgetContainerHud = new Container();
 		this.hookWidgetContainerAbove = new Container();
 		this.hookWidgetContainerAbove.addChild(new EditorTopGap(() => this.statusRowOccupied));
 		this.hookWidgetContainerBelow = new Container();
@@ -1207,6 +1159,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.chatContainer,
 			this.pendingMessagesContainer,
 			this.todoContainer,
+			this.hookWidgetContainerHud,
 			this.subagentContainer,
 			this.btwContainer,
 			this.omfgContainer,
@@ -1226,6 +1179,48 @@ export class InteractiveMode implements InteractiveModeContext {
 		]);
 		this.ui.setFocus(this.editor);
 		this.syncComposerShape();
+		if (settings.get("tui.screenMode") === "fullscreen") {
+			this.#fullscreenChatLayout = new FullscreenChatLayout({
+				transcript: new FullscreenTranscriptAggregate([this.composer.header, this.chatContainer]),
+				maxTranscriptRows: settings.get("tui.maxTranscriptRows"),
+				wheelScrollRows: settings.get("tui.wheelScrollRows"),
+				copyText: text => {
+					void copyToClipboard(text);
+					this.showStatus(`Copied ${text.length.toLocaleString()} characters`);
+				},
+				beforeEditor: [
+					this.pendingMessagesContainer,
+					this.todoContainer,
+					this.hookWidgetContainerHud,
+					this.subagentContainer,
+					this.btwContainer,
+					this.omfgContainer,
+					this.cleanseContainer,
+					this.errorBannerContainer,
+					this.modelCycleContainer,
+					this.deferredCommandContainer,
+					this.statusContainer,
+					this.statusLine,
+					this.attachmentChipsContainer,
+					this.hookWidgetContainerAbove,
+				],
+				editorHost: this.editorContainer,
+				isEditorHostFocusTarget: (component: Component) => this.editorContainer.children.includes(component),
+				editor: this.editor,
+				afterEditor: [this.hookWidgetContainerBelow],
+				getTerminalRows: () => this.ui.terminal.rows,
+				requestRender: () => this.ui.requestRender(),
+			});
+			this.#fullscreenChatOverlayHandle = this.ui.showOverlay(this.#fullscreenChatLayout, {
+				anchor: "top-left",
+				width: "100%",
+				maxHeight: "100%",
+				margin: 0,
+				fullscreen: true,
+				mouseTracking: "drag",
+			});
+			this.ui.setFocus(this.#fullscreenChatLayout);
+		}
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
@@ -2797,10 +2792,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * the "active" state.
 	 */
 	#renderSubagentList(): void {
-		this.subagentContainer.clear();
-		const lines = renderSubagentHudLines(this.#observerRegistry.getSessions(), this.ui.terminal.columns);
-		if (lines.length === 0) return;
-		this.subagentContainer.addChild(new Text(lines.join("\n"), 1, 0));
+		this.subagentContainer.update(this.#observerRegistry.getSessions(), this.ui.terminal.columns);
 	}
 
 	async #loadTodoList(source: AgentSession = this.session): Promise<void> {
@@ -4759,6 +4751,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#appearanceRefreshRequest = undefined;
 		// Last chance to refresh the startup status placeholder for the next launch.
 		this.#persistComposerStatus();
+		this.#fullscreenChatOverlayHandle?.hide();
+		this.#fullscreenChatOverlayHandle = undefined;
 		if (this.loadingAnimation) {
 			this.#stopLoadingAnimation(false);
 		}
@@ -4969,7 +4963,8 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.editorContainer.clear();
 		this.editorContainer.addChild(nextEditor);
-		this.ui.setFocus(nextEditor);
+		this.#fullscreenChatLayout?.setEditor(nextEditor);
+		this.ui.setFocus(this.#fullscreenChatLayout ?? nextEditor);
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();

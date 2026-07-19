@@ -9,6 +9,9 @@ import { __providerInFlightForTesting, streamSimple } from "@oh-my-pi/pi-ai/stre
 import type { Context } from "@oh-my-pi/pi-ai/types";
 import {
 	__physicalTargetSegmentsForTesting,
+	getDefault,
+	getEnumValues,
+	getUi,
 	onAppendOnlyModeChanged,
 	onCodeModeChanged,
 	onModelRolesChanged,
@@ -16,6 +19,7 @@ import {
 	resetSettingsForTest,
 	type SettingPath,
 	Settings,
+	type SettingValue,
 } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as discovery from "@oh-my-pi/pi-coding-agent/discovery";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
@@ -1082,6 +1086,34 @@ describe("Settings", () => {
 			} finally {
 				unsubscribe();
 			}
+		});
+
+		it("defaults to retained screen mode and exposes fullscreen display metadata", () => {
+			const screenMode: SettingValue<"tui.screenMode"> = getDefault("tui.screenMode");
+			const fullscreen: SettingValue<"tui.screenMode"> = "fullscreen";
+			const maxTranscriptRows: SettingValue<"tui.maxTranscriptRows"> = getDefault("tui.maxTranscriptRows");
+			const wheelScrollRows: SettingValue<"tui.wheelScrollRows"> = getDefault("tui.wheelScrollRows");
+
+			expect(screenMode).toBe("retained");
+			expect(fullscreen).toBe("fullscreen");
+			expect(maxTranscriptRows).toBe(10_000);
+			expect(wheelScrollRows).toBe(2);
+			expect(getEnumValues("tui.screenMode")).toEqual(["retained", "fullscreen"]);
+			expect(getUi("tui.screenMode")).toMatchObject({
+				tab: "appearance",
+				group: "Display",
+				label: "Screen Mode",
+			});
+			expect(getUi("tui.maxTranscriptRows")).toMatchObject({
+				tab: "appearance",
+				group: "Display",
+				label: "Fullscreen Transcript Rows",
+			});
+			expect(getUi("tui.wheelScrollRows")).toMatchObject({
+				tab: "appearance",
+				group: "Display",
+				label: "Fullscreen Wheel Speed",
+			});
 		});
 	});
 
