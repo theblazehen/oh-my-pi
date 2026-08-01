@@ -26,6 +26,7 @@ import taskAsyncContractTemplate from "../prompts/tools/task-async-contract.md" 
 import { TASK_EFFORTS, type TaskEffort } from "../thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { isIrcEnabled } from "../tools/hub";
+import type { ForkContextSnapshot } from "./executor";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
 import { isScoutSpawnable, resolveSpawnPolicy } from "./spawn-policy";
@@ -112,6 +113,7 @@ export type {
 	SubagentEventPayload,
 	SubagentLifecyclePayload,
 	SubagentProgressPayload,
+	TaskContextSource,
 	TaskParams,
 	TaskToolDetails,
 } from "./types";
@@ -215,6 +217,27 @@ function validateEffort(effort: TaskEffort | undefined, label: string): string |
 	return `${label} has an invalid \`effort\` value ${JSON.stringify(effort)}. Use "lo", "med", or "hi".`;
 }
 
+function validateContextSource(source: unknown, label: string): string | undefined {
+	if (source === undefined || source === "fresh" || source === "fork") return undefined;
+	return `${label} has an invalid \`source\` value ${JSON.stringify(source)}. Use "fresh" or "fork".`;
+}
+
+function validateContextSources(params: TaskParams): string | undefined {
+	const topLevelError = validateContextSource(params.source, "The call");
+	if (topLevelError) return topLevelError;
+	if (Array.isArray(params.tasks)) {
+		for (let i = 0; i < params.tasks.length; i++) {
+			const item = params.tasks[i];
+			const itemError = validateContextSource(
+				item?.source,
+				`Task ${i + 1}${item?.name ? ` (\`${item.name}\`)` : ""}`,
+			);
+			if (itemError) return itemError;
+		}
+	}
+	return undefined;
+}
+
 function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string | undefined {
 	const hasTask = typeof params.task === "string" && params.task.trim() !== "";
 	const tasks = params.tasks;
@@ -268,6 +291,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 		return params.tasks;
 	}
 	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task };
+	if ("source" in params) item.source = params.source;
 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
 	if ("tools" in params) item.tools = params.tools;
@@ -290,6 +314,8 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if (item.name !== undefined) spawn.name = item.name;
 	if (item.task !== undefined) spawn.task = item.task;
 	if (params.context !== undefined) spawn.context = params.context;
+	if ("source" in item) spawn.source = item.source;
+	else if ("source" in params) spawn.source = params.source;
 	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
 	if ("tools" in item) spawn.tools = item.tools;
@@ -307,6 +333,28 @@ interface SyncSpawnRef {
 	item: TaskItem;
 	index: number;
 	preAllocatedId?: string;
+}
+
+function captureForkContext(session: ToolSession): ForkContextSnapshot | undefined {
+	const manager = session.sessionManager;
+	if (!manager || typeof manager.forkBranch !== "function") return undefined;
+	const branch = manager.getBranch();
+	let sourceLeafId: string | null = null;
+	let foundAssistant = false;
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry?.type === "message" && entry.message.role === "assistant") {
+			foundAssistant = true;
+			sourceLeafId = entry.id;
+			break;
+		}
+	}
+	if (!foundAssistant && branch.length > 0) sourceLeafId = branch[branch.length - 1]!.id;
+	return {
+		sourceFile: session.getSessionFile(),
+		sourceLeafId,
+		sessionManager: manager,
+	};
 }
 
 /** Merged view of a sync spawn set's payloads: joined text plus flattened results/usage/paths. */
@@ -656,6 +704,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			assignment: (params.task ?? "").trim(),
 			context: this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined,
 			agent: params.agent,
+			contextSource: params.source,
 			...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 			...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 			...(params.effort !== undefined ? { effort: params.effort } : {}),
@@ -682,12 +731,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const params = repairTaskParams(rawParams as TaskParams);
+		const forkContext = captureForkContext(this.session);
 		// Schema defaults fill `agent` for model calls, but internal callers
 		// and stale transcripts can bypass arktype. `spawnParamsFor` resolves each
 		// item's agent type against the session's actual default agent.
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
 		const batchEnabled = this.#isBatchEnabled();
-		const validationError = validateShapeParams(batchEnabled, params) ?? validateSpawnParams(params, batchEnabled);
+		const validationError =
+			validateContextSources(params) ??
+			validateShapeParams(batchEnabled, params) ??
+			validateSpawnParams(params, batchEnabled);
 		if (validationError) {
 			return createTaskModeError(validationError);
 		}
@@ -774,6 +827,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const result = await this.#executeSyncFanout(
 				toolCallId,
 				params,
+				forkContext,
 				spawnItems.map((item, index) => ({ item, index })),
 				defaultAgent,
 				signal,
@@ -829,6 +883,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				await this.#executeSyncFanout(
 					toolCallId,
 					params,
+					forkContext,
 					spawnItems.map((item, index) => ({ item, index })),
 					defaultAgent,
 					signal,
@@ -895,24 +950,38 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		let failedCount = 0;
 		let primaryJobId = asyncSpawns[0].agentId;
 		const syncResults: SingleResult[] = [];
+		const asyncResults: SingleResult[] = [];
 		// oxlint-disable-next-line prefer-const -- read by buildAsyncDetails before assignment
 		let syncUsage: Usage | undefined;
-		// oxlint-disable-next-line prefer-const -- read by buildAsyncDetails before assignment
-		let syncOutputPaths: string[] | undefined;
+		let asyncUsage: Usage | undefined;
 		let syncProjectAgentsDir: string | null = null;
-		const buildAsyncDetails = (): TaskToolDetails => ({
-			projectAgentsDir: syncProjectAgentsDir,
-			results: [...syncResults],
-			totalDurationMs: Date.now() - callStartedAt,
-			usage: syncUsage,
-			outputPaths: syncOutputPaths,
-			progress: spawns.map(spawn => ({ ...spawn.progress })),
-			async: {
-				state: settledCount < asyncSpawns.length ? "running" : failedCount > 0 ? "failed" : "completed",
-				jobId: primaryJobId,
-				type: "task",
-			},
-		});
+		const buildAsyncDetails = (): TaskToolDetails => {
+			const results = [...syncResults, ...asyncResults].sort((a, b) => a.index - b.index);
+			const outputPaths = results.flatMap(result => (result.outputPath ? [result.outputPath] : []));
+			const usageTotals = createUsageTotals();
+			let hasUsage = false;
+			if (syncUsage) {
+				addUsageTotals(usageTotals, syncUsage);
+				hasUsage = true;
+			}
+			if (asyncUsage) {
+				addUsageTotals(usageTotals, asyncUsage);
+				hasUsage = true;
+			}
+			return {
+				projectAgentsDir: syncProjectAgentsDir,
+				results,
+				totalDurationMs: Date.now() - callStartedAt,
+				usage: hasUsage ? usageTotals : undefined,
+				outputPaths: outputPaths.length > 0 ? outputPaths : undefined,
+				progress: spawns.map(spawn => ({ ...spawn.progress })),
+				async: {
+					state: settledCount < asyncSpawns.length ? "running" : failedCount > 0 ? "failed" : "completed",
+					jobId: primaryJobId,
+					type: "task",
+				},
+			};
+		};
 
 		const started: Array<{ agentId: string; jobId: string }> = [];
 		const failedSchedules: string[] = [];
@@ -922,11 +991,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					manager,
 					toolCallId,
 					spawnParams: spawnParamsFor(params, spawn.item, defaultAgent),
+					forkContext,
 					agentId: spawn.agentId,
 					progress: spawn.progress,
 					ircEnabled,
 					buildDetails: buildAsyncDetails,
 					onUpdate,
+					onResult: result => {
+						const orderedResult = { ...result, index: spawn.index };
+						asyncResults.push(orderedResult);
+						if (orderedResult.usage) {
+							asyncUsage ??= createUsageTotals();
+							addUsageTotals(asyncUsage, orderedResult.usage);
+						}
+					},
 					onSettled: failed => {
 						settledCount += 1;
 						if (failed) failedCount += 1;
@@ -1019,6 +1097,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const payloads = await this.#runSyncSpawns({
 			toolCallId,
 			params,
+			forkContext,
 			defaultAgent,
 			signal,
 			spawns: syncSpawns.map(spawn => ({ item: spawn.item, index: spawn.index, preAllocatedId: spawn.agentId })),
@@ -1039,7 +1118,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		);
 		syncResults.push(...merged.results);
 		syncUsage = merged.usage;
-		syncOutputPaths = merged.outputPaths;
 		syncProjectAgentsDir = merged.projectAgentsDir;
 		// Settle the inline spawns' progress rows from their merged results so
 		// post-return job updates carry final statuses, not the last snapshot.
@@ -1081,15 +1159,28 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		manager: AsyncJobManager;
 		toolCallId: string;
 		spawnParams: TaskParams;
+		forkContext?: ForkContextSnapshot;
 		agentId: string;
 		progress: AgentProgress;
 		ircEnabled: boolean;
 		buildDetails: () => TaskToolDetails;
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>;
+		onResult?: (result: SingleResult) => void;
 		onSettled?: (failed: boolean) => void;
 	}): string {
-		const { manager, toolCallId, spawnParams, agentId, progress, ircEnabled, buildDetails, onUpdate, onSettled } =
-			options;
+		const {
+			manager,
+			toolCallId,
+			spawnParams,
+			forkContext,
+			agentId,
+			progress,
+			ircEnabled,
+			buildDetails,
+			onUpdate,
+			onResult,
+			onSettled,
+		} = options;
 		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
 			if (aborted) {
 				const ref = AgentRegistry.global().get(agentId);
@@ -1178,6 +1269,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					const result = await this.#executeSync(
 						toolCallId,
 						spawnParams,
+						forkContext,
 						runSignal,
 						forwardSyncProgress,
 						agentId,
@@ -1221,6 +1313,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						delete progress.resolvedModel;
 						delete progress.resolvedModelIsFallback;
 					}
+					if (singleResult) onResult?.(singleResult);
 					onSettled?.(resultFailed);
 					const statusText = resultFailed
 						? `Background task ${agentId} failed.`
@@ -1270,6 +1363,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	async #executeSyncFanout(
 		toolCallId: string,
 		params: TaskParams,
+		forkContext: ForkContextSnapshot | undefined,
 		spawns: SyncSpawnRef[],
 		defaultAgent: string,
 		signal?: AbortSignal,
@@ -1285,6 +1379,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				return await this.#executeSync(
 					toolCallId,
 					spawnParamsFor(params, spawn.item, defaultAgent),
+					forkContext,
 					signal,
 					onUpdate,
 					spawn.preAllocatedId,
@@ -1316,6 +1411,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const payloads = await this.#runSyncSpawns({
 			toolCallId,
 			params,
+			forkContext,
 			defaultAgent,
 			signal,
 			spawns,
@@ -1351,12 +1447,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	async #runSyncSpawns(args: {
 		toolCallId: string;
 		params: TaskParams;
+		forkContext: ForkContextSnapshot | undefined;
 		defaultAgent: string;
 		spawns: SyncSpawnRef[];
 		signal?: AbortSignal;
 		onItemProgress?: (index: number, progress: AgentProgress) => void;
 	}): Promise<(AgentToolResult<TaskToolDetails> | undefined)[]> {
-		const { toolCallId, params, defaultAgent, spawns, signal, onItemProgress } = args;
+		const { toolCallId, params, forkContext, defaultAgent, spawns, signal, onItemProgress } = args;
 		const semaphore = this.#getSpawnSemaphore();
 		const { results } = await mapWithConcurrencyLimitAllSettled(
 			spawns,
@@ -1382,6 +1479,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					return await this.#executeSync(
 						toolCallId,
 						spawnParamsFor(params, spawn.item, defaultAgent),
+						forkContext,
 						workerSignal,
 						itemOnUpdate,
 						spawn.preAllocatedId,
@@ -1421,6 +1519,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	async #executeSync(
 		toolCallId: string,
 		params: TaskParams,
+		forkContext: ForkContextSnapshot | undefined,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 		preAllocatedId?: string,
@@ -1432,6 +1531,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return this.#runSpawn(
 			toolCallId,
 			params,
+			forkContext,
 			signal,
 			onUpdate,
 			preAllocatedId,
@@ -1446,6 +1546,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	async #runSpawn(
 		toolCallId: string,
 		params: TaskParams,
+		forkContext: ForkContextSnapshot | undefined,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 		preAllocatedId?: string,
@@ -1465,6 +1566,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				assignment,
 				context,
 				agent: params.agent,
+				contextSource: params.source,
+				forkContext,
 				...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 				...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 				...(params.effort !== undefined ? { effort: params.effort } : {}),

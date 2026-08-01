@@ -23,7 +23,7 @@ import { isIrcEnabled } from "../tools/hub";
 import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
-import { type ExecutorOptions, runSubprocess } from "./executor";
+import { type ExecutorOptions, type ForkContextSnapshot, runSubprocess } from "./executor";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -41,6 +41,7 @@ import {
 	canSpawnAtDepth,
 	type SingleResult,
 	type StructuredSubagentOutput,
+	type TaskContextSource,
 } from "./types";
 import type { WorkPoolYieldItem } from "./workpool-yield";
 import { type NestedRepoPatch, parseIsolationBackend } from "./worktree";
@@ -86,6 +87,9 @@ export interface StructuredSubagentRequest {
 	invocationKind: "task" | "eval";
 	assignment: string;
 	context?: string;
+	/** Requested task context source and its scheduling-time parent snapshot. */
+	contextSource?: TaskContextSource;
+	forkContext?: ForkContextSnapshot;
 	agent?: string;
 	model?: string | string[];
 	/** Presence, rather than truthiness, makes this the highest-priority schema. */
@@ -410,6 +414,8 @@ function buildExecutorOptions(
 		task: renderSubagentPrompt(request.assignment),
 		assignment: request.assignment.trim(),
 		context: request.context?.trim() || undefined,
+		contextSource: request.contextSource,
+		forkContext: request.forkContext,
 		planReference: undefined,
 		// Task `name` is the spawn handle (id allocation). Eval `label` is a
 		// real UI description. Copy it only for eval so generateTaskLabel can run.

@@ -4,7 +4,10 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { Component, Focusable, MouseRoutable, SgrMouseEvent } from "@oh-my-pi/pi-tui";
 import { resetSettingsForTest, Settings } from "../../../src/config/settings";
 import { AssistantMessageComponent } from "../../../src/modes/components/assistant-message";
-import { FullscreenChatLayout, FullscreenTranscriptAggregate } from "../../../src/modes/components/fullscreen-chat-layout";
+import {
+	FullscreenChatLayout,
+	FullscreenTranscriptAggregate,
+} from "../../../src/modes/components/fullscreen-chat-layout";
 import { TranscriptContainer } from "../../../src/modes/components/transcript-container";
 import { UserMessageComponent } from "../../../src/modes/components/user-message";
 import { initTheme } from "../../../src/modes/theme/theme";
