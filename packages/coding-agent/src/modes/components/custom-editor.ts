@@ -30,6 +30,7 @@ type ConfigurableEditorAction = Extract<
 	| "app.model.cycleBackward"
 	| "app.model.select"
 	| "app.model.selectTemporary"
+	| "app.prewalk.exit"
 	| "app.tools.expand"
 	| "app.thinking.toggle"
 	| "app.editor.external"
@@ -52,6 +53,7 @@ const DEFAULT_ACTION_KEYS: Record<ConfigurableEditorAction, KeyId[]> = {
 	"app.model.cycleBackward": ["shift+ctrl+p"],
 	"app.model.select": ["alt+m"],
 	"app.model.selectTemporary": ["alt+p"],
+	"app.prewalk.exit": ["alt+w"],
 	"app.tools.expand": ["ctrl+o"],
 	"app.thinking.toggle": ["ctrl+t"],
 	"app.editor.external": ["ctrl+g"],
@@ -555,6 +557,7 @@ export class CustomEditor extends Editor {
 	onHistorySearch?: () => void;
 	onSuspend?: () => void;
 	onSelectModelTemporary?: () => void;
+	onExitPrewalk?: () => void;
 	/** Called when the configured copy-prompt shortcut is pressed. */
 	onCopyPrompt?: () => void;
 	/** Called when the configured image-paste shortcut is pressed. */
@@ -871,6 +874,11 @@ export class CustomEditor extends Editor {
 			// Intercept configured temporary model selector shortcut
 			if (this.#matchesAction(canonical, "app.model.selectTemporary") && this.onSelectModelTemporary) {
 				this.onSelectModelTemporary();
+				return;
+			}
+
+			if (this.#matchesAction(canonical, "app.prewalk.exit") && this.onExitPrewalk) {
+				this.onExitPrewalk();
 				return;
 			}
 

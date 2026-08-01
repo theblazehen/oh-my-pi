@@ -9,6 +9,7 @@ User remaps live in `~/.omp/agent/keybindings.yml`. The file is a YAML mapping w
 ```yaml
 app.model.cycleForward: Ctrl+P
 app.model.selectTemporary: Alt+P
+app.prewalk.exit: Alt+W
 app.plan.toggle: Alt+Shift+P
 ```
 
@@ -28,6 +29,7 @@ app.history.search: []
 | `app.model.cycleBackward`   | `Shift+Ctrl+P`                         | Cycle role models backward                    |
 | `app.model.selectTemporary` | `Alt+P`                                | Pick a model temporarily for this session     |
 | `app.model.select`          | `Alt+M`                                | Open the model selector and set roles         |
+| `app.prewalk.exit`          | `Alt+W`                                | Exit prewalk and return to the default model  |
 | `app.plan.toggle`           | `Alt+Shift+P`                          | Toggle plan mode                              |
 | `app.history.search`        | `Ctrl+R`                               | Search prompt history                         |
 | `app.tools.expand`          | `Ctrl+O`                               | Toggle tool-output expansion                  |

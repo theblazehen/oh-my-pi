@@ -43,6 +43,7 @@ export function buildHotkeysMarkdown(bindings: HotkeysMarkdownBindings): string 
 		`| \`${appKey(bindings, "app.model.cycleBackward")}\` | Cycle role models (backward) |`,
 		`| \`${appKey(bindings, "app.model.selectTemporary")}\` | Select model (temporary) |`,
 		`| \`${appKey(bindings, "app.model.select")}\` | Select model (set roles) |`,
+		`| \`${appKey(bindings, "app.prewalk.exit")}\` | Exit prewalk and return to the default model |`,
 		`| \`${appKey(bindings, "app.plan.toggle")}\` | Toggle plan mode |`,
 		`| \`${appKey(bindings, "app.history.search")}\` | Search prompt history |`,
 		`| \`${appKey(bindings, "app.tools.expand")}\` | Toggle tool output expansion |`,

@@ -89,6 +89,7 @@ async function createContext() {
 	const prompt = vi.fn(async () => {});
 	const retry = vi.fn(async () => true);
 	const abort = vi.fn(async () => {});
+	const getPrewalkState = vi.fn(() => undefined);
 	const session = {
 		isStreaming: false,
 		isCompacting: false,
@@ -99,6 +100,7 @@ async function createContext() {
 		prompt,
 		queuedMessageCount: 0,
 		abort,
+		getPrewalkState,
 		retry,
 	};
 	const updatePendingMessagesDisplay = vi.fn();
@@ -145,6 +147,7 @@ async function createContext() {
 			getFocused: vi.fn(() => focused),
 			terminal: { write: terminalWrite, refreshAppearance },
 		} as unknown as InteractiveModeContext["ui"],
+		statusLine: { invalidate: vi.fn() } as unknown as InteractiveModeContext["statusLine"],
 		loadingAnimation: undefined,
 		autoCompactionLoader: undefined,
 		retryLoader: undefined,
@@ -227,6 +230,7 @@ async function createContext() {
 			requestRender,
 			retry,
 			abort,
+			getPrewalkState,
 			resetDisplay,
 			refreshAppearance,
 			resetDisplayAfterAppearanceRefresh,
