@@ -29,6 +29,7 @@ interface AppKeybindings {
 	"app.model.cycleBackward": true;
 	"app.model.select": true;
 	"app.model.selectTemporary": true;
+	"app.prewalk.exit": true;
 	"app.tools.expand": true;
 	"app.tools.toggleVisibility": true;
 	"app.editor.external": true;
@@ -121,6 +122,10 @@ export const KEYBINDINGS = {
 	"app.model.selectTemporary": {
 		defaultKeys: "alt+p",
 		description: "Select temporary model for current session",
+	},
+	"app.prewalk.exit": {
+		defaultKeys: "alt+w",
+		description: "Exit prewalk and return to the default model",
 	},
 	"app.tools.expand": {
 		defaultKeys: "ctrl+o",

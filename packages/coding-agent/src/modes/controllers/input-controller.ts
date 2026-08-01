@@ -263,6 +263,21 @@ export class InputController {
 		void this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL });
 	}
 
+	async #abortPrewalkToDefault(): Promise<boolean> {
+		const result = await this.ctx.session.abortPrewalkToDefault();
+		if (!result.exited) return false;
+		this.ctx.statusLine.invalidate();
+		this.ctx.updateEditorBorderColor();
+		this.ctx.showStatus("Prewalk interrupted: returned to the default model and re-armed");
+		return true;
+	}
+
+	#abortPrewalkFromEscape(): void {
+		void this.#abortPrewalkToDefault().catch(error => {
+			this.ctx.showError(error instanceof Error ? error.message : String(error));
+		});
+	}
+
 	setupKeyHandlers(): void {
 		this.#draftText ??= this.ctx.editor.getText();
 		this.ctx.editor.setActionKeys("app.interrupt", this.ctx.keybindings.getKeys("app.interrupt"));
@@ -429,6 +444,12 @@ export class InputController {
 				}
 				return;
 			}
+			if (this.ctx.session.getPrewalkState()) {
+				if (this.ctx.loadingAnimation) this.ctx.cancelPendingSubmission();
+				this.restoreQueuedMessagesToEditor({ abort: true, abortSession: false });
+				this.#abortPrewalkFromEscape();
+				return;
+			}
 			if (this.ctx.loadingAnimation) {
 				if (this.ctx.cancelPendingSubmission()) {
 					return;
@@ -504,6 +525,8 @@ export class InputController {
 			this.ctx.keybindings.getKeys("app.model.selectTemporary"),
 		);
 		this.ctx.editor.onSelectModelTemporary = () => this.ctx.showModelSelector({ temporaryOnly: true });
+		this.ctx.editor.setActionKeys("app.prewalk.exit", this.ctx.keybindings.getKeys("app.prewalk.exit"));
+		this.ctx.editor.onExitPrewalk = () => void this.exitPrewalk();
 
 		// Global debug handler on TUI (works regardless of focus)
 		this.ctx.ui.onDebug = () => this.ctx.showDebugSelector();
@@ -1544,7 +1567,7 @@ export class InputController {
 		}
 	}
 
-	restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
+	restoreQueuedMessagesToEditor(options?: { abort?: boolean; abortSession?: boolean; currentText?: string }): number {
 		this.ctx.locallySubmittedUserSignatures.clear();
 		// On Esc (abort) drop non-user internal steers so the post-abort drain can't
 		// auto-resume; plain Alt+Up dequeue preserves them for the continuing stream.
@@ -1565,7 +1588,7 @@ export class InputController {
 		];
 		if (allQueued.length === 0) {
 			this.ctx.updatePendingMessagesDisplay();
-			if (options?.abort) {
+			if (options?.abort && options.abortSession !== false) {
 				void this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL });
 			}
 			return 0;
@@ -1606,7 +1629,7 @@ export class InputController {
 		}
 		this.ctx.editor.setCollapsedText(combinedText);
 		this.ctx.updatePendingMessagesDisplay();
-		if (options?.abort) {
+		if (options?.abort && options.abortSession !== false) {
 			void this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL });
 		}
 		return allQueued.length;
@@ -2136,6 +2159,29 @@ export class InputController {
 				cycleOrder.indexOf(result.role),
 			);
 			this.ctx.showModelCycleTrack(track);
+		} catch (error) {
+			this.ctx.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	async exitPrewalk(): Promise<void> {
+		if (this.ctx.focusedAgentId) {
+			this.ctx.showStatus("Model/thinking apply to the main session — press ←← to return first");
+			return;
+		}
+		try {
+			const result = await this.ctx.session.exitPrewalkToDefault();
+			if (!result.exited) {
+				this.ctx.showStatus("Prewalk is not active");
+				return;
+			}
+			this.ctx.statusLine.invalidate();
+			this.ctx.updateEditorBorderColor();
+			this.ctx.showStatus(
+				result.rearmed
+					? "Prewalk remains armed: there is no active run to suspend"
+					: "Prewalk off for this run: using the default model until quiescence",
+			);
 		} catch (error) {
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 		}

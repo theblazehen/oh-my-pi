@@ -2376,6 +2376,14 @@ Older entries are archived in [packages/coding-agent/CHANGELOG.md@f7051d9e7377](
 ### Removed
 
 - Removed the unreliable Bing and Yahoo HTML-scraping web search providers
+### Added
+
+- Added the `Alt+W` prewalk exit shortcut. It returns the session to its configured default model, while completed prewalk handoffs now return and re-arm automatically at the idle boundary.
+
+### Changed
+
+- Active prewalk handoffs now return to the configured default model and re-arm when interrupted with Esc or a user steering message.
+- Show the Prewalk status indicator only while its implementation handoff is active.
 
 ## [17.0.2] - 2026-07-17
 

@@ -83,7 +83,7 @@ export interface SegmentContext {
 		paused: boolean;
 	} | null;
 	prewalk: {
-		enabled: boolean;
+		phase: "handoff";
 	} | null;
 	loopMode: {
 		state: "waiting" | "running" | "paused";
