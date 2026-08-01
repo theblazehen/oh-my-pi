@@ -58,7 +58,6 @@ function createContext(): {
 	editor: FakeEditor;
 	spies: {
 		abort: Spy;
-		abortPrewalkToDefault: Spy;
 		abortBash: Spy;
 		abortEval: Spy;
 		abortHandoff: Spy;
@@ -68,7 +67,6 @@ function createContext(): {
 		clearQueue: Spy;
 		flushSync: Spy;
 		getQueuedMessages: Spy;
-		getPrewalkState: Spy;
 		ensureLoadingAnimation: Spy;
 		handleBtwCommand: Spy;
 		handleBtwEscape: Spy;
@@ -89,7 +87,6 @@ function createContext(): {
 } {
 	let editorText = "";
 	const abort = vi.fn();
-	const abortPrewalkToDefault = vi.fn(async () => ({ exited: true, switched: true, rearmed: true }));
 	const abortBash = vi.fn();
 	const abortEval = vi.fn();
 	const abortHandoff = vi.fn();
@@ -110,7 +107,6 @@ function createContext(): {
 	const hasActiveOmfg = vi.fn(() => false);
 	const updatePendingMessagesDisplay = vi.fn();
 	const prompt = vi.fn();
-	const getPrewalkState = vi.fn(() => undefined);
 	const startPendingSubmission = vi.fn(
 		(input: { text: string; images?: ImageContent[]; imageLinks?: (string | undefined)[] }) => {
 			ensureLoadingAnimation();
@@ -164,13 +160,11 @@ function createContext(): {
 			messages: [],
 			extensionRunner: undefined,
 			abort,
-			abortPrewalkToDefault,
 			abortBash,
 			abortEval,
 			clearQueue,
 			getQueuedMessages,
 			maybeStartTitleGeneration: vi.fn(),
-			getPrewalkState,
 			prompt,
 			subscribe: vi.fn((listener: (event: { type: string }) => void) => {
 				sessionListeners.push(listener);
@@ -234,7 +228,6 @@ function createContext(): {
 		editor,
 		spies: {
 			abort,
-			abortPrewalkToDefault,
 			abortBash,
 			abortEval,
 			abortHandoff,
@@ -243,7 +236,6 @@ function createContext(): {
 			clearQueue,
 			clearEditor: ctx.clearEditor as Spy,
 			getQueuedMessages,
-			getPrewalkState,
 			ensureLoadingAnimation,
 			flushSync: ctx.sessionManager.flushSync as Spy,
 			handleBtwCommand,
@@ -322,7 +314,6 @@ describe("InputController escape behavior", () => {
 		editor.onEscape?.();
 		expect(spies.cancelPendingSubmission).toHaveBeenCalledTimes(1);
 		expect(spies.clearQueue).not.toHaveBeenCalled();
-		expect(spies.abortPrewalkToDefault).not.toHaveBeenCalled();
 		expect(spies.abort).not.toHaveBeenCalled();
 	});
 
@@ -360,41 +351,6 @@ describe("InputController escape behavior", () => {
 		expect(spies.prompt).not.toHaveBeenCalled();
 		expect(editor.addToHistory).toHaveBeenCalledWith("/btw why is it doing that?");
 		expect(editor.getText()).toBe("");
-	});
-
-	it("aborts active prewalk, restores queued input, then returns and re-arms", async () => {
-		const { ctx, editor, spies } = createContext();
-		const completed = Promise.withResolvers<void>();
-		spies.getPrewalkState.mockReturnValue({ phase: "handoff", target: {} } as never);
-		spies.clearQueue.mockReturnValue({ steering: [{ text: "queued request" }], followUp: [] });
-		spies.showStatus.mockImplementation(() => completed.resolve());
-		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
-		const controller = new InputController(ctx);
-
-		controller.setupKeyHandlers();
-		editor.onEscape?.();
-		expect(spies.abortPrewalkToDefault).toHaveBeenCalledTimes(1);
-		expect(editor.getText()).toBe("queued request");
-		expect(spies.abort).not.toHaveBeenCalled();
-
-		await completed.promise;
-		expect(spies.showStatus).toHaveBeenCalledWith("Prewalk interrupted: returned to the default model and re-armed");
-	});
-
-	it("cancels an unstarted optimistic submission before aborting active prewalk", () => {
-		const { ctx, editor, spies } = createContext();
-		spies.getPrewalkState.mockReturnValue({ phase: "handoff", target: {} } as never);
-		spies.cancelPendingSubmission.mockReturnValue(true);
-		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
-		const controller = new InputController(ctx);
-
-		controller.setupKeyHandlers();
-		editor.onEscape?.();
-
-		expect(spies.cancelPendingSubmission).toHaveBeenCalledTimes(1);
-		expect(spies.clearQueue).toHaveBeenCalledWith({ forInterrupt: true });
-		expect(spies.abortPrewalkToDefault).toHaveBeenCalledTimes(1);
-		expect(spies.abort).not.toHaveBeenCalled();
 	});
 
 	it("falls back to aborting the active session when no pending optimistic submission exists", () => {

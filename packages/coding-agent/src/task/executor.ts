@@ -71,6 +71,7 @@ import {
 	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
+	type TaskContextSource,
 	type TaskToolDetails,
 	type YieldItem,
 } from "./types";
@@ -314,6 +315,10 @@ export interface ExecutorOptions {
 	assignment?: string;
 	/** Shared background from the task call (`task.batch`), rendered into the subagent's system prompt. */
 	context?: string;
+	/** Requested task context source. */
+	contextSource?: TaskContextSource;
+	/** Parent transcript snapshot captured before task scheduling. */
+	forkContext?: ForkContextSnapshot;
 	/**
 	 * The session's active overall plan, handed off so subagents spawned during
 	 * plan execution share the same plan context as the main agent. Omitted when
@@ -455,6 +460,12 @@ export interface ExecutorOptions {
 	 * set this false so disposal unregisters them instead of leaving idle peers.
 	 */
 	keepAlive?: boolean;
+}
+
+export interface ForkContextSnapshot {
+	sourceFile: string | null;
+	sourceLeafId: string | null;
+	sessionManager: Pick<SessionManager, "forkBranch">;
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -2535,6 +2546,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		onProgress,
 	} = options;
 	const startTime = Date.now();
+	const requestedContextSource = options.contextSource ?? "fresh";
+	let usedContextSource: "fresh" | "fork" = "fresh";
 	// Set by the session's onFirstChatDispatch hook the first time the agent
 	// loop dispatches a chat request to the provider — the launch-complete boundary.
 	let firstChatDispatchAt: number | undefined;
@@ -2832,12 +2845,47 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : (thinkingLevel ?? resolvedThinkingLevel));
 			resolvedAt = performance.now();
 			const effectiveCwd = worktree ?? cwd;
-			const sessionManagerPromise = sessionFile
-				? SessionManager.open(sessionFile, undefined, undefined, {
-						initialCwd: effectiveCwd,
-						suppressBreadcrumb: true,
-					})
-				: Promise.resolve(SessionManager.inMemory(effectiveCwd));
+			const forkContext = options.forkContext;
+			const childTranscriptUnavailable = sessionFile === null;
+			const forkSnapshotUnavailable =
+				forkContext === undefined ||
+				forkContext.sessionManager === undefined ||
+				forkContext.sourceFile === null ||
+				forkContext.sourceFile === undefined;
+			const sessionManagerPromise =
+				requestedContextSource === "fork" &&
+				forkContext !== undefined &&
+				forkContext.sessionManager !== undefined &&
+				forkContext.sourceFile !== null &&
+				forkContext.sourceFile !== undefined &&
+				sessionFile !== null
+					? forkContext.sessionManager
+							.forkBranch({
+								sourceFile: forkContext.sourceFile,
+								sourceLeafId: forkContext.sourceLeafId,
+								cwd: effectiveCwd,
+								sessionDir: path.dirname(sessionFile),
+								sessionFile,
+								suppressBreadcrumb: true,
+							})
+							.then(manager => {
+								usedContextSource = "fork";
+								return manager;
+							})
+					: requestedContextSource === "fork" && (forkSnapshotUnavailable || childTranscriptUnavailable)
+						? Promise.reject(
+								new Error(
+									forkSnapshotUnavailable
+										? "Cannot fork task context: parent session snapshot or transcript is unavailable"
+										: "Cannot fork task context: child transcript path is unavailable",
+								),
+							)
+						: sessionFile
+							? SessionManager.open(sessionFile, undefined, undefined, {
+									initialCwd: effectiveCwd,
+									suppressBreadcrumb: true,
+								})
+							: Promise.resolve(SessionManager.inMemory(effectiveCwd));
 			// Setup below can fail before this promise's consumption boundary.
 			// Observe rejection immediately while preserving it for the later await.
 			sessionManagerPromise.catch(() => {});
@@ -2931,6 +2979,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				getApiKey: options.getApiKey,
 				settings: subagentSettings,
 				model,
+				...(usedContextSource === "fork"
+					? {
+							providerPromptCacheKey: sessionManagerForRun.getHeader()?.providerPromptCacheKey,
+							providerPromptCacheKeySource: "fork" as const,
+						}
+					: {}),
 				modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
 				modelPatternAuthFallback:
 					model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,

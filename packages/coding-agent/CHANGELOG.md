@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added task context sources (`fresh` and `fork`), including forks from a completed parent conversation.
+
 ## [17.2.3] - 2026-08-01
 
 ### Changed

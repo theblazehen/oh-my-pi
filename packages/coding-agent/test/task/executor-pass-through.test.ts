@@ -17,7 +17,8 @@ import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { type ForkContextSnapshot, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
@@ -364,5 +365,80 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(result.exitCode).toBe(0);
 		const forwarded = spy.mock.calls[0]?.[0];
 		expect(forwarded?.thinkingLevel).toBe(ThinkingLevel.Low);
+	});
+
+	it("selects and wires the captured fork source", async () => {
+		const sourceFile = "/tmp/source.jsonl";
+		const sourceLeafId: string | null = "selected-leaf";
+		const effectiveCwd = "/tmp/worktree";
+		const childDir = "/tmp/child-artifacts";
+		const childFile = `${childDir}/${baseOptions.id}.jsonl`;
+		const providerPromptCacheKey = "live-fork-cache-key";
+		type ForkBranch = SessionManager["forkBranch"];
+		const childManager = {
+			getHeader: () => ({ providerPromptCacheKey }),
+		} as unknown as SessionManager;
+		const forkBranch = vi.fn<ForkBranch>(async () => childManager);
+		const forkContext = {
+			sourceFile,
+			sourceLeafId,
+			sessionManager: { forkBranch },
+		} as ForkContextSnapshot;
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			cwd: "/tmp/project",
+			worktree: effectiveCwd,
+			artifactsDir: childDir,
+			contextSource: "fork",
+			forkContext,
+		});
+
+		expect(result.exitCode, `${result.error ?? ""} ${result.stderr}`).toBe(0);
+		expect(forkBranch).toHaveBeenCalledTimes(1);
+		expect(forkBranch).toHaveBeenCalledWith({
+			sourceFile,
+			sourceLeafId,
+			cwd: effectiveCwd,
+			sessionDir: childDir,
+			sessionFile: childFile,
+			suppressBreadcrumb: true,
+		});
+		expect(spy).toHaveBeenCalledTimes(1);
+		const forwarded = spy.mock.calls[0]?.[0];
+		expect(forwarded?.sessionManager).toBe(childManager);
+		expect(forwarded?.providerPromptCacheKey).toBe(providerPromptCacheKey);
+		expect(forwarded?.providerPromptCacheKeySource).toBe("fork");
+	});
+
+	it("keeps fresh execution on the existing child path", async () => {
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const forkBranch = vi.fn(() => {
+			throw new Error("fresh path called forkBranch");
+		});
+
+		const result = await runSubprocess({
+			...baseOptions,
+			contextSource: "fresh",
+			forkContext: {
+				sourceFile: "/tmp/source.jsonl",
+				sourceLeafId: null,
+				sessionManager: { forkBranch },
+			},
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(forkBranch).not.toHaveBeenCalled();
+		expect(spy.mock.calls[0]?.[0]?.sessionManager).toBeDefined();
+	});
+
+	it("fails explicit fork when the scheduling snapshot is unavailable", async () => {
+		const result = await runSubprocess({ ...baseOptions, contextSource: "fork" });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.error).toContain("Cannot fork task context");
 	});
 });

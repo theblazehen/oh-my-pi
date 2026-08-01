@@ -238,7 +238,7 @@ const modeSegment: StatusLineSegment = {
 		}
 
 		const prewalk = ctx.prewalk;
-		if (prewalk?.phase === "handoff") {
+		if (prewalk?.enabled) {
 			const content = withIcon(theme.icon.prewalk, "Prewalk");
 			return { content: theme.fg("accent", content), visible: true };
 		}

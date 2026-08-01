@@ -317,7 +317,12 @@ export class ExtensionUiController {
 			return;
 		}
 
-		const target = placement === "hud" ? this.#hookWidgetsHud : placement === "belowEditor" ? this.#hookWidgetsBelow : this.#hookWidgetsAbove;
+		const target =
+			placement === "hud"
+				? this.#hookWidgetsHud
+				: placement === "belowEditor"
+					? this.#hookWidgetsBelow
+					: this.#hookWidgetsAbove;
 		target.set(key, this.#createHookWidget(content));
 		this.#rebuildHookWidgets();
 	}

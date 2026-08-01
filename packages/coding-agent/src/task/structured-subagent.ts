@@ -21,7 +21,7 @@ import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../tools/hub";
 import { buildOutputValidator } from "../tools/output-schema-validator";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
-import { type ExecutorOptions, runSubprocess } from "./executor";
+import { type ExecutorOptions, type ForkContextSnapshot, runSubprocess } from "./executor";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -39,6 +39,7 @@ import {
 	canSpawnAtDepth,
 	type SingleResult,
 	type StructuredSubagentOutput,
+	type TaskContextSource,
 } from "./types";
 import { type NestedRepoPatch, parseIsolationMode } from "./worktree";
 
@@ -83,6 +84,9 @@ export interface StructuredSubagentRequest {
 	invocationKind: "task" | "eval";
 	assignment: string;
 	context?: string;
+	/** Requested task context source and its scheduling-time parent snapshot. */
+	contextSource?: TaskContextSource;
+	forkContext?: ForkContextSnapshot;
 	agent?: string;
 	model?: string | string[];
 	/** Presence, rather than truthiness, makes this the highest-priority schema. */
@@ -383,6 +387,8 @@ function buildExecutorOptions(
 		task: renderSubagentPrompt(request.assignment),
 		assignment: request.assignment.trim(),
 		context: request.context?.trim() || undefined,
+		contextSource: request.contextSource,
+		forkContext: request.forkContext,
 		planReference: undefined,
 		description: trimToUndefined(request.identity?.label),
 		index: request.index ?? 0,

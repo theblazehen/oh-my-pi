@@ -19,10 +19,12 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { AgentDefinition, SingleResult, TaskParams } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { AgentDefinition, SingleResult, TaskParams, TaskToolDetails } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { isRecord } from "@oh-my-pi/pi-utils";
 
@@ -39,13 +41,16 @@ function createSession(
 		settings?: Record<string, unknown>;
 		agentId?: string;
 		planMode?: boolean;
+		sessionManager?: ToolSession["sessionManager"];
+		sessionFile?: string | null;
 	} = {},
 ): ToolSession {
 	return {
 		cwd: "/tmp",
 		hasUI: false,
 		settings: Settings.isolated(options.settings ?? {}),
-		getSessionFile: () => null,
+		getSessionFile: () => options.sessionFile ?? null,
+		sessionManager: options.sessionManager,
 		getSessionSpawns: () => "*",
 		getAgentId: () => options.agentId ?? null,
 		getPlanModeState: options.planMode ? () => ({ enabled: true }) : undefined,
@@ -584,6 +589,57 @@ describe("task.batch spawning", () => {
 		]);
 	});
 
+	it("keeps completed async results in input order in the aggregate details", async () => {
+		mockDiscovery();
+		const gates = new Map<string, PromiseWithResolvers<void>>();
+		const started = Promise.withResolvers<void>();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			const id = options.id ?? "?";
+			const gate = Promise.withResolvers<void>();
+			gates.set(id, gate);
+			if (gates.size === 2) started.resolve();
+			await gate.promise;
+			return makeResult(id, {
+				index: id === "First" ? 0 : 1,
+				outputPath: `/tmp/${id}.md`,
+			});
+		});
+
+		const manager = createManager();
+		const tool = await TaskTool.create(
+			createSession({
+				manager,
+				settings: { "async.enabled": true, "task.batch": true, "task.maxConcurrency": 2 },
+			}),
+		);
+		const result = await tool.execute("tc-async-details", {
+			context: "Shared context.",
+			tasks: [
+				{ name: "First", task: "Do first." },
+				{ name: "Second", task: "Do second." },
+			],
+		} as TaskParams);
+
+		const firstJob = manager.getJob("First");
+		const secondJob = manager.getJob("Second");
+		expect(firstJob).toBeDefined();
+		expect(secondJob).toBeDefined();
+		await started.promise;
+
+		gates.get("Second")!.resolve();
+		await secondJob!.promise;
+		gates.get("First")!.resolve();
+		await firstJob!.promise;
+
+		const latestDetails = firstJob!.latestDetails as unknown as TaskToolDetails;
+		expect(result.details?.async?.state).toBe("running");
+		expect(latestDetails.results.map(item => ({ index: item.index, id: item.id }))).toEqual([
+			{ index: 0, id: "First" },
+			{ index: 1, id: "Second" },
+		]);
+		expect(latestDetails.outputPaths).toEqual(["/tmp/First.md", "/tmp/Second.md"]);
+	});
+
 	it("settles the batch async aggregate when a queued spawn is cancelled mid-flight", async () => {
 		mockDiscovery();
 		const started: string[] = [];
@@ -652,5 +708,69 @@ describe("task.batch spawning", () => {
 		expect(last?.async?.state).toBe("failed");
 		expect(last?.progress?.find(p => p.id === "Second")?.status).toBe("aborted");
 		expect(last?.progress?.find(p => p.id === "First")?.status).toBe("completed");
+	});
+
+	it("captures the fork leaf before a delayed background spawn runs", async () => {
+		mockDiscovery();
+		const storage = new MemorySessionStorage();
+		const manager = SessionManager.create("/tmp", "/tmp/sessions", storage);
+		const capturedParent = manager.appendMessage({ role: "user", content: "parent", timestamp: Date.now() });
+		const capturedAssistant = manager.appendMessage({
+			role: "assistant",
+			provider: "anthropic",
+			model: "test",
+			api: "anthropic-messages",
+			content: [{ type: "text", text: "captured" }],
+			stopReason: "stop",
+			timestamp: Date.now(),
+		} as never);
+		const inFlightTaskCall = manager.appendCustomEntry("tool_execution_start", {
+			toolCallId: "task-call",
+			toolName: "task",
+		});
+		const sourceFile = manager.getSessionFile();
+		if (!sourceFile) throw new Error("expected session file");
+		const seen: Array<{ sourceFile: string | null; sourceLeafId: string | null }> = [];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			seen.push({
+				sourceFile: options.forkContext?.sourceFile ?? null,
+				sourceLeafId: options.forkContext?.sourceLeafId ?? null,
+			});
+			return makeResult(options.id ?? "?");
+		});
+		const jobs = createManager();
+		const tool = await TaskTool.create(
+			createSession({
+				manager: jobs,
+				sessionManager: manager,
+				sessionFile: sourceFile,
+				settings: { "async.enabled": true, "task.batch": false },
+			}),
+		);
+		const result = await tool.execute("tc-captured", { agent: "task", task: "Do it.", source: "fork" } as TaskParams);
+		manager.appendMessage({
+			role: "assistant",
+			provider: "anthropic",
+			model: "test",
+			api: "anthropic-messages",
+			content: [{ type: "text", text: "later" }],
+			stopReason: "stop",
+			timestamp: Date.now(),
+		} as never);
+		await jobs.getJob(result.details?.async?.jobId ?? "")?.promise;
+		expect(seen).toEqual([{ sourceFile, sourceLeafId: capturedAssistant }]);
+		expect(capturedAssistant).not.toBe(capturedParent);
+		const capturedBranch = manager.getBranch(capturedAssistant);
+		expect(capturedBranch).toContainEqual(
+			expect.objectContaining({
+				id: capturedAssistant,
+				type: "message",
+				message: expect.objectContaining({
+					role: "assistant",
+					content: [{ type: "text", text: "captured" }],
+				}),
+			}),
+		);
+		expect(capturedBranch.some(entry => entry.id === inFlightTaskCall)).toBe(false);
 	});
 });

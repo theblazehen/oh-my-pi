@@ -2354,7 +2354,11 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
-		options?: { suppressBreadcrumb?: boolean; sessionFile?: string },
+		options?: {
+			suppressBreadcrumb?: boolean;
+			sessionFile?: string;
+			sourceLeafId?: string | null;
+		},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
@@ -2365,7 +2369,29 @@ export class SessionManager {
 		await resolveBlobRefsInEntries(sourceEntries, manager.#blobs);
 
 		const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		const history = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+		let history = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+		if (options && "sourceLeafId" in options) {
+			if (options.sourceLeafId === undefined) {
+				throw new Error("Fork source leaf is unavailable");
+			}
+
+			const entriesById = new Map(history.map(entry => [entry.id, entry]));
+			const branch: SessionEntry[] = [];
+			const seen = new Set<string>();
+			let cursor: string | null = options.sourceLeafId;
+			while (cursor !== null) {
+				if (seen.has(cursor)) throw new Error(`Fork source contains a parent cycle at entry ${cursor}`);
+				seen.add(cursor);
+				const entry = entriesById.get(cursor);
+				if (!entry) throw new Error(`Fork source entry ${cursor} not found`);
+				branch.push(entry);
+				if (entry.parentId !== null && typeof entry.parentId !== "string") {
+					throw new Error(`Fork source entry ${entry.id} has an unavailable parent boundary`);
+				}
+				cursor = entry.parentId;
+			}
+			history = branch.reverse();
+		}
 		manager.#resetToNewSession(
 			{
 				parentSession: sourceHeader?.id,
@@ -2388,6 +2414,26 @@ export class SessionManager {
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();
 		return manager;
+	}
+
+	/** Clone a completed branch through this manager's configured storage backend. */
+	async forkBranch(options: {
+		cwd: string;
+		sessionDir?: string;
+		sessionFile?: string;
+		sourceFile?: string;
+		sourceLeafId?: string | null;
+		suppressBreadcrumb?: boolean;
+	}): Promise<SessionManager> {
+		const sourceFile = options.sourceFile ?? this.#sessionFile;
+		if (!sourceFile) throw new Error("Cannot fork a session without a persisted transcript");
+		if (sourceFile === this.#sessionFile) {
+			await this.ensureOnDisk();
+			await this.flush();
+		} else {
+			await this.#storage.drain();
+		}
+		return SessionManager.forkFrom(sourceFile, options.cwd, options.sessionDir, this.#storage, options);
 	}
 
 	/**

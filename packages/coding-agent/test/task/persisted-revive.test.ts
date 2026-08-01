@@ -62,8 +62,15 @@ function createRevivedSession(activeToolNames: string[][]): RevivedSessionHandle
 	return { session, observer: () => observer };
 }
 
-async function createPersistedSession(cwd: string, restrictToolNames?: boolean): Promise<string> {
+async function createPersistedSession(
+	cwd: string,
+	restrictToolNames?: boolean,
+	providerPromptCacheKey?: string,
+): Promise<string> {
 	const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+	if (providerPromptCacheKey !== undefined) {
+		await manager.newSession({ providerPromptCacheKey });
+	}
 	const sessionFile = manager.getSessionFile();
 	if (!sessionFile) throw new Error("Expected a persisted session file");
 	manager.appendSessionInit({
@@ -238,5 +245,35 @@ describe("persisted subagent revival", () => {
 		rpcRegistry.dispose();
 		AgentLifecycleManager.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
+	});
+
+	it("cold-revives persisted child history with its provider cache lineage", async () => {
+		const cwd = makeTempDir("@pi-cache-revive-");
+		const providerPromptCacheKey = "persisted-child-cache-key";
+		const sessionFile = await createPersistedSession(cwd, false, providerPromptCacheKey);
+		let capturedOptions: CreateAgentSessionOptions | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			capturedOptions = options;
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+
+		const ref = createRef(sessionFile);
+		const reviver = await createFactory(cwd)(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		const sessionManager = capturedOptions?.sessionManager;
+		if (!sessionManager) throw new Error("Expected the reopened session manager");
+		const options = capturedOptions;
+		if (!options) throw new Error("Expected createAgentSession options");
+		expect(
+			sessionManager
+				.getEntries()
+				.filter(entry => entry.type === "message")
+				.map(entry => (entry.type === "message" ? entry.message : undefined)),
+		).toEqual([expect.objectContaining({ role: "assistant", content: [{ type: "text", text: "persisted" }] })]);
+		expect(sessionManager.getHeader()?.providerPromptCacheKey).toBe(providerPromptCacheKey);
+		expect(options.providerPromptCacheKey).toBe(providerPromptCacheKey);
+		expect(options.providerPromptCacheKeySource).toBe("fork");
 	});
 });

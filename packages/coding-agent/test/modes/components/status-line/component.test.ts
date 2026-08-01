@@ -6,7 +6,7 @@ import type { AgentSession } from "../../../../src/session/agent-session";
 
 function makeSessionWithLastMessage(
 	lastMessage: unknown,
-	prewalkHandoff: boolean = false,
+	prewalkArmed: boolean = false,
 	{
 		cost = 0,
 		advisorCost = 0,
@@ -41,8 +41,7 @@ function makeSessionWithLastMessage(
 			}),
 			getSessionName: () => "test-session",
 		},
-		getPrewalkState: () =>
-			prewalkHandoff ? { phase: "handoff" as const, target: { id: "cheap-model", provider: "openai" } } : undefined,
+		getPrewalkState: () => (prewalkArmed ? { target: { id: "cheap-model", provider: "openai" } } : undefined),
 		getAsyncJobSnapshot: () => undefined,
 		isAdvisorActive: () => false,
 		getAdvisorStatusOverview: () => ({
@@ -84,7 +83,7 @@ describe("StatusLineComponent", () => {
 		expect(statusLine.getCachedContextBreakdown()).toEqual({ usedTokens: 42, contextWindow: 128000 });
 	});
 
-	it("renders Prewalk annotation during a handoff", () => {
+	it("renders Prewalk annotation when prewalk is armed", () => {
 		const statusLine = new StatusLineComponent(makeSessionWithLastMessage(null, true) as unknown as AgentSession);
 
 		// By default preset, 'mode' segment is included in left/right segments.

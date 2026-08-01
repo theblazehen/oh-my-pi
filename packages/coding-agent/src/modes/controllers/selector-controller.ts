@@ -245,7 +245,7 @@ export class SelectorController {
 				maxHeight: "100%",
 				margin: 0,
 				fullscreen: true,
-			mouseTracking: "motion",
+				mouseTracking: "motion",
 			});
 			this.ctx.ui.setFocus(selector);
 			this.ctx.ui.requestRender();
@@ -324,7 +324,7 @@ export class SelectorController {
 				maxHeight: "100%",
 				margin: 0,
 				fullscreen: true,
-			mouseTracking: "motion",
+				mouseTracking: "motion",
 			});
 			this.ctx.ui.setFocus(overlay);
 			this.ctx.ui.requestRender();

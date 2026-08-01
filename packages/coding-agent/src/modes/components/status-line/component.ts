@@ -1563,11 +1563,8 @@ export class StatusLineComponent implements Component {
 			planMode: this.#planModeStatus,
 			loopMode: this.#loopModeStatus,
 			prewalk:
-				typeof this.session.getPrewalkState === "function"
-					? (() => {
-							const prewalk = this.session.getPrewalkState();
-							return prewalk ? { phase: prewalk.phase } : null;
-						})()
+				typeof this.session.getPrewalkState === "function" && this.session.getPrewalkState()
+					? { enabled: true }
 					: null,
 			goalMode: this.#goalModeStatus,
 			vibeMode: this.#vibeModeStatus,

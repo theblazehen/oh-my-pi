@@ -85,6 +85,7 @@ export function createPersistedSubagentReviverFactory(
 			const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
 				suppressBreadcrumb: true,
 			});
+			const providerPromptCacheKey = reopened.getHeader()?.providerPromptCacheKey;
 			const artifactManager = ctx.session.sessionManager.getArtifactManager();
 			if (artifactManager) reopened.adoptArtifactManager(artifactManager);
 			// A restricted persisted contract must not consult process-global MCP
@@ -113,6 +114,9 @@ export function createPersistedSubagentReviverFactory(
 				restrictToolNames: restrictToolNames || undefined,
 				requireYieldTool: true,
 				systemPrompt: () => [init.systemPrompt],
+				...(providerPromptCacheKey !== undefined
+					? { providerPromptCacheKey, providerPromptCacheKeySource: "fork" as const }
+					: {}),
 				// Old files predate persisted spawns: deny re-spawning rather than let
 				// createAgentSession default to wildcard ("*").
 				spawns: init.spawns ?? "",

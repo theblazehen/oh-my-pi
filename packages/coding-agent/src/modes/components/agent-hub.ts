@@ -332,7 +332,12 @@ export class AgentHubOverlayComponent extends Container {
 			},
 		});
 		this.#transcriptViewer = viewer;
-		this.#transcriptOverlay = this.#ui.showOverlay(viewer, { width: "100%", margin: 0, fullscreen: true, mouseTracking: "motion" });
+		this.#transcriptOverlay = this.#ui.showOverlay(viewer, {
+			width: "100%",
+			margin: 0,
+			fullscreen: true,
+			mouseTracking: "motion",
+		});
 		this.#ui.setFocus(viewer);
 		this.#requestRender();
 	}
