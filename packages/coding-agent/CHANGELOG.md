@@ -4,7 +4,13 @@
 
 ### Added
 
-- Added task context sources (`fresh` and `fork`), including forks from a completed parent conversation.
+- Added task context sources (`fresh` and `fork`), with `fork` inheriting a frozen, provider-neutral native-text copy of the completed parent conversation while removing parent compaction and execution-control state so text-only child models work and compact the inherited history normally.
+- Added a fixed 29-minute background-job wait option alongside the existing adaptive polling mode.
+
+### Changed
+
+- OMP worker subprocesses now default to nice 19 without lowering the interactive CLI or Bun worker threads; `OMP_SUBPROCESS_NICE` can override the value or use `inherit` to opt out.
+- Headless Chromium now enables ANGLE Vulkan on Linux when an accessible DRM render node is available, while retaining the existing software/default path elsewhere.
 
 ## [17.2.3] - 2026-08-01
 

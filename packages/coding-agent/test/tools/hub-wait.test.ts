@@ -10,6 +10,7 @@ import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { type CoordinationDetails, HubTool } from "@oh-my-pi/pi-coding-agent/tools/hub";
+import { resolvePollWindow } from "../../src/tools/hub/jobs";
 
 const SELF_ID = "Main";
 
@@ -46,6 +47,23 @@ describe("hub unified wait", () => {
 	afterEach(() => {
 		AgentRegistry.resetGlobalForTests();
 		IrcBus.resetGlobalForTests();
+	});
+
+	test("resolves a fixed 29-minute poll window without smart polling", () => {
+		const session = {
+			settings: {
+				get(key: string): unknown {
+					return key === "async.pollWaitDuration" ? "29m" : undefined;
+				},
+			},
+		} as unknown as ToolSession;
+		const manager = {
+			nextPollWaitMs: () => {
+				throw new Error("smart poll duration must not be requested");
+			},
+		} as unknown as AsyncJobManager;
+
+		expect(resolvePollWindow(session, manager, SELF_ID)).toEqual({ waitMs: 1_740_000, smart: false });
 	});
 
 	test("an incoming message settles the wait while watched jobs keep running", async () => {

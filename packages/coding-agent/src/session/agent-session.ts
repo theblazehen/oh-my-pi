@@ -4432,6 +4432,11 @@ export class AgentSession {
 		this.#rewoundToolResultIds.clear();
 	}
 
+	/** Clear checkpoint state inherited from another logical agent without rewriting its transcript. */
+	clearCheckpointRuntimeState(): void {
+		this.#clearCheckpointRuntimeState();
+	}
+
 	/** Drop mutable tool decisions and directives owned by the previous logical session. */
 	#clearSessionScopedToolState(): void {
 		this.agent.clearDeferredToolDirectives();

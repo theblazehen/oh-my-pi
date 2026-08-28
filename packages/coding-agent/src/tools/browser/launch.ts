@@ -296,17 +296,49 @@ export interface LaunchHeadlessResult {
 	userDataDir?: string;
 }
 
-/**
- * Base Chromium argv shared by process-local puppeteer launches and the
- * broker-owned shared browser: sandbox/stealth flags, window size, and
- * PUPPETEER_PROXY* env-derived proxy flags.
- */
-export function buildHeadlessLaunchArgs(viewport: { width: number; height: number }): string[] {
+interface HeadlessGpuProbe {
+	platform: NodeJS.Platform;
+	listDriEntries(): readonly string[];
+	isAccessible(path: string): boolean;
+}
+
+const SYSTEM_HEADLESS_GPU_PROBE: HeadlessGpuProbe = {
+	platform: process.platform,
+	listDriEntries: () => fs.readdirSync("/dev/dri"),
+	isAccessible: candidate => {
+		try {
+			fs.accessSync(candidate, fs.constants.R_OK | fs.constants.W_OK);
+			return true;
+		} catch {
+			return false;
+		}
+	},
+};
+
+function linuxHardwareGpuArgs(probe: HeadlessGpuProbe): string[] {
+	if (probe.platform !== "linux") return [];
+	try {
+		const hasRenderNode = probe
+			.listDriEntries()
+			.some(name => /^renderD\d+$/.test(name) && probe.isAccessible(path.join("/dev/dri", name)));
+		return hasRenderNode ? ["--use-angle=vulkan", "--enable-features=Vulkan"] : [];
+	} catch {
+		// Missing or unreadable DRM state is normal on GPU-less/container hosts.
+		return [];
+	}
+}
+
+function buildHeadlessLaunchArgsWithProbe(
+	viewport: { width: number; height: number },
+	additionalArgs: readonly string[],
+	probe: HeadlessGpuProbe,
+): string[] {
 	const launchArgs = [
 		"--no-sandbox",
 		"--disable-setuid-sandbox",
 		"--disable-blink-features=AutomationControlled",
 		`--window-size=${viewport.width},${viewport.height}`,
+		...linuxHardwareGpuArgs(probe),
 	];
 	const proxy = process.env.PUPPETEER_PROXY;
 	if (proxy) {
@@ -322,7 +354,22 @@ export function buildHeadlessLaunchArgs(viewport: { width: number; height: numbe
 	if (ignoreCert === "true" || ignoreCert === "1" || ignoreCert === "yes" || ignoreCert === "on") {
 		launchArgs.push("--ignore-certificate-errors");
 	}
+	for (const arg of additionalArgs) {
+		if (!launchArgs.includes(arg)) launchArgs.push(arg);
+	}
 	return launchArgs;
+}
+
+/**
+ * Base Chromium argv shared by process-local puppeteer launches and the
+ * broker-owned shared browser: sandbox/stealth flags, Linux hardware-GPU
+ * policy, window size, and PUPPETEER_PROXY* env-derived proxy flags.
+ */
+export function buildHeadlessLaunchArgs(
+	viewport: { width: number; height: number },
+	additionalArgs: readonly string[] = [],
+): string[] {
+	return buildHeadlessLaunchArgsWithProbe(viewport, additionalArgs, SYSTEM_HEADLESS_GPU_PROBE);
 }
 
 export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<LaunchHeadlessResult> {
@@ -333,10 +380,7 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		deviceScaleFactor: vp.deviceScaleFactor ?? DEFAULT_VIEWPORT.deviceScaleFactor,
 	};
 	const puppeteer = await loadPuppeteer();
-	const launchArgs = buildHeadlessLaunchArgs(initialViewport);
-	for (const arg of opts.args ?? []) {
-		if (!launchArgs.includes(arg)) launchArgs.push(arg);
-	}
+	const launchArgs = buildHeadlessLaunchArgs(initialViewport, opts.args);
 	// Own the Chromium profile directory instead of letting puppeteer-core create
 	// (and delete) a temporary one. Passing `--user-data-dir` makes puppeteer
 	// treat the profile as non-temporary, so `ChromeLauncher.cleanUserDataDir`
@@ -868,6 +912,23 @@ export async function applyStealthPatches(
 
 export function stealthIgnoreDefaultArgsForTest(executablePath: string | undefined): string[] {
 	return stealthIgnoreDefaultArgs(executablePath);
+}
+
+export function buildHeadlessLaunchArgsForTest(
+	viewport: { width: number; height: number },
+	options: {
+		platform: NodeJS.Platform;
+		driEntries?: readonly string[];
+		accessibleDriEntries?: readonly string[];
+		additionalArgs?: readonly string[];
+	},
+): string[] {
+	const accessible = new Set(options.accessibleDriEntries ?? []);
+	return buildHeadlessLaunchArgsWithProbe(viewport, options.additionalArgs ?? [], {
+		platform: options.platform,
+		listDriEntries: () => options.driEntries ?? [],
+		isAccessible: candidate => accessible.has(path.basename(candidate)),
+	});
 }
 
 export function targetSupportsUserAgentOverrideForTest(target: Target): boolean {

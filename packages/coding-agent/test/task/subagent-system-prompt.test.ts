@@ -4,6 +4,16 @@ import "../../src/config/prompt-templates";
 import subagentSystemPromptTemplate from "../../src/prompts/system/subagent-system-prompt.md" with { type: "text" };
 
 describe("subagent system prompt", () => {
+	it("treats inherited trajectory as history while retaining smart nested delegation", () => {
+		const out = prompt.render(subagentSystemPromptTemplate, { agent: "Execute the assigned work." });
+
+		expect(out).toContain("history and evidence, not your live control state");
+		expect(out).toContain("do not resume the parent agent's todos, checkpoints, pending tool calls");
+		expect(out).toContain("perform its coherent core work directly");
+		expect(out).toContain("genuinely independent sub-work");
+		expect(out).toContain("Never spawn one child and wait for it to perform your primary assignment");
+	});
+
 	it("revokes native output labels when caller schema overrides the agent", () => {
 		const out = prompt.render(subagentSystemPromptTemplate, {
 			agent: 'Use incremental yield with type: ["findings"].',

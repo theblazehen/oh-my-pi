@@ -44,6 +44,7 @@ import type { ArtifactManager } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
+import type { SessionEntry } from "../session/session-entries";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
 import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "../thinking";
@@ -465,7 +466,199 @@ export interface ExecutorOptions {
 export interface ForkContextSnapshot {
 	sourceFile: string | null;
 	sourceLeafId: string | null;
-	sessionManager: Pick<SessionManager, "forkBranch">;
+	entries: readonly SessionEntry[];
+}
+
+const FORK_CONTROL_TOOLS: Record<string, true> = { todo: true, checkpoint: true, rewind: true };
+const FORK_CONTROL_CUSTOM_TYPES: Record<string, true> = {
+	"eager-task-prelude": true,
+	"eager-todo-prelude": true,
+};
+
+/** Entry types that are parent-only runtime/config state, never conversation. */
+const FORK_NON_CONVERSATION_TYPES: Record<string, true> = {
+	session_init: true,
+	model_change: true,
+	thinking_level_change: true,
+	service_tier_change: true,
+	mode_change: true,
+	credential_pin: true,
+	ttsr_injection: true,
+	title: true,
+	title_change: true,
+	custom: true,
+	label: true,
+};
+
+/**
+ * Clone the parent branch into fresh entry objects for the child, retaining
+ * only conversation-bearing entries (messages, custom_message,
+ * branch_summary) and scrubbing parent-only execution control.
+ *
+ * "Clone before mutation": the returned entries are new objects, never
+ * references into the parent session, so the in-place edits below cannot leak
+ * into the parent's tree.
+ *
+ * Scrubbing:
+ * - Non-conversation entry types (runtime/config) are dropped.
+ * - Every `compaction` entry is dropped unconditionally — Snapcompact-backed
+ *   or not — so no parent compaction boundary, archive, or provider-native
+ *   replay payload reaches the child. The still-persisted pre- and
+ *   post-compaction message entries become ordinary full textual history and
+ *   the child compacts later under its own runtime.
+ * - `custom` messages with an eager task/todo prelude `customType` vanish.
+ * - `todo`/`checkpoint`/`rewind` toolCall blocks and their paired toolResults
+ *   are removed, both from the assistant turn that issued them and any
+ *   standalone `toolResult` row whose call id was removed.
+ * - Dangling `toolCall` blocks (no retained result) and orphan `toolResult`s
+ *   (no retained call) are dropped so the built child context has no unpaired
+ *   tools.
+ * - Every inherited assistant turn is provider-neutralized on the first pass,
+ *   whether or not control scrubbing changed it: the child runs under its own
+ *   provider/model/system contract, so no parent provider-native replay state
+ *   may survive. `redactedThinking` (encrypted, no plaintext to keep) is
+ *   dropped, signed `thinking` signatures are cleared so the provider encoder
+ *   downgrades them to plain text, and `providerPayload` is removed. A turn
+ *   left with no content is dropped entirely.
+ *
+ * Retained entries keep their structural types — branch summaries are never
+ * folded into user text. Every retained `parentId` is relinked in original
+ * order to the nearest surviving ancestor. Returned entries are
+ * deep-independent clones: no returned object (or nested `message.content`,
+ * `preserveData`, …) is shared with the source session.
+ */
+export function scrubTaskForkEntries(entries: readonly SessionEntry[]): SessionEntry[] {
+	const entriesById = new Map<string, SessionEntry>();
+	for (const entry of entries) entriesById.set(entry.id, entry);
+
+	const removedCallIds = new Set<string>();
+	const retained: SessionEntry[] = [];
+
+	for (const entry of entries) {
+		// Eager task/todo preludes are persisted as custom_message entries too;
+		// drop them regardless of representation so no parent-only prelude
+		// survives into the child.
+		if (entry.type === "custom_message" && FORK_CONTROL_CUSTOM_TYPES[entry.customType ?? ""]) continue;
+		if (entry.type === "message") {
+			const message = entry.message;
+			if (message.role === "custom" && FORK_CONTROL_CUSTOM_TYPES[message.customType ?? ""]) continue;
+			if (message.role === "assistant") {
+				const content = message.content.filter(part => {
+					if (part.type !== "toolCall" || !FORK_CONTROL_TOOLS[part.name]) return true;
+					removedCallIds.add(part.id);
+					return false;
+				});
+				if (content.length === 0) continue;
+				// Neutralize protected reasoning unconditionally: redactedThinking
+				// dropped, signed thinking signatures cleared, and the provider's
+				// opaque native-history payload removed so nothing encrypted or
+				// provider-signed survives into the child's own lineage.
+				const neutralized = content
+					.filter(part => part.type !== "redactedThinking")
+					.map(part => (part.type === "thinking" ? { ...part, thinkingSignature: undefined } : part));
+				if (neutralized.length === 0) continue;
+				const { providerPayload: _providerPayload, ...messageRest } = message;
+				retained.push({ ...entry, message: { ...messageRest, content: neutralized } });
+				continue;
+			}
+			if (message.role === "toolResult") {
+				if (FORK_CONTROL_TOOLS[message.toolName] || removedCallIds.has(message.toolCallId)) continue;
+				retained.push(entry);
+				continue;
+			}
+			retained.push(entry);
+			continue;
+		}
+		if (FORK_NON_CONVERSATION_TYPES[entry.type]) continue;
+		// Every parent compaction boundary — Snapcompact-archived, remote-replay,
+		// or LLM-summarized — is dropped unconditionally so no compaction
+		// provider/replay state survives and every persisted raw message replays
+		// as full visible text; the child compacts later under its own runtime.
+		if (entry.type === "compaction") continue;
+		retained.push(entry);
+	}
+
+	// Drop dangling toolCall blocks and orphan toolResults that survive the
+	// control scrub (e.g. a non-control call whose result was on a sibling path).
+	const pairedResultIds = new Set<string>();
+	for (const entry of retained) {
+		if (entry.type === "message" && entry.message.role === "toolResult")
+			pairedResultIds.add(entry.message.toolCallId);
+	}
+	const presentCallIds = new Set<string>();
+	for (const entry of retained) {
+		if (entry.type === "message" && entry.message.role === "assistant") {
+			for (const part of entry.message.content) if (part.type === "toolCall") presentCallIds.add(part.id);
+		}
+	}
+	const finalRetained: SessionEntry[] = [];
+	for (const entry of retained) {
+		if (entry.type === "message" && entry.message.role === "toolResult") {
+			if (!presentCallIds.has(entry.message.toolCallId)) continue; // orphaned result
+			finalRetained.push(entry);
+			continue;
+		}
+		if (entry.type === "message" && entry.message.role === "assistant") {
+			const content = entry.message.content.filter(part => part.type !== "toolCall" || pairedResultIds.has(part.id));
+			if (content.length === 0) continue; // dangling call turn dropped
+			// The first pass already neutralized protected reasoning and removed
+			// providerPayload; only the dangling-call filter runs here.
+			finalRetained.push({ ...entry, message: { ...entry.message, content } });
+			continue;
+		}
+		finalRetained.push(entry);
+	}
+
+	// Relink every retained parentId to the nearest surviving ancestor (or null
+	// when none remains), preserving original branch order.
+	const retainedById = new Map<string, SessionEntry>();
+	for (const entry of finalRetained) retainedById.set(entry.id, entry);
+	return finalRetained.map(entry => {
+		if (entry.parentId === null) return structuredClone(entry);
+		const seen = new Set<string>();
+		let cursor: string | null = entry.parentId;
+		while (cursor !== null && !seen.has(cursor)) {
+			if (retainedById.has(cursor)) return structuredClone({ ...entry, parentId: cursor });
+			seen.add(cursor);
+			cursor = entriesById.get(cursor)?.parentId ?? null;
+		}
+		return structuredClone({ ...entry, parentId: null });
+	});
+}
+
+/**
+ * Seed the child session with the parent's completed conversation as a native
+ * branch: consume the frozen scheduling-time snapshot (`forkContext.entries`),
+ * scrub runtime/control state, and ingest each surviving entry as a replicated
+ * entry so the child owns all of its compaction/provider/runtime state. No
+ * Snapcompact, no pending-summary folding; the parent's `compaction` entries
+ * are all dropped by the scrub so every persisted raw message is visible.
+ *
+ * A non-null `sourceLeafId` must describe a valid snapshot before scrubbing:
+ * the captured branch is non-empty, ends at exactly that leaf, and starts at a
+ * root entry (`parentId === null`). A malformed snapshot is rejected with a
+ * `Cannot fork task context` error rather than silently seeding a partial or
+ * misplaced branch.
+ */
+function seedForkContext(manager: SessionManager, forkContext: ForkContextSnapshot): void {
+	const entries = forkContext.entries;
+	if (forkContext.sourceLeafId !== null) {
+		if (entries.length === 0) {
+			throw new Error("Cannot fork task context: parent session snapshot is empty");
+		}
+		const tail = entries[entries.length - 1];
+		if (tail === undefined || tail.id !== forkContext.sourceLeafId) {
+			throw new Error("Cannot fork task context: parent session snapshot does not end at the located leaf");
+		}
+		const root = entries[0];
+		if (root === undefined || root.parentId !== null) {
+			throw new Error("Cannot fork task context: parent session snapshot does not start at a root entry");
+		}
+	}
+	const scrubbed = scrubTaskForkEntries(entries);
+	for (const entry of scrubbed) {
+		manager.ingestReplicatedEntry(structuredClone(entry));
+	}
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -2846,33 +3039,29 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			resolvedAt = performance.now();
 			const effectiveCwd = worktree ?? cwd;
 			const forkContext = options.forkContext;
-			const childTranscriptUnavailable = sessionFile === null;
 			const forkSnapshotUnavailable =
 				forkContext === undefined ||
-				forkContext.sessionManager === undefined ||
+				forkContext.entries === undefined ||
 				forkContext.sourceFile === null ||
-				forkContext.sourceFile === undefined;
+				forkContext.sourceFile === undefined ||
+				// A fork must name the leaf it was scheduled from. A null/absent
+				// leaf means the parent had no work to hand off (or the snapshot
+				// is runtime-malformed) — never seed the child from it.
+				forkContext.sourceLeafId == null;
 			const sessionManagerPromise =
 				requestedContextSource === "fork" &&
 				forkContext !== undefined &&
-				forkContext.sessionManager !== undefined &&
-				forkContext.sourceFile !== null &&
-				forkContext.sourceFile !== undefined &&
+				!forkSnapshotUnavailable &&
 				sessionFile !== null
-					? forkContext.sessionManager
-							.forkBranch({
-								sourceFile: forkContext.sourceFile,
-								sourceLeafId: forkContext.sourceLeafId,
-								cwd: effectiveCwd,
-								sessionDir: path.dirname(sessionFile),
-								sessionFile,
-								suppressBreadcrumb: true,
-							})
-							.then(manager => {
-								usedContextSource = "fork";
-								return manager;
-							})
-					: requestedContextSource === "fork" && (forkSnapshotUnavailable || childTranscriptUnavailable)
+					? SessionManager.open(sessionFile, undefined, undefined, {
+							initialCwd: effectiveCwd,
+							suppressBreadcrumb: true,
+						}).then(async manager => {
+							seedForkContext(manager, forkContext);
+							usedContextSource = "fork";
+							return manager;
+						})
+					: requestedContextSource === "fork" && (forkSnapshotUnavailable || sessionFile === null)
 						? Promise.reject(
 								new Error(
 									forkSnapshotUnavailable
@@ -2979,12 +3168,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				getApiKey: options.getApiKey,
 				settings: subagentSettings,
 				model,
-				...(usedContextSource === "fork"
-					? {
-							providerPromptCacheKey: sessionManagerForRun.getHeader()?.providerPromptCacheKey,
-							providerPromptCacheKeySource: "fork" as const,
-						}
-					: {}),
 				modelPattern: model || modelOverride === undefined ? undefined : modelPatterns,
 				modelPatternAuthFallback:
 					model || modelOverride === undefined ? undefined : options.parentActiveModelPattern,
@@ -3066,6 +3249,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				throw err;
 			}
 			sessionCreatedAt = performance.now();
+			if (usedContextSource === "fork") {
+				// The archive is evidence for this child, not live parent-owned control
+				// state. Drop runtime obligations reconstructed during session startup.
+				session.clearCheckpointRuntimeState();
+				session.setTodoPhases([]);
+			}
 
 			monitor.setActiveSession(session);
 			installRegistryStatusSync(session);

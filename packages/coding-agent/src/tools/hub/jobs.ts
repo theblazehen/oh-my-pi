@@ -34,6 +34,7 @@ const WAIT_DURATION_MS: Record<string, number> = {
 	"30s": 30_000,
 	"1m": 60_000,
 	"5m": 5 * 60_000,
+	"29m": 1_740_000,
 };
 
 /**

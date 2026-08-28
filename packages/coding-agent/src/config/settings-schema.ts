@@ -4250,7 +4250,7 @@ export const SETTINGS_SCHEMA = {
 
 	"async.pollWaitDuration": {
 		type: "enum",
-		values: ["5s", "10s", "30s", "1m", "5m", "smart"] as const,
+		values: ["5s", "10s", "30s", "1m", "5m", "29m", "smart"] as const,
 		default: "smart",
 		ui: {
 			tab: "tools",
@@ -4264,6 +4264,7 @@ export const SETTINGS_SCHEMA = {
 				{ value: "30s", label: "30 seconds" },
 				{ value: "1m", label: "1 minute" },
 				{ value: "5m", label: "5 minutes" },
+				{ value: "29m", label: "29 minutes" },
 				{ value: "smart", label: "Smart", description: "Default — adaptive 5s→5m, resets when you stop polling" },
 			],
 		},

@@ -364,7 +364,7 @@ interface SyncSpawnRef {
 
 function captureForkContext(session: ToolSession): ForkContextSnapshot | undefined {
 	const manager = session.sessionManager;
-	if (!manager || typeof manager.forkBranch !== "function") return undefined;
+	if (!manager || typeof manager.getBranch !== "function") return undefined;
 	const branch = manager.getBranch();
 	let sourceLeafId: string | null = null;
 	let foundAssistant = false;
@@ -377,10 +377,18 @@ function captureForkContext(session: ToolSession): ForkContextSnapshot | undefin
 		}
 	}
 	if (!foundAssistant && branch.length > 0) sourceLeafId = branch[branch.length - 1]!.id;
+	// Re-request the branch from the located leaf so the snapshot ends at the
+	// last completed assistant turn — excluding the in-flight task call and any
+	// later entries appended by the live manager after scheduling.
+	const captured = manager.getBranch(sourceLeafId ?? undefined);
 	return {
 		sourceFile: session.getSessionFile(),
 		sourceLeafId,
-		sessionManager: manager,
+		// Freeze the completed pre-task branch at scheduling time: deep-clone
+		// exactly the entries under the located leaf so later parent mutation
+		// (in-flight task call, subsequent messages, compactions) cannot leak
+		// into the child. The child owns all compaction/provider/runtime state.
+		entries: structuredClone(captured),
 	};
 }
 

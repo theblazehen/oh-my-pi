@@ -548,9 +548,44 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		expect(restored?.startedAt).toBe(startedAt);
 		expect(reloadedSession.getLastCompletedRewind()).toBeUndefined();
 
+		const branchBeforeClear = reloadedSession.sessionManager.getBranch();
+		reloadedSession.clearCheckpointRuntimeState();
+		expect(reloadedSession.getCheckpointState()).toBeUndefined();
+		expect(reloadedSession.getLastCompletedRewind()).toBeUndefined();
+		expect(reloadedSession.sessionManager.getBranch()).toEqual(branchBeforeClear);
+
+		// Normal resume still rehydrates from the unchanged branch.
+		const resumedMock = createMockModel({ responses: [] });
+		const resumedAgent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model: resumedMock,
+				systemPrompt: ["Test"],
+				tools: reloadedTools,
+				messages: reloadedSession.sessionManager.buildSessionContext().messages,
+			},
+			convertToLlm,
+			streamFn: resumedMock.stream,
+		});
+		const resumedSession = new AgentSession({
+			agent: resumedAgent,
+			sessionManager: reloadedSession.sessionManager,
+			settings: reloadedSettings,
+			modelRegistry: new ModelRegistry(
+				harness.authStorage,
+				path.join(harness.tempDir.path(), "models-resumed-after-clear.yml"),
+			),
+			toolRegistry: new Map(reloadedTools.map(tool => [tool.name, tool])),
+		});
+		harness.extraSessions.push(resumedSession);
+		expect(resumedSession.getCheckpointState()).toMatchObject({
+			checkpointEntryId: checkpointEntry.id,
+			startedAt,
+		});
+
 		// The rewind tool must accept the request now that the active checkpoint
 		// has been re-hydrated — previously this threw "No active checkpoint".
-		const rewindResult = await rewindToolForSession(reloadedSession).execute("call_rewind_after_resume", {
+		const rewindResult = await rewindToolForSession(resumedSession).execute("call_rewind_after_resume", {
 			report: "post-resume findings",
 		});
 		expect(rewindResult.content.some(part => part.type === "text" && part.text.includes("Rewind requested"))).toBe(
