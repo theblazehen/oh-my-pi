@@ -170,6 +170,9 @@
 
 - Fixed Codex V2 remote compaction bypassing the provider's live WebSocket transport before trying SSE ([#7198](https://github.com/can1357/oh-my-pi/issues/7198)).
 - Tool calls skipped mid-batch to service queued steering/peer input now distinguish calls that never entered `tool.execute` (`SyntheticToolResultDetails`, `executed: false`) from in-flight calls that may have performed partial work (`execution: "started"`), allowing UI/telemetry consumers to render normal steering control flow without misreporting execution state ([#7199](https://github.com/can1357/oh-my-pi/issues/7199)).
+### Fixed
+
+- Made provider-native compaction request timeouts configurable so large Responses V2 and V1 compactions are not unconditionally aborted after three minutes.
 
 ## [17.2.2] - 2026-07-31
 

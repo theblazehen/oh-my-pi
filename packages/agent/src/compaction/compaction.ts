@@ -190,6 +190,8 @@ export interface CompactionSettings {
 	remoteEnabled?: boolean;
 	remoteEndpoint?: string;
 	remoteStreamingV2Enabled?: boolean;
+	/** Per-request timeout for provider-native compaction, in seconds. */
+	remoteTimeoutSeconds?: number;
 	v2RetainedMessageBudget?: number;
 }
 
@@ -1561,6 +1563,8 @@ export async function compact(
 	} = preparation;
 
 	const reserveTokens = settings.reserveTokens ?? DEFAULT_RESERVE_TOKENS;
+	const remoteTimeoutMs =
+		settings.remoteTimeoutSeconds === undefined ? undefined : settings.remoteTimeoutSeconds * 1000;
 
 	const summaryOptions: SummaryOptions = {
 		promptOverride: options?.promptOverride,
@@ -1709,6 +1713,7 @@ export async function compact(
 					key =>
 						requestCompactionV2Streaming(model, key, request, signal, {
 							fetch: summaryOptions.fetch,
+							timeoutMs: remoteTimeoutMs,
 							providerSessionState: summaryOptions.providerSessionState,
 							preferWebsockets: summaryOptions.preferWebsockets,
 							codexCompaction: summaryOptions.codexCompaction,
@@ -1760,6 +1765,7 @@ export async function compact(
 							signal,
 							{
 								fetch: summaryOptions.fetch,
+								timeoutMs: remoteTimeoutMs,
 								sessionId: summaryOptions.sessionId,
 								providerSessionState: summaryOptions.providerSessionState,
 								codexCompaction: summaryOptions.codexCompaction,
