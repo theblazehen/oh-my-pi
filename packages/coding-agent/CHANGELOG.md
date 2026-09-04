@@ -12,6 +12,10 @@
 - OMP worker subprocesses now default to nice 19 without lowering the interactive CLI or Bun worker threads; `OMP_SUBPROCESS_NICE` can override the value or use `inherit` to opt out.
 - Headless Chromium now enables ANGLE Vulkan on Linux when an accessible DRM render node is available, while retaining the existing software/default path elsewhere.
 
+### Fixed
+
+- Added a 10-minute default `compaction.remoteTimeoutSeconds` setting for provider-native compaction while retaining the agent library's existing default for direct callers.
+
 ## [17.2.3] - 2026-08-01
 
 ### Changed

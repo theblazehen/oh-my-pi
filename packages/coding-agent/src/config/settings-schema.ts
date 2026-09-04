@@ -2296,6 +2296,24 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"compaction.remoteTimeoutSeconds": {
+		type: "number",
+		default: 600,
+		ui: {
+			tab: "context",
+			group: "Compaction",
+			label: "Remote Compaction Timeout",
+			description: "Maximum time allowed for each provider-native compaction request",
+			options: [
+				{ value: "180", label: "3 minutes" },
+				{ value: "300", label: "5 minutes" },
+				{ value: "600", label: "10 minutes" },
+				{ value: "900", label: "15 minutes" },
+				{ value: "1800", label: "30 minutes" },
+			],
+		},
+	},
+
 	"compaction.remoteStreamingV2Enabled": {
 		type: "boolean",
 		default: true,
@@ -5692,6 +5710,7 @@ export interface CompactionSettings {
 	remoteEnabled: boolean;
 	remoteEndpoint: string | undefined;
 	remoteStreamingV2Enabled: boolean;
+	remoteTimeoutSeconds: number;
 	v2RetainedMessageBudget: number;
 	idleEnabled: boolean;
 	idleThresholdTokens: number;

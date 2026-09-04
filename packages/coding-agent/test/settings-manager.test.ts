@@ -394,6 +394,20 @@ describe("Settings", () => {
 	});
 
 	describe("defaults", () => {
+		it("allows ten minutes for provider-native compaction by default", async () => {
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("compaction.remoteTimeoutSeconds")).toBe(600);
+			expect(settings.getGroup("compaction").remoteTimeoutSeconds).toBe(600);
+			expect(getDefault("compaction.remoteTimeoutSeconds")).toBe(600);
+		});
+
+		it("preserves an explicit provider-native compaction timeout in the compaction group", () => {
+			const settings = Settings.isolated({ "compaction.remoteTimeoutSeconds": 47 });
+
+			expect(settings.getGroup("compaction").remoteTimeoutSeconds).toBe(47);
+		});
+
 		it("keeps eight inline images live by default", async () => {
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 			expect(settings.get("tui.maxInlineImages")).toBe(8);

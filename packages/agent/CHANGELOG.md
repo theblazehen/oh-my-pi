@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Made provider-native compaction request timeouts configurable so large Responses V2 and V1 compactions are not unconditionally aborted after three minutes.
+
 ## [17.2.2] - 2026-07-31
 
 ### Fixed

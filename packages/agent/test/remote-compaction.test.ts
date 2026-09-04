@@ -699,6 +699,42 @@ describe("requestCompactionV2Streaming", () => {
 		expect(result.usage?.reasoningOutputTokens).toBe(1);
 	});
 
+	test("keeps the 180-second timeout for direct helper callers", async () => {
+		const timeoutSignal = new AbortController().signal;
+		const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeoutSignal);
+		const model = makeOpenAiModel({
+			remoteCompaction: {
+				enabled: true,
+				v2StreamingEnabled: true,
+				v2Endpoint: "https://compact.example/v1/responses",
+			},
+		});
+		const request = buildCompactionV2Request(
+			model,
+			[{ type: "message", role: "user", content: [{ type: "input_text", text: "real user" }] }],
+			"instructions",
+		);
+		const fetchMock: FetchImpl = async (_input, init) => {
+			expect(init?.signal).toBe(timeoutSignal);
+			return sseResponse([
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: { type: "compaction", encrypted_content: "enc_default_timeout" },
+				},
+				{
+					type: "response.completed",
+					response: { usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } },
+				},
+			]);
+		};
+
+		await requestCompactionV2Streaming(model, "test-key", request, undefined, { fetch: fetchMock });
+
+		expect(timeoutSpy).toHaveBeenCalledTimes(1);
+		expect(timeoutSpy).toHaveBeenCalledWith(180_000);
+	});
+
 	test("retries transient V2 stream failures with a fresh request attempt", async () => {
 		const model = makeOpenAiModel({
 			remoteCompaction: {
@@ -1285,6 +1321,27 @@ describe("requestOpenAiRemoteCompaction abort", () => {
 });
 
 describe("requestOpenAiRemoteCompaction timeout", () => {
+	test("keeps the 180-second timeout for direct helper callers", async () => {
+		const timeoutSignal = new AbortController().signal;
+		const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeoutSignal);
+		const fetchMock: FetchImpl = async (_input, init) => {
+			expect(init?.signal).toBe(timeoutSignal);
+			return Response.json({ output: [{ type: "compaction", encrypted_content: "enc_default_timeout" }] });
+		};
+
+		await requestOpenAiRemoteCompaction(
+			makeOpenAiModel(),
+			"test-key",
+			[{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+			"compact",
+			undefined,
+			{ fetch: fetchMock },
+		);
+
+		expect(timeoutSpy).toHaveBeenCalledTimes(1);
+		expect(timeoutSpy).toHaveBeenCalledWith(180_000);
+	});
+
 	test("a never-responding endpoint rejects with TimeoutError instead of hanging", async () => {
 		// Contract: the compact endpoint is a raw fetch outside the pi-ai stream
 		// watchdogs — a silently dropped connection must not hang compaction
@@ -1509,6 +1566,72 @@ describe("compact() remote compaction failure handling", () => {
 		expect(remote?.replacementHistory.at(-1)).toEqual(compactionItem);
 		expect(result.summary).toContain("Remote compaction preserved provider-native history");
 		expect(completeSpy).not.toHaveBeenCalled();
+	});
+
+	test("uses the configured remote timeout for V2 streaming compaction", async () => {
+		const timeoutSignal = new AbortController().signal;
+		const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockImplementation(timeoutMs => {
+			expect(timeoutMs).toBe(47_000);
+			return timeoutSignal;
+		});
+		const preparation = makePreparation();
+		preparation.settings = {
+			...preparation.settings,
+			remoteStreamingV2Enabled: true,
+			remoteTimeoutSeconds: 47,
+		};
+		const model = makeOpenAiModel({
+			remoteCompaction: {
+				enabled: true,
+				v2StreamingEnabled: true,
+				v2Endpoint: "https://compact.example/v1/responses",
+			},
+		});
+		const fetchMock: FetchImpl = async (input, init) => {
+			expect(new URL(String(input)).pathname).toBe("/v1/responses");
+			expect(init?.signal).toBe(timeoutSignal);
+			return sseResponse([
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: { type: "compaction", encrypted_content: "enc_configured_v2_timeout" },
+				},
+				{
+					type: "response.completed",
+					response: { usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11 } },
+				},
+			]);
+		};
+
+		const result = await compact(preparation, model, "test-key", undefined, undefined, { fetch: fetchMock });
+
+		expect(timeoutSpy).toHaveBeenCalledTimes(1);
+		expect(result.shortSummary).toBe("Remote compaction");
+	});
+
+	test("uses the configured remote timeout for V1 native compaction", async () => {
+		const timeoutSignal = new AbortController().signal;
+		const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockImplementation(timeoutMs => {
+			expect(timeoutMs).toBe(47_000);
+			return timeoutSignal;
+		});
+		const preparation = makePreparation();
+		preparation.settings = {
+			...preparation.settings,
+			remoteStreamingV2Enabled: false,
+			remoteTimeoutSeconds: 47,
+		};
+		const model = makeOpenAiModel({ remoteCompaction: { enabled: true } });
+		const fetchMock: FetchImpl = async (input, init) => {
+			expect(new URL(String(input)).pathname).toBe("/v1/responses/compact");
+			expect(init?.signal).toBe(timeoutSignal);
+			return Response.json({ output: [{ type: "compaction", encrypted_content: "enc_configured_v1_timeout" }] });
+		};
+
+		const result = await compact(preparation, model, "test-key", undefined, undefined, { fetch: fetchMock });
+
+		expect(timeoutSpy).toHaveBeenCalledTimes(1);
+		expect(result.shortSummary).toBe("Remote compaction");
 	});
 
 	test("rewrites an oversized trailing tool output before V2 streaming compaction", async () => {
