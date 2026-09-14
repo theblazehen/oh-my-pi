@@ -2064,9 +2064,9 @@ export class Editor implements Component, Focusable {
 		this.#submitValue();
 	}
 
-	#exitHistoryForEditing(): void {
+	#exitHistoryForEditing(preserveStartAnchor = false): void {
 		if (this.#historyIndex === -1) return;
-		if (this.#state.cursorLine === 0 && this.#state.cursorCol === 0) {
+		if (!preserveStartAnchor && this.#state.cursorLine === 0 && this.#state.cursorCol === 0) {
 			this.#state.cursorLine = this.#state.lines.length - 1;
 			const line = this.#state.lines[this.#state.cursorLine] || "";
 			this.#setCursorCol(line.length);
@@ -2199,7 +2199,8 @@ export class Editor implements Component, Focusable {
 	}
 
 	#insertCharacter(char: string): void {
-		this.#exitHistoryForEditing();
+		// Slash commands typed immediately after recalling history should prefix the recalled prompt.
+		this.#exitHistoryForEditing(char.startsWith("/"));
 		// Undo coalescing: consecutive word typing collapses into one undo unit
 		// (mirrors Input); any other action resets the run via #lastAction.
 		const isWordChunk = [...segmenter.segment(char)].every(seg => getWordNavKind(seg.segment) !== "whitespace");

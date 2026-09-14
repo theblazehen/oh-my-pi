@@ -88,6 +88,28 @@ export interface SessionContext {
 	cacheMissExplainedAt?: boolean[];
 }
 
+/**
+ * State derived from entries that precede a bounded resident history window.
+ * The resident entries are still authoritative: changes encountered while
+ * walking them overwrite this seed exactly as they would overwrite older
+ * journal entries in a fully materialized session.
+ */
+export interface SessionContextSeed {
+	thinkingLevel?: string;
+	configuredThinkingLevel?: string;
+	serviceTier?: ServiceTierByFamily;
+	models?: Readonly<Record<string, string>>;
+	injectedTtsrRules?: readonly string[];
+	mode?: string;
+	modeData?: Record<string, unknown>;
+	/** Whether the prefix contains an explicit default-role model change. */
+	hasExplicitDefaultModel?: boolean;
+	/** Transcript cache-reset state at the resident-window boundary. */
+	cacheResetPending?: boolean;
+	/** Last assistant model in the prefix, used only by transcript annotations. */
+	lastAssistantModel?: string;
+}
+
 /** Lists session model strings to try when restoring, in fallback order. */
 export function getRestorableSessionModels(
 	models: Readonly<Record<string, string>>,
@@ -118,6 +140,8 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
 }
 
 export interface BuildSessionContextOptions {
+	/** Derived state from entries before a bounded resident history window. */
+	seed?: SessionContextSeed;
 	/**
 	 * Build the display transcript instead of the LLM context. By default this
 	 * preserves every path entry with compactions inline; set
@@ -236,14 +260,15 @@ export function buildSessionContext(
 	path.reverse();
 
 	// Extract settings and find compaction
-	let thinkingLevel: string | undefined = "off";
-	let configuredThinkingLevel: string | undefined;
-	let serviceTier: ServiceTierByFamily | undefined;
-	const models: Record<string, string> = {};
+	const seed = options?.seed;
+	let thinkingLevel: string | undefined = seed?.thinkingLevel ?? "off";
+	let configuredThinkingLevel: string | undefined = seed?.configuredThinkingLevel;
+	let serviceTier: ServiceTierByFamily | undefined = seed?.serviceTier;
+	const models: Record<string, string> = { ...seed?.models };
 	let compaction: CompactionEntry | null = null;
-	const injectedTtsrRulesSet = new Set<string>();
-	let mode = "none";
-	let modeData: Record<string, unknown> | undefined;
+	const injectedTtsrRulesSet = new Set(seed?.injectedTtsrRules);
+	let mode = seed?.mode ?? "none";
+	let modeData: Record<string, unknown> | undefined = seed?.modeData;
 	// Track whether an explicit `model_change` with role="default" has been
 	// seen on this path. Once a user (or the agent itself) records an
 	// explicit default, later assistant-message inference must NOT overwrite
@@ -251,7 +276,7 @@ export function buildSessionContext(
 	// server-side model downgrades both produce assistant messages tagged
 	// with the wrong model id, which previously clobbered the user's pick on
 	// resume (issue #849).
-	let hasExplicitDefaultModel = false;
+	let hasExplicitDefaultModel = seed?.hasExplicitDefaultModel ?? false;
 
 	for (const entry of path) {
 		if (entry.type === "thinking_level_change") {
@@ -305,9 +330,9 @@ export function buildSessionContext(
 	// 3. Emit messages after compaction
 	const messages: AgentMessage[] = [];
 	const cacheMissExplainedAt: boolean[] = [];
-	let pendingReset = false;
-	let currentMode = "none";
-	let lastAssistantModel: string | undefined;
+	let pendingReset = seed?.cacheResetPending ?? false;
+	let currentMode = seed?.mode ?? "none";
+	let lastAssistantModel: string | undefined = seed?.lastAssistantModel;
 
 	const handleEntryResetTracking = (entry: SessionEntry) => {
 		if (entry.type === "compaction") {

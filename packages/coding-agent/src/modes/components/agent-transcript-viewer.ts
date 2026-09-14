@@ -7,11 +7,12 @@
  * compositing into the live transcript's scrollback. It renders a parked
  * subagent / advisor / collab-guest transcript that has no live in-view session.
  *
- * Local transcripts tail append-only growth: unchanged file identity plus stable
- * sentinels means only newly appended JSONL is parsed and rendered. Rewrites,
- * truncation, rotation, or sentinel drift fall back to a full rebuild so changed
- * historical entries cannot leave stale components behind. Collab guests use the
- * same append path over the host's byte-capped transcript reads.
+ * Local transcripts keep a bounded, line-aligned byte window. The initial open
+ * reads only the tail; app-owned scrolling pages older/newer bytes in from disk
+ * and evicts the opposite edge. Unchanged file identity plus stable sentinels
+ * still permits exactly-once tail appends. Rewrites, truncation, rotation, or
+ * sentinel drift discard the window and reopen the current tail. Collab guests
+ * retain their independent append-only host protocol.
  */
 import * as fs from "node:fs";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
@@ -65,6 +66,12 @@ export interface AgentTranscriptViewerDeps {
 const POLL_MS = 250;
 
 const SENTINEL_BYTES = 4096;
+/** One disk page. A single oversized JSONL record may exceed this soft target. */
+const LOCAL_PAGE_BYTES = 512 * 1024;
+/** Resident complete-line payload. The visible pair of pages may exceed this when one record itself is larger. */
+const LOCAL_RESIDENT_BYTES = 4 * 1024 * 1024;
+/** Start fetching before the viewport hits the hard edge, hiding most disk latency. */
+const LOCAL_PAGE_PREFETCH_ROWS = 6;
 
 /** Sanitize wire-delivered error text for a single TUI row: tabs → spaces,
  *  newlines collapsed, absolute paths shortened, truncated to `maxWidth`.
@@ -83,15 +90,34 @@ interface LocalTranscriptSentinel {
 	bytes: Buffer;
 }
 
+interface LocalTranscriptPage {
+	/** Inclusive byte offset, always at the start of a JSONL line. */
+	start: number;
+	/** Exclusive byte offset, always immediately after a newline. */
+	end: number;
+	bytes: Buffer;
+}
+
 interface LocalTranscriptState {
 	path: string;
 	dev: number;
 	ino: number;
+	/** Number of file bytes consumed by the append detector. */
 	size: number;
 	mtimeMs: number;
-	offset: number;
-	pending: string;
+	/** End of the last complete JSONL line observed at the file tail. */
+	completeEnd: number;
+	/** Incomplete live-tail line. It is never counted against/evicted by the page budget. */
+	pending: Buffer;
+	/** Contiguous complete-line pages currently materialized for display. */
+	pages: LocalTranscriptPage[];
 	sentinels: LocalTranscriptSentinel[];
+}
+
+interface LocalTranscriptTail {
+	page: LocalTranscriptPage | undefined;
+	completeEnd: number;
+	pending: Buffer;
 }
 
 function readFileRangeSync(file: string, offset: number, length: number): Buffer {
@@ -99,26 +125,161 @@ function readFileRangeSync(file: string, offset: number, length: number): Buffer
 	const fd = fs.openSync(file, "r");
 	try {
 		const buffer = Buffer.alloc(length);
-		const bytesRead = fs.readSync(fd, buffer, 0, length, offset);
-		return bytesRead === length ? buffer : buffer.subarray(0, bytesRead);
+		let total = 0;
+		while (total < length) {
+			const bytesRead = fs.readSync(fd, buffer, total, length - total, offset + total);
+			if (bytesRead === 0) break;
+			total += bytesRead;
+		}
+		return total === length ? buffer : buffer.subarray(0, total);
 	} finally {
 		fs.closeSync(fd);
 	}
+}
+
+async function readFileRange(file: string, offset: number, length: number): Promise<Buffer> {
+	if (length <= 0) return Buffer.alloc(0);
+	const handle = await fs.promises.open(file, "r");
+	try {
+		const buffer = Buffer.alloc(length);
+		let total = 0;
+		while (total < length) {
+			const { bytesRead } = await handle.read(buffer, total, length - total, offset + total);
+			if (bytesRead === 0) break;
+			total += bytesRead;
+		}
+		return total === length ? buffer : buffer.subarray(0, total);
+	} finally {
+		await handle.close();
+	}
+}
+
+function firstAndLastNewline(bytes: Buffer): { first: number; last: number } {
+	return { first: bytes.indexOf(0x0a), last: bytes.lastIndexOf(0x0a) };
+}
+
+/**
+ * Read the current tail without ever handing a headless JSONL fragment to the
+ * parser. We normally hold one page; if the first complete record is larger
+ * than a page, extend backward until its preceding newline is found. The same
+ * exception is necessary for an incomplete live record, whose bytes must stay
+ * available until a future append supplies its newline.
+ */
+function readLocalTail(file: string, size: number): LocalTranscriptTail {
+	if (size <= 0) return { page: undefined, completeEnd: 0, pending: Buffer.alloc(0) };
+	let start = Math.max(0, size - LOCAL_PAGE_BYTES);
+	let bytes = readFileRangeSync(file, start, size - start);
+	let aligned = start === 0 || readFileRangeSync(file, start - 1, 1)[0] === 0x0a;
+
+	// At a non-aligned target, the first newline only terminates the headless
+	// record. Extend until either that full oversized record is available or a
+	// second newline leaves at least one complete aligned tail record to render.
+	while (start > 0 && !aligned) {
+		const { first, last } = firstAndLastNewline(bytes);
+		if (first >= 0 && last > first) break;
+		const previousStart = Math.max(0, start - LOCAL_PAGE_BYTES);
+		bytes = Buffer.concat([readFileRangeSync(file, previousStart, start - previousStart), bytes]);
+		start = previousStart;
+		aligned = start === 0 || readFileRangeSync(file, start - 1, 1)[0] === 0x0a;
+	}
+
+	if (!aligned) {
+		const firstNewline = bytes.indexOf(0x0a);
+		if (firstNewline < 0) return { page: undefined, completeEnd: size, pending: Buffer.alloc(0) };
+		start += firstNewline + 1;
+		bytes = bytes.subarray(firstNewline + 1);
+	}
+
+	const lastNewline = bytes.lastIndexOf(0x0a);
+	if (lastNewline < 0) {
+		return { page: undefined, completeEnd: start, pending: Buffer.from(bytes) };
+	}
+	const completeEnd = start + lastNewline + 1;
+	const pageBytes = Buffer.from(bytes.subarray(0, lastNewline + 1));
+	return {
+		page: pageBytes.byteLength > 0 ? { start, end: completeEnd, bytes: pageBytes } : undefined,
+		completeEnd,
+		pending: Buffer.from(bytes.subarray(lastNewline + 1)),
+	};
+}
+
+/** Read the complete-line page immediately preceding an aligned byte offset. */
+async function readPreviousLocalPage(file: string, end: number): Promise<LocalTranscriptPage | undefined> {
+	if (end <= 0) return undefined;
+	let start = Math.max(0, end - LOCAL_PAGE_BYTES);
+	let bytes = await readFileRange(file, start, end - start);
+	let aligned = start === 0 || (await readFileRange(file, start - 1, 1))[0] === 0x0a;
+	while (start > 0 && !aligned) {
+		const { first, last } = firstAndLastNewline(bytes);
+		if (first >= 0 && last > first) break;
+		const previousStart = Math.max(0, start - LOCAL_PAGE_BYTES);
+		bytes = Buffer.concat([await readFileRange(file, previousStart, start - previousStart), bytes]);
+		start = previousStart;
+		aligned = start === 0 || (await readFileRange(file, start - 1, 1))[0] === 0x0a;
+	}
+	if (!aligned) {
+		const firstNewline = bytes.indexOf(0x0a);
+		if (firstNewline < 0) return undefined;
+		start += firstNewline + 1;
+		bytes = bytes.subarray(firstNewline + 1);
+	}
+	if (bytes.byteLength === 0) return undefined;
+	if (bytes.byteLength !== end - start) return undefined;
+	return { start, end, bytes: Buffer.from(bytes) };
+}
+
+/** Read the complete-line page immediately following an aligned byte offset. */
+async function readNextLocalPage(
+	file: string,
+	start: number,
+	completeEnd: number,
+): Promise<LocalTranscriptPage | undefined> {
+	if (start >= completeEnd) return undefined;
+	let end = Math.min(completeEnd, start + LOCAL_PAGE_BYTES);
+	let bytes = await readFileRange(file, start, end - start);
+	while (end < completeEnd && bytes.lastIndexOf(0x0a) < 0) {
+		const nextEnd = Math.min(completeEnd, end + LOCAL_PAGE_BYTES);
+		bytes = Buffer.concat([bytes, await readFileRange(file, end, nextEnd - end)]);
+		end = nextEnd;
+	}
+	if (end < completeEnd) {
+		const lastNewline = bytes.lastIndexOf(0x0a);
+		if (lastNewline < 0) return undefined;
+		end = start + lastNewline + 1;
+		bytes = bytes.subarray(0, lastNewline + 1);
+	}
+	if (bytes.byteLength === 0) return undefined;
+	if (bytes.byteLength !== end - start) return undefined;
+	return { start, end, bytes: Buffer.from(bytes) };
+}
+
+/** Split complete JSONL bytes into independently evictable, line-aligned pages. */
+function splitCompleteLocalPages(start: number, bytes: Buffer): LocalTranscriptPage[] {
+	const pages: LocalTranscriptPage[] = [];
+	let pageStart = 0;
+	while (pageStart < bytes.byteLength) {
+		const targetEnd = Math.min(bytes.byteLength, pageStart + LOCAL_PAGE_BYTES);
+		let pageEnd = targetEnd;
+		if (targetEnd < bytes.byteLength) {
+			const priorNewline = bytes.lastIndexOf(0x0a, targetEnd - 1);
+			if (priorNewline >= pageStart) {
+				pageEnd = priorNewline + 1;
+			} else {
+				const nextNewline = bytes.indexOf(0x0a, targetEnd);
+				pageEnd = nextNewline >= 0 ? nextNewline + 1 : bytes.byteLength;
+			}
+		}
+		const pageBytes = Buffer.from(bytes.subarray(pageStart, pageEnd));
+		pages.push({ start: start + pageStart, end: start + pageEnd, bytes: pageBytes });
+		pageStart = pageEnd;
+	}
+	return pages;
 }
 
 function sentinelOffsets(size: number): number[] {
 	if (size <= 0) return [];
 	const length = Math.min(SENTINEL_BYTES, size);
 	return [...new Set([0, Math.max(0, Math.floor((size - length) / 2)), Math.max(0, size - length)])];
-}
-
-function sentinelsFromBuffer(buffer: Buffer): LocalTranscriptSentinel[] {
-	const size = buffer.byteLength;
-	const length = Math.min(SENTINEL_BYTES, size);
-	return sentinelOffsets(size).map(offset => ({
-		offset,
-		bytes: Buffer.from(buffer.subarray(offset, offset + length)),
-	}));
 }
 
 function sentinelsFromFile(file: string, size: number): LocalTranscriptSentinel[] {
@@ -149,6 +310,13 @@ export class AgentTranscriptViewer implements Component {
 
 	#localState: LocalTranscriptState | undefined;
 	#localUnavailable = "";
+	#localPageToken = 0;
+	#localPageLoadInFlight = false;
+	/** Signed row adjustment applied after ScrollView receives rebuilt lines. */
+	#rowsAddedAbove = 0;
+	#rowAnchorWidth = 1;
+	#lastContentWidth = 1;
+	#viewportHeight = 10;
 	// Remote transcript state (incremental; the host caps each read).
 	#remoteBytes = 0;
 	#remoteFetchInFlight = false;
@@ -199,6 +367,8 @@ export class AgentTranscriptViewer implements Component {
 	dispose(): void {
 		this.#disposed = true;
 		this.#stopPolling();
+		this.#localPageToken++;
+		this.#localPageLoadInFlight = false;
 		this.#remoteToken++;
 		this.#builder.dispose();
 	}
@@ -240,14 +410,18 @@ export class AgentTranscriptViewer implements Component {
 				return;
 			}
 		}
-		this.#loadLocalFull(sessionFile, stat);
+		this.#loadLocalTail(sessionFile, stat);
 	}
 
 	#clearLocal(reason: string): void {
 		if (!this.#localState && this.#localUnavailable === reason) return;
+		this.#localPageToken++;
+		this.#localPageLoadInFlight = false;
+		this.#rowsAddedAbove = 0;
 		this.#localState = undefined;
 		this.#localUnavailable = reason;
 		this.#model = undefined;
+		this.#followBottom = true;
 		this.#rebuild([]);
 	}
 
@@ -260,7 +434,7 @@ export class AgentTranscriptViewer implements Component {
 				current = readFileRangeSync(sessionFile, sentinel.offset, sentinel.bytes.byteLength);
 			} catch (err) {
 				// The file can be unlinked/rotated between statSync and this read.
-				// Treat as not-appendable so #refresh falls back to a guarded full load.
+				// Treat as not-appendable so #refresh falls back to a guarded tail load.
 				logger.debug("transcript viewer: sentinel read failed", { err: String(err) });
 				return false;
 			}
@@ -269,85 +443,394 @@ export class AgentTranscriptViewer implements Component {
 		return true;
 	}
 
-	#loadLocalFull(sessionFile: string, stat: fs.Stats): void {
-		let data: Buffer;
+	#loadLocalTail(sessionFile: string, stat: fs.Stats): void {
+		let tail: LocalTranscriptTail;
+		let sentinels: LocalTranscriptSentinel[];
 		try {
-			data = fs.readFileSync(sessionFile);
+			tail = readLocalTail(sessionFile, stat.size);
+			sentinels = sentinelsFromFile(sessionFile, stat.size);
 		} catch (err) {
 			// Leave #localState unchanged so a transient read error retries next poll.
-			logger.debug("transcript viewer: read failed", { err: String(err) });
+			logger.debug("transcript viewer: tail read failed", { err: String(err) });
 			return;
 		}
-		// The file may have grown between the earlier `statSync` and this read.
-		// Anchor the tail cursor to what we actually consumed so the next poll's
-		// `#appendLocal` never re-renders bytes already in the rebuilt transcript;
-		// re-stat for mtime/identity so the post-read clock matches what's on disk.
+		// Every byte up to the sampled stat must be represented by either the
+		// complete-line cursor or its trailing pending fragment. A short read means
+		// the file changed underneath us; keep the previous window and retry.
+		if (tail.completeEnd + tail.pending.byteLength !== stat.size) return;
 		let post: fs.Stats;
 		try {
 			post = fs.statSync(sessionFile);
 		} catch {
-			post = stat;
+			return;
 		}
-		// A reader that opens the file mid-append sees a trailing partial line
-		// (no terminating newline). Carry those bytes as `pending` so the next
-		// poll's `#appendLocal` joins them with the completion bytes instead of
-		// parsing a headless line fragment and dropping the entry.
-		const text = data.toString("utf-8");
-		const lastNewline = text.lastIndexOf("\n");
-		const complete = lastNewline >= 0 ? text.slice(0, lastNewline + 1) : "";
-		const pending = lastNewline >= 0 ? text.slice(lastNewline + 1) : text;
+		if (
+			post.dev !== stat.dev ||
+			post.ino !== stat.ino ||
+			post.size < stat.size ||
+			(post.size === stat.size && post.mtimeMs !== stat.mtimeMs)
+		)
+			return;
+
+		this.#localPageToken++;
+		this.#localPageLoadInFlight = false;
+		this.#rowsAddedAbove = 0;
 		this.#localUnavailable = "";
 		this.#localState = {
 			path: sessionFile,
-			dev: post.dev,
-			ino: post.ino,
-			size: data.byteLength,
-			mtimeMs: post.mtimeMs,
-			offset: data.byteLength,
-			pending,
-			sentinels: sentinelsFromBuffer(data),
+			dev: stat.dev,
+			ino: stat.ino,
+			size: stat.size,
+			mtimeMs: stat.mtimeMs,
+			completeEnd: tail.completeEnd,
+			pending: tail.pending,
+			pages: tail.page ? [tail.page] : [],
+			sentinels,
 		};
-		this.#model = undefined;
-		this.#rebuild(this.#extractMessages(parseSessionEntries(complete)));
+		this.#followBottom = true;
+		this.#rebuildLocalWindow();
 	}
 
 	#appendLocal(sessionFile: string, stat: fs.Stats, state: LocalTranscriptState): void {
-		let chunk: string;
-		try {
-			chunk = readFileRangeSync(sessionFile, state.offset, stat.size - state.offset).toString("utf-8");
-		} catch (err) {
-			logger.debug("transcript viewer: tail read failed", { err: String(err) });
-			this.#loadLocalFull(sessionFile, stat);
+		const growth = stat.size - state.size;
+		if (growth > LOCAL_PAGE_BYTES) {
+			if (this.#followBottom) this.#loadLocalTail(sessionFile, stat);
+			else this.#advanceParkedLocalTail(sessionFile, stat, state);
 			return;
 		}
-		const combined = state.pending + chunk;
-		const lastNewline = combined.lastIndexOf("\n");
-		const complete = lastNewline >= 0 ? combined.slice(0, lastNewline + 1) : "";
-		const previousModel = this.#model;
-		const parsed = complete ? this.#extractMessages(parseSessionEntries(complete)) : [];
+		let chunk: Buffer;
+		try {
+			chunk = readFileRangeSync(sessionFile, state.size, growth);
+		} catch (err) {
+			logger.debug("transcript viewer: tail read failed", { err: String(err) });
+			this.#loadLocalTail(sessionFile, stat);
+			return;
+		}
+		if (chunk.byteLength !== growth) {
+			this.#loadLocalTail(sessionFile, stat);
+			return;
+		}
+		const combined = Buffer.concat([state.pending, chunk]);
+		const lastNewline = combined.lastIndexOf(0x0a);
+		const complete = lastNewline >= 0 ? Buffer.from(combined.subarray(0, lastNewline + 1)) : Buffer.alloc(0);
+		const pending = Buffer.from(lastNewline >= 0 ? combined.subarray(lastNewline + 1) : combined);
+		const oldCompleteEnd = state.completeEnd;
+		const newCompleteEnd = oldCompleteEnd + complete.byteLength;
 		let sentinels: LocalTranscriptSentinel[];
 		try {
 			sentinels = sentinelsFromFile(sessionFile, stat.size);
 		} catch (err) {
-			// File unlinked/rotated mid-poll: fall back to a guarded full reload
+			// File unlinked/rotated mid-poll: fall back to a guarded tail reload
 			// instead of letting the open escape the poll timer.
 			logger.debug("transcript viewer: sentinel recompute failed", { err: String(err) });
-			this.#loadLocalFull(sessionFile, stat);
+			this.#loadLocalTail(sessionFile, stat);
 			return;
 		}
-		this.#localState = {
+		let post: fs.Stats;
+		try {
+			post = fs.statSync(sessionFile);
+		} catch {
+			return;
+		}
+		if (
+			post.dev !== stat.dev ||
+			post.ino !== stat.ino ||
+			post.size < stat.size ||
+			(post.size === stat.size && post.mtimeMs !== stat.mtimeMs)
+		) {
+			this.#loadLocalTail(sessionFile, post);
+			return;
+		}
+		const windowAtTail = this.#localWindowEnd(state) === oldCompleteEnd;
+		const nextState: LocalTranscriptState = {
 			...state,
 			size: stat.size,
 			mtimeMs: stat.mtimeMs,
-			offset: stat.size,
-			pending: lastNewline >= 0 ? combined.slice(lastNewline + 1) : combined,
+			completeEnd: newCompleteEnd,
+			pending,
 			sentinels,
 		};
+		this.#localState = nextState;
+		if (complete.byteLength === 0 || !windowAtTail) return;
+
+		// A reader parked above the tail keeps its viewport stable. Once appending
+		// would require front eviction, leave the completed bytes cold; paging down
+		// can bring them in without moving the visible record.
+		if (!this.#followBottom && this.#localResidentBytes(nextState.pages) + complete.byteLength > LOCAL_RESIDENT_BYTES)
+			return;
+
+		const lastPage = nextState.pages.at(-1);
+		if (
+			lastPage &&
+			lastPage.end === oldCompleteEnd &&
+			lastPage.bytes.byteLength + complete.byteLength <= LOCAL_PAGE_BYTES
+		) {
+			lastPage.end = newCompleteEnd;
+			lastPage.bytes = Buffer.concat([lastPage.bytes, complete]);
+		} else {
+			nextState.pages.push(...splitCompleteLocalPages(oldCompleteEnd, complete));
+		}
+
+		if (this.#followBottom) {
+			const evicted = this.#trimLocalPages("front", 1);
+			if (evicted) {
+				this.#rebuildLocalWindow();
+				return;
+			}
+		}
+		const previousModel = this.#model;
+		const parsed = this.#extractMessages(parseSessionEntries(complete.toString("utf-8")));
 		if (parsed.length > 0) {
 			this.#append(parsed);
 		} else if (this.#model !== previousModel) {
 			this.deps.requestRender();
 		}
+	}
+
+	/**
+	 * Advance a parked reader after a burst without materializing every byte
+	 * added since the previous poll. The resident pages (and therefore its
+	 * viewport) stay intact, while the new complete-line boundary lets ordinary
+	 * downward paging traverse the cold appended range later.
+	 */
+	#advanceParkedLocalTail(sessionFile: string, stat: fs.Stats, state: LocalTranscriptState): void {
+		let tail: LocalTranscriptTail;
+		let sentinels: LocalTranscriptSentinel[];
+		try {
+			tail = readLocalTail(sessionFile, stat.size);
+			sentinels = sentinelsFromFile(sessionFile, stat.size);
+		} catch (err) {
+			logger.debug("transcript viewer: bounded tail probe failed", { err: String(err) });
+			return;
+		}
+		if (tail.completeEnd + tail.pending.byteLength !== stat.size) return;
+
+		let post: fs.Stats;
+		try {
+			post = fs.statSync(sessionFile);
+		} catch {
+			return;
+		}
+		if (
+			post.dev !== stat.dev ||
+			post.ino !== stat.ino ||
+			post.size < stat.size ||
+			(post.size === stat.size && post.mtimeMs !== stat.mtimeMs)
+		) {
+			this.#loadLocalTail(sessionFile, post);
+			return;
+		}
+
+		this.#localUnavailable = "";
+		this.#localState = {
+			...state,
+			size: stat.size,
+			mtimeMs: stat.mtimeMs,
+			completeEnd: tail.completeEnd,
+			pending: tail.pending,
+			sentinels,
+		};
+	}
+
+	#localWindowStart(state: LocalTranscriptState): number {
+		return state.pages[0]?.start ?? state.completeEnd;
+	}
+
+	#localWindowEnd(state: LocalTranscriptState): number {
+		return state.pages.at(-1)?.end ?? state.completeEnd;
+	}
+
+	#localResidentBytes(pages: readonly LocalTranscriptPage[]): number {
+		let bytes = 0;
+		for (const page of pages) bytes += page.bytes.byteLength;
+		return bytes;
+	}
+
+	#trimLocalPages(edge: "front" | "back", minimumPages: number): boolean {
+		const state = this.#localState;
+		if (!state) return false;
+		let resident = this.#localResidentBytes(state.pages);
+		let evicted = false;
+		while (resident > LOCAL_RESIDENT_BYTES && state.pages.length > minimumPages) {
+			const page = edge === "front" ? state.pages.shift() : state.pages.pop();
+			if (!page) break;
+			resident -= page.bytes.byteLength;
+			evicted = true;
+		}
+		return evicted;
+	}
+
+	#localEntries(state: LocalTranscriptState): SessionMessageEntry[] {
+		this.#model = undefined;
+		const entries: SessionMessageEntry[] = [];
+		for (const page of state.pages) {
+			try {
+				entries.push(...this.#extractMessages(parseSessionEntries(page.bytes.toString("utf-8"))));
+			} catch (err) {
+				// Pages are newline aligned, but a malformed persisted record must not
+				// tear down the fullscreen overlay or poison neighboring pages.
+				logger.debug("transcript viewer: page parse failed", {
+					err: String(err),
+					start: page.start,
+					end: page.end,
+				});
+			}
+		}
+		return entries;
+	}
+
+	#rebuildLocalWindow(anchorDirection: -1 | 0 | 1 = 0, requireVisibleAnchor = false): boolean {
+		const state = this.#localState;
+		if (!state) return false;
+		const oldLines = this.#builder.isEmpty ? [] : this.#builder.container.render(this.#lastContentWidth);
+		if (requireVisibleAnchor && oldLines.length === 0) return false;
+		const oldOffset = this.#scrollView.getScrollOffset();
+		this.#builder.rebuild(this.#localEntries(state));
+		if (!this.#followBottom && anchorDirection !== 0 && oldLines.length > 0) {
+			const newLines = this.#builder.isEmpty ? [] : this.#builder.container.render(this.#lastContentWidth);
+			const delta = this.#anchorRowDelta(oldLines, newLines, oldOffset, anchorDirection, requireVisibleAnchor);
+			if (delta === undefined) {
+				this.deps.requestRender();
+				return false;
+			}
+			this.#rowAnchorWidth = this.#lastContentWidth;
+			this.#rowsAddedAbove += delta;
+		}
+		this.deps.requestRender();
+		return true;
+	}
+
+	/**
+	 * Locate an unchanged row inside the current viewport after a bounded-window
+	 * rebuild. Its old/new index difference is the signed number of rows inserted
+	 * above the anchor (or removed by front eviction). Applying that difference
+	 * after ScrollView.setLines preserves the anchor despite setLines clamping.
+	 */
+	#anchorRowDelta(
+		oldLines: readonly string[],
+		newLines: readonly string[],
+		oldOffset: number,
+		direction: -1 | 1,
+		requireVisibleAnchor: boolean,
+	): number | undefined {
+		const start = Math.max(0, Math.min(oldOffset, oldLines.length - 1));
+		const matchEnd = Math.min(oldLines.length, start + Math.max(1, this.#viewportHeight));
+		const candidateEnd = requireVisibleAnchor ? start + 1 : matchEnd;
+		const viewportRows = new Set(oldLines.slice(start, candidateEnd));
+		const occurrences = new Map<string, number[]>();
+		for (let index = 0; index < newLines.length; index++) {
+			const row = newLines[index]!;
+			if (viewportRows.has(row)) {
+				const indexes = occurrences.get(row);
+				if (indexes) indexes.push(index);
+				else occurrences.set(row, [index]);
+			}
+		}
+		let bestDelta: number | undefined;
+		let bestScore = 0;
+		for (let oldIndex = start; oldIndex < candidateEnd; oldIndex++) {
+			const indexes = occurrences.get(oldLines[oldIndex]!);
+			if (!indexes) continue;
+			for (const newIndex of indexes) {
+				const delta = newIndex - oldIndex;
+				if ((direction < 0 && delta < 0) || (direction > 0 && delta > 0)) continue;
+				let score = 1;
+				while (
+					oldIndex + score < matchEnd &&
+					newIndex + score < newLines.length &&
+					oldLines[oldIndex + score] === newLines[newIndex + score]
+				)
+					score++;
+				if (score > bestScore || (score === bestScore && Math.abs(delta) < Math.abs(bestDelta ?? Infinity))) {
+					bestScore = score;
+					bestDelta = delta;
+				}
+			}
+		}
+		return requireVisibleAnchor && bestScore < matchEnd - start ? undefined : bestDelta;
+	}
+
+	#maybeLoadLocalPage(direction: -1 | 1): void {
+		if (this.#disposed || this.deps.remote || this.#localPageLoadInFlight) return;
+		const state = this.#localState;
+		if (!state) return;
+		const offset = this.#scrollView.getScrollOffset();
+		const maxOffset = this.#scrollView.getMaxScrollOffset();
+		if (direction < 0 && (offset > LOCAL_PAGE_PREFETCH_ROWS || this.#localWindowStart(state) <= 0)) return;
+		if (
+			direction > 0 &&
+			(maxOffset - offset > LOCAL_PAGE_PREFETCH_ROWS || this.#localWindowEnd(state) >= state.completeEnd)
+		)
+			return;
+
+		const boundary = direction < 0 ? this.#localWindowStart(state) : this.#localWindowEnd(state);
+		const completeEnd = state.completeEnd;
+		const token = this.#localPageToken;
+		this.#localPageLoadInFlight = true;
+		void (
+			direction < 0
+				? readPreviousLocalPage(state.path, boundary)
+				: readNextLocalPage(state.path, boundary, completeEnd)
+		)
+			.then(page => {
+				if (!page || this.#disposed || token !== this.#localPageToken) return;
+				const current = this.#localState;
+				if (!current || current.path !== state.path || current.dev !== state.dev || current.ino !== state.ino)
+					return;
+				if (direction < 0 && this.#localWindowStart(current) !== boundary) return;
+				if (direction > 0 && this.#localWindowEnd(current) !== boundary) return;
+
+				let post: fs.Stats;
+				try {
+					post = fs.statSync(current.path);
+				} catch {
+					return;
+				}
+				if (!this.#canAppendLocal(current.path, post, current)) {
+					this.#loadLocalTail(current.path, post);
+					return;
+				}
+
+				if (direction < 0) {
+					// `page.end === boundary`: the first byte already in the window is
+					// never included twice, and readPreviousLocalPage drops its headless line.
+					if (page.end !== boundary) return;
+					const oldPages = [...current.pages];
+					current.pages.unshift(page);
+					const evictedBack = this.#trimLocalPages("back", 2);
+					if (evictedBack && !this.#rebuildLocalWindow(direction, true)) {
+						// Back eviction is normally far below an upward-scrolling viewport,
+						// but retain the old bounded window if any visible row was in it.
+						current.pages = oldPages;
+						this.#builder.rebuild(this.#localEntries(current));
+						return;
+					}
+					if (evictedBack) return;
+				} else {
+					if (page.start !== boundary || page.end > current.completeEnd) return;
+					const oldPages = [...current.pages];
+					current.pages.push(page);
+					const evictedFront = this.#trimLocalPages("front", 2);
+					if (evictedFront && !this.#rebuildLocalWindow(direction, true)) {
+						// At least one current viewport row belonged to an eviction candidate.
+						// Restore the bounded old window rather than silently jumping over it.
+						current.pages = oldPages;
+						this.#builder.rebuild(this.#localEntries(current));
+						return;
+					}
+					if (evictedFront) return;
+				}
+				this.#rebuildLocalWindow(direction);
+			})
+			.catch((err: unknown) => {
+				logger.debug("transcript viewer: page read failed", { err: String(err) });
+			})
+			.finally(() => {
+				if (token === this.#localPageToken) {
+					this.#localPageLoadInFlight = false;
+					if (this.#initialEntryId && !this.#disposed) this.deps.requestRender();
+				}
+			});
 	}
 
 	#fetchRemote(): void {
@@ -451,6 +934,7 @@ export class AgentTranscriptViewer implements Component {
 				if (event.wheel !== null) {
 					this.#scrollView.scroll(event.wheel * 3);
 					this.#syncFollow();
+					this.#maybeLoadLocalPage(event.wheel < 0 ? -1 : 1);
 					this.deps.requestRender();
 				}
 				return true;
@@ -498,29 +982,45 @@ export class AgentTranscriptViewer implements Component {
 
 	/** Returns true when the key was a scroll command. ScrollView owns the offset. */
 	#handleScroll(data: string): boolean {
+		let direction: -1 | 1;
 		if (this.#scrollView.handleScrollKey(data)) {
+			direction =
+				matchesKey(data, "shift+up") ||
+				matchesKey(data, "up") ||
+				matchesKey(data, "pageUp") ||
+				matchesKey(data, "home")
+					? -1
+					: 1;
 			this.#syncFollow();
+			this.#maybeLoadLocalPage(direction);
 			this.deps.requestRender();
 			return true;
 		}
 		if (matchesKey(data, "j") || matchesSelectDown(data)) {
 			this.#scrollView.scroll(1);
+			direction = 1;
 		} else if (matchesKey(data, "k") || matchesSelectUp(data)) {
 			this.#scrollView.scroll(-1);
+			direction = -1;
 		} else if (data === "g") {
 			this.#scrollView.scrollToTop();
+			direction = -1;
 		} else if (data === "G") {
 			this.#scrollView.scrollToBottom();
+			direction = 1;
 		} else {
 			return false;
 		}
 		this.#syncFollow();
+		this.#maybeLoadLocalPage(direction);
 		this.deps.requestRender();
 		return true;
 	}
 
 	#syncFollow(): void {
-		this.#followBottom = this.#scrollView.getScrollOffset() >= this.#scrollView.getMaxScrollOffset();
+		const state = this.#localState;
+		const windowAtTail = !state || this.#localWindowEnd(state) >= state.completeEnd;
+		this.#followBottom = windowAtTail && this.#scrollView.getScrollOffset() >= this.#scrollView.getMaxScrollOffset();
 	}
 
 	#submit(text: string): void {
@@ -578,10 +1078,15 @@ export class AgentTranscriptViewer implements Component {
 		// Chrome: top border + header rows + divider border + (notice) + editor + footer + bottom border.
 		const chrome = headerLines.length + 2 + editorLines.length + footerLines.length + (noticeLine ? 1 : 0) + 1;
 		const viewportHeight = Math.max(3, termHeight - chrome);
+		this.#lastContentWidth = contentWidth;
+		this.#viewportHeight = viewportHeight;
 
 		const contentLines = this.#builder.isEmpty
 			? [` ${theme.fg("dim", this.#placeholder(Math.max(10, contentWidth - 1)))}`]
 			: this.#builder.container.render(contentWidth);
+		// setLines/setHeight clamp their owned offset. Capture it first and apply
+		// the signed prepend/front-eviction row delta only after both clamps.
+		const anchoredOffset = this.#scrollView.getScrollOffset();
 		this.#scrollView.setLines(contentLines);
 		this.#scrollView.setHeight(viewportHeight);
 		if (this.#initialEntryId) {
@@ -590,10 +1095,18 @@ export class AgentTranscriptViewer implements Component {
 				this.#followBottom = false;
 				this.#scrollView.setScrollOffset(Math.max(0, targetRow - 1));
 				this.#initialEntryId = undefined;
+			} else if (this.#localState && !this.deps.remote) {
+				this.#followBottom = false;
+				this.#scrollView.scrollToTop();
+				if (this.#localWindowStart(this.#localState) > 0) this.#maybeLoadLocalPage(-1);
+				else this.#initialEntryId = undefined;
 			}
 		} else if (this.#followBottom) {
 			this.#scrollView.scrollToBottom();
+		} else if (this.#rowsAddedAbove !== 0 && this.#rowAnchorWidth === contentWidth) {
+			this.#scrollView.setScrollOffset(anchoredOffset + this.#rowsAddedAbove);
 		}
+		this.#rowsAddedAbove = 0;
 
 		const lines: string[] = [];
 		lines.push(...new DynamicBorder().render(width));

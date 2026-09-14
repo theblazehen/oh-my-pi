@@ -94,7 +94,7 @@ describe("InputController.handleCtrlZ", () => {
 		expect(showError).not.toHaveBeenCalled();
 
 		// Simulating the kernel-delivered SIGCONT drives the TUI back up.
-		sigcontListener = onceSpy.mock.calls.find(([sig]) => sig === "SIGCONT")?.[1];
+		sigcontListener = onceSpy.mock.calls.find(([sig]) => String(sig) === "SIGCONT")?.[1];
 		expect(sigcontListener).toBeDefined();
 		sigcontListener?.();
 		expect(ui.start).toHaveBeenCalledTimes(1);
@@ -119,7 +119,7 @@ describe("InputController.handleCtrlZ", () => {
 		// The exact listener we registered for SIGCONT is the one we
 		// remove; otherwise a leaked handler would fire on the next
 		// unrelated continue and re-`start()` an already-running TUI.
-		sigcontListener = onceSpy.mock.calls.find(([sig]) => sig === "SIGCONT")?.[1];
+		sigcontListener = onceSpy.mock.calls.find(([sig]) => String(sig) === "SIGCONT")?.[1];
 		expect(sigcontListener).toBeDefined();
 		expect(removeSpy).toHaveBeenCalledWith("SIGCONT", sigcontListener);
 

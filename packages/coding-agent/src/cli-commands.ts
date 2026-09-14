@@ -224,6 +224,7 @@ export const commands: CommandEntry[] = [
 		aliases: ["q"],
 		help: commandHelp.searchHelp,
 	},
+	{ name: "sessions", load: () => import("./commands/sessions").then(m => m.default) },
 ];
 
 // Documented-looking plugin/marketplace verbs that are NOT registered top-level

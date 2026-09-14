@@ -433,6 +433,84 @@ describe("AsyncJobManager", () => {
 		manager.cancel(firstJobId);
 	});
 
+	test("reserves capacity across intervening registrations", () => {
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 2,
+			onJobComplete: async () => {},
+		});
+		const runUntilCancelled = async ({ signal }: { signal: AbortSignal }): Promise<string> => {
+			await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+			return "done";
+		};
+
+		const lease = manager.tryReserveSlot();
+		expect(lease).toBeDefined();
+		expect(manager.atCapacity).toBe(false);
+
+		const ordinaryJobId = manager.register("bash", "ordinary", runUntilCancelled);
+		expect(manager.atCapacity).toBe(true);
+		expect(() => manager.register("bash", "over-cap", async () => "nope")).toThrow(/Background job limit reached/);
+
+		const reservedJobId = manager.registerReserved(lease!, "bash", "reserved", runUntilCancelled);
+		expect(manager.getRunningJobs()).toHaveLength(2);
+		expect(manager.atCapacity).toBe(true);
+
+		manager.cancel(ordinaryJobId);
+		manager.cancel(reservedJobId);
+	});
+
+	test("released reservations restore capacity and release idempotently", () => {
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 1,
+			onJobComplete: async () => {},
+		});
+
+		const lease = manager.tryReserveSlot();
+		expect(lease).toBeDefined();
+		expect(manager.atCapacity).toBe(true);
+		expect(manager.tryReserveSlot()).toBeUndefined();
+		expect(() => manager.register("bash", "blocked", async () => "blocked")).toThrow(/Background job limit reached/);
+
+		lease!.release();
+		lease!.release();
+		expect(manager.atCapacity).toBe(false);
+
+		const jobId = manager.register("bash", "after release", async () => "done");
+		expect(manager.getJob(jobId)).toBeDefined();
+	});
+
+	test("registerReserved consumes only the exact live reservation", () => {
+		const firstManager = new AsyncJobManager({ maxRunningJobs: 1, onJobComplete: async () => {} });
+		const secondManager = new AsyncJobManager({ maxRunningJobs: 1, onJobComplete: async () => {} });
+		const lease = firstManager.tryReserveSlot();
+		expect(lease).toBeDefined();
+
+		expect(() => secondManager.registerReserved(lease!, "bash", "wrong manager", async () => "nope")).toThrow(
+			/Invalid or already consumed/,
+		);
+		const jobId = firstManager.registerReserved(lease!, "bash", "reserved", async () => "done");
+		expect(firstManager.getJob(jobId)).toBeDefined();
+		expect(() => firstManager.registerReserved(lease!, "bash", "again", async () => "nope")).toThrow(
+			/Invalid or already consumed/,
+		);
+		lease!.release();
+	});
+
+	test("dispose invalidates and releases outstanding reservations", async () => {
+		const manager = new AsyncJobManager({ maxRunningJobs: 1, onJobComplete: async () => {} });
+		const lease = manager.tryReserveSlot();
+		expect(lease).toBeDefined();
+		expect(manager.atCapacity).toBe(true);
+
+		expect(await manager.dispose()).toBe(true);
+		lease!.release();
+		lease!.release();
+		expect(() => manager.registerReserved(lease!, "bash", "disposed", async () => "nope")).toThrow(
+			/manager is disposed/,
+		);
+		expect(manager.tryReserveSlot()).toBeUndefined();
+	});
+
 	test("queued jobs do not count toward the cap until markRunning", async () => {
 		const manager = new AsyncJobManager({
 			maxRunningJobs: 1,
@@ -447,7 +525,7 @@ describe("AsyncJobManager", () => {
 			"queued",
 			async ({ markRunning }) => {
 				await gate.promise;
-				markRunning();
+				await markRunning();
 				started.resolve();
 				await release.promise;
 				return "queued done";
@@ -472,6 +550,238 @@ describe("AsyncJobManager", () => {
 		release.resolve();
 		await manager.waitForAll();
 		expect(manager.getJob(queuedJobId)?.status).toBe("completed");
+	});
+
+	test("queued jobs wait for a steering reservation to release its only slot", async () => {
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 1,
+			onJobComplete: async () => {},
+		});
+		const lease = manager.tryReserveSlot();
+		expect(lease).toBeDefined();
+
+		const gate = Promise.withResolvers<void>();
+		const markRunningCalled = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let actualWorkStarted = false;
+		const queuedJobId = manager.register(
+			"task",
+			"queued behind reservation",
+			async ({ markRunning }) => {
+				await gate.promise;
+				const permit = markRunning();
+				markRunningCalled.resolve();
+				await permit;
+				actualWorkStarted = true;
+				started.resolve();
+				await release.promise;
+				return "queued done";
+			},
+			{ queued: true },
+		);
+
+		gate.resolve();
+		await markRunningCalled.promise;
+		expect(actualWorkStarted).toBe(false);
+		expect(manager.getJob(queuedJobId)?.queued).toBe(true);
+		expect(manager.atCapacity).toBe(true);
+
+		lease!.release();
+		await started.promise;
+		expect(actualWorkStarted).toBe(true);
+		expect(manager.getJob(queuedJobId)?.queued).toBe(false);
+		expect(() => manager.register("bash", "over cap", async () => "nope")).toThrow(/Background job limit reached/);
+
+		release.resolve();
+		await manager.waitForAll();
+		expect(manager.getJob(queuedJobId)?.status).toBe("completed");
+		expect(manager.atCapacity).toBe(false);
+	});
+
+	test("concurrent queued waiters acquire one running slot sequentially", async () => {
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 1,
+			onJobComplete: async () => {},
+		});
+		const lease = manager.tryReserveSlot();
+		expect(lease).toBeDefined();
+
+		const gate = Promise.withResolvers<void>();
+		const firstAttempted = Promise.withResolvers<void>();
+		const secondAttempted = Promise.withResolvers<void>();
+		const firstStartObserved = Promise.withResolvers<void>();
+		const secondStarted = Promise.withResolvers<void>();
+		const firstRelease = Promise.withResolvers<void>();
+		const secondRelease = Promise.withResolvers<void>();
+		const started: string[] = [];
+		const releases = new Map([
+			["first", firstRelease],
+			["second", secondRelease],
+		]);
+		const attempts = new Map([
+			["first", firstAttempted],
+			["second", secondAttempted],
+		]);
+
+		const registerQueued = (label: "first" | "second"): string =>
+			manager.register(
+				"task",
+				label,
+				async ({ markRunning }) => {
+					await gate.promise;
+					const permit = markRunning();
+					attempts.get(label)!.resolve();
+					await permit;
+					started.push(label);
+					if (started.length === 1) {
+						// Let every permit continuation released in this turn run before
+						// observing the count. A broken broadcast wake would expose both.
+						await Promise.resolve();
+						await Promise.resolve();
+						firstStartObserved.resolve();
+					} else {
+						secondStarted.resolve();
+					}
+					await releases.get(label)!.promise;
+					return `${label} done`;
+				},
+				{ queued: true },
+			);
+
+		const firstJobId = registerQueued("first");
+		const secondJobId = registerQueued("second");
+		gate.resolve();
+		await Promise.all([firstAttempted.promise, secondAttempted.promise]);
+		expect(started).toEqual([]);
+		expect(manager.getJob(firstJobId)?.queued).toBe(true);
+		expect(manager.getJob(secondJobId)?.queued).toBe(true);
+
+		lease!.release();
+		await firstStartObserved.promise;
+		expect(started).toHaveLength(1);
+		const firstLabel = started[0]!;
+		const waitingLabel = firstLabel === "first" ? "second" : "first";
+		const waitingJobId = waitingLabel === "first" ? firstJobId : secondJobId;
+		expect(manager.getJob(waitingJobId)?.queued).toBe(true);
+
+		releases.get(firstLabel)!.resolve();
+		await secondStarted.promise;
+		expect(started).toEqual([firstLabel, waitingLabel]);
+		expect(manager.getJob(waitingJobId)?.queued).toBe(false);
+
+		releases.get(waitingLabel)!.resolve();
+		await manager.waitForAll();
+		expect(manager.getJob(firstJobId)?.status).toBe("completed");
+		expect(manager.getJob(secondJobId)?.status).toBe("completed");
+		expect(manager.atCapacity).toBe(false);
+	});
+
+	test("cancelling a queued waiter rejects markRunning without starting work", async () => {
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 1,
+			onJobComplete: async () => {},
+		});
+		const lease = manager.tryReserveSlot();
+		expect(lease).toBeDefined();
+
+		const markRunningCalled = Promise.withResolvers<void>();
+		let markRunningError: string | undefined;
+		let actualWorkStarted = false;
+		const queuedJobId = manager.register(
+			"task",
+			"cancelled waiter",
+			async ({ markRunning }) => {
+				const permit = markRunning();
+				markRunningCalled.resolve();
+				try {
+					await permit;
+				} catch (error) {
+					markRunningError = error instanceof Error ? error.message : String(error);
+					throw error;
+				}
+				actualWorkStarted = true;
+				return "should not run";
+			},
+			{ queued: true },
+		);
+
+		await markRunningCalled.promise;
+		expect(manager.cancel(queuedJobId)).toBe(true);
+		await manager.waitForAll();
+		expect(markRunningError).toMatch(/cancelled/i);
+		expect(actualWorkStarted).toBe(false);
+		expect(manager.getJob(queuedJobId)?.status).toBe("cancelled");
+
+		lease!.release();
+		expect(manager.atCapacity).toBe(false);
+	});
+
+	test("disposing the manager rejects queued waiters without starting work", async () => {
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 1,
+			onJobComplete: async () => {},
+		});
+		const lease = manager.tryReserveSlot();
+		expect(lease).toBeDefined();
+
+		const markRunningCalled = Promise.withResolvers<void>();
+		let markRunningError: string | undefined;
+		let actualWorkStarted = false;
+		manager.register(
+			"task",
+			"disposed waiter",
+			async ({ markRunning }) => {
+				const permit = markRunning();
+				markRunningCalled.resolve();
+				try {
+					await permit;
+				} catch (error) {
+					markRunningError = error instanceof Error ? error.message : String(error);
+					throw error;
+				}
+				actualWorkStarted = true;
+				return "should not run";
+			},
+			{ queued: true },
+		);
+
+		await markRunningCalled.promise;
+		expect(await manager.dispose()).toBe(true);
+		expect(markRunningError).toMatch(/disposed/i);
+		expect(actualWorkStarted).toBe(false);
+		expect(manager.getAllJobs()).toEqual([]);
+		lease!.release();
+	});
+
+	test("registerReserved rejects queued jobs without consuming their lease", async () => {
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 1,
+			onJobComplete: async () => {},
+		});
+		const lease = manager.tryReserveSlot();
+		expect(lease).toBeDefined();
+		let rejectedRunStarted = false;
+
+		expect(() =>
+			manager.registerReserved(
+				lease!,
+				"task",
+				"invalid queued reservation",
+				async () => {
+					rejectedRunStarted = true;
+					return "nope";
+				},
+				{ queued: true },
+			),
+		).toThrow(/queued/i);
+		expect(rejectedRunStarted).toBe(false);
+		expect(manager.atCapacity).toBe(true);
+
+		const jobId = manager.registerReserved(lease!, "bash", "valid reservation", async () => "done");
+		await manager.waitForAll();
+		expect(manager.getJob(jobId)?.status).toBe("completed");
+		expect(manager.atCapacity).toBe(false);
 	});
 
 	test("evicts completed jobs after retention period", async () => {

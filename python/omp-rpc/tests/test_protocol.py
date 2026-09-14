@@ -82,7 +82,7 @@ class ProtocolParsingTests(unittest.TestCase):
                 "isCompacting": False,
                 "steeringMode": "one-at-a-time",
                 "followUpMode": "all",
-                "interruptMode": "immediate",
+                "interruptMode": "blocking",
                 "sessionFile": "/tmp/test.jsonl",
                 "sessionId": "session-123",
                 "sessionName": "Scratchpad",
@@ -125,6 +125,7 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertIsInstance(state, SessionState)
         self.assertEqual(state.session_id, "session-123")
         self.assertEqual(state.follow_up_mode, "all")
+        self.assertEqual(state.interrupt_mode, "blocking")
         self.assertEqual(state.model.id if state.model else None, "claude-sonnet-4-5")
         self.assertEqual(state.todo_phases[0].tasks[0].status, "in_progress")
         # Legacy bare-string systemPrompt is accepted and wrapped to a tuple.

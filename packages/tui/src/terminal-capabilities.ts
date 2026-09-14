@@ -570,11 +570,11 @@ export function resolveImageProtocol(
 	if (imageProtocol !== null && isPaseoEmbedder(env)) {
 		return null;
 	}
-	// Herdr owns the pane grid but does not expose whether the attached client
-	// enabled its experimental Kitty renderer. Outer-terminal identity variables
-	// can leak into the pane, so only the explicit protocol override is safe.
-	if (imageProtocol !== null && isInsideHerdr(env)) {
-		return null;
+	// Herdr owns the pane grid and exports an explicit capability from the server.
+	// Pane shells intentionally use a neutral TERM, so the capability must enable
+	// Kitty even when no outer-terminal identity leaks into the persistent PTY.
+	if (isInsideHerdr(env)) {
+		return env.HERDR_KITTY_GRAPHICS === "1" && isTTY ? ImageProtocol.Kitty : null;
 	}
 	return imageProtocol;
 }

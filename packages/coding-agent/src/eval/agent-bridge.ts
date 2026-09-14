@@ -208,7 +208,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 			"task",
 			id,
 			async ({ signal, reportProgress, markRunning }) => {
-				markRunning();
+				await markRunning();
 				let latestProgress: AgentProgress | undefined;
 				try {
 					const execution = await runStructuredSubagent({

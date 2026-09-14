@@ -952,7 +952,6 @@ describe("Settings", () => {
 
 			expect(settings.getGroup("compaction").remoteTimeoutSeconds).toBe(47);
 		});
-
 	});
 
 	describe("live persisted reload", () => {

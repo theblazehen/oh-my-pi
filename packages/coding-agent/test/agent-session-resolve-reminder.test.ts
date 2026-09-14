@@ -77,7 +77,7 @@ describe("AgentSession resolve reminder", () => {
 		}
 		if (transition === "branch") {
 			session.sessionManager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
-			const [target] = session.getUserMessagesForBranching();
+			const [target] = await session.getUserMessagesForBranching();
 			if (!target) throw new Error("Expected a branchable user message");
 			const result = await session.branch(target.entryId);
 			expect(result.cancelled).toBe(false);

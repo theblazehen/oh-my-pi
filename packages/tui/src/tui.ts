@@ -1447,7 +1447,7 @@ export class TUI extends Container {
 		} while (this.#imageBudget.endPass());
 		const viewport = rendered.length > height ? rendered.slice(rendered.length - height) : Array.from(rendered);
 		this.#extractCursorMarkers(viewport);
-		this.#emitAltFrame(this.#prepareLinesArray(viewport, width), width, height);
+		this.#emitAltFrame(this.#prepareLinesArray(viewport, width), width, height, null);
 	}
 
 	/**
@@ -3034,15 +3034,22 @@ export class TUI extends Container {
 			}
 			if (same) {
 				const previous = this.#hardwareCursorState;
-				if (target
-					? !previous || target.row !== previous.row || target.col !== previous.col || target.visible !== previous.visible
-					: previous?.visible !== false) {
+				if (
+					target
+						? !previous ||
+							target.row !== previous.row ||
+							target.col !== previous.col ||
+							target.visible !== previous.visible
+						: previous?.visible !== false
+				) {
 					this.terminal.write(HIDE_CURSOR + cursorSequence);
 					if (target) this.#recordHardwareCursorState(target);
 					else this.#recordHardwareCursorHidden();
 				}
 				this.#debugPaint = {
-					lines: fitted, windowTop: 0, altScreen: true,
+					lines: fitted,
+					windowTop: 0,
+					altScreen: true,
 					...(target === null ? {} : { cursor: { x: target.col, y: target.row, visible: target.visible } }),
 				};
 				return;
@@ -3060,7 +3067,9 @@ export class TUI extends Container {
 		else this.#recordHardwareCursorState({ row: Math.max(0, height - 1), col: 0, visible: false });
 		this.#altPreviousLines = fitted;
 		this.#debugPaint = {
-			lines: fitted, windowTop: 0, altScreen: true,
+			lines: fitted,
+			windowTop: 0,
+			altScreen: true,
 			...(target === null ? {} : { cursor: { x: target.col, y: target.row, visible: target.visible } }),
 		};
 		this.#fullRedrawCount += 1;

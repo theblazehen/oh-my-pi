@@ -49,7 +49,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 
 	const rehydrate = async (ctx: ExtensionContext): Promise<void> => {
 		const runtime = getRuntime(ctx);
-		const control = reconstructControlState(ctx.sessionManager.getBranch());
+		const control = reconstructControlState(await ctx.sessionManager.getBranchAsync());
 		runtime.goal = control.goal;
 		runtime.autoResumeArmed = false;
 		runtime.lastAutoResumePendingRunNumber = null;
@@ -260,10 +260,6 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		dashboard.updateWidget(ctx, runtime);
 		dashboard.requestRender();
 		if (!runtime.autoresearchMode) return;
-		if (ctx.hasPendingMessages()) {
-			runtime.autoResumeArmed = false;
-			return;
-		}
 		const { session } = await loadActiveSession(ctx);
 		const storage = session ? await openAutoresearchStorageIfExists(ctx.cwd) : null;
 		const pendingRow = session && storage ? storage.getPendingRun(session.id) : null;

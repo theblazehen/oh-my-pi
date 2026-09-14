@@ -87,7 +87,8 @@ export class TodoTracker {
 
 	/** Rehydrates todo phases from the current transcript branch. */
 	syncFromBranch(): void {
-		this.setPhases(getLatestTodoPhasesFromEntries(this.#host.sessionManager.getBranch()));
+		const manager = this.#host.sessionManager;
+		this.setPhases(getLatestTodoPhasesFromEntries(manager.getBranch(), manager.getTodoPhasesSeed()));
 	}
 
 	/** Returns a defensive clone suitable for snapshots and branch state. */

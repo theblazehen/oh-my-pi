@@ -92,7 +92,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession branching", () =>
 		await session.agent.waitForIdle();
 
 		// Should have exactly 1 user message available for branching
-		const userMessages = session.getUserMessagesForBranching();
+		const userMessages = await session.getUserMessagesForBranching();
 		expect(userMessages.length).toBe(1);
 		expect(userMessages[0].text).toBe("Say hello");
 
@@ -120,7 +120,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession branching", () =>
 		await session.agent.waitForIdle();
 
 		// Should have 1 user message
-		const userMessages = session.getUserMessagesForBranching();
+		const userMessages = await session.getUserMessagesForBranching();
 		expect(userMessages.length).toBe(1);
 
 		// Verify we have messages before branching
@@ -152,7 +152,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession branching", () =>
 		await session.agent.waitForIdle();
 
 		// Should have 3 user messages
-		const userMessages = session.getUserMessagesForBranching();
+		const userMessages = await session.getUserMessagesForBranching();
 		expect(userMessages.length).toBe(3);
 
 		// Branch from second message (keeps first message + response)

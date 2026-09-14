@@ -276,6 +276,7 @@ function subprocessEnv(overrides: Record<string, string | undefined>): Record<st
 		"KITTY_WINDOW_ID",
 		"GHOSTTY_RESOURCES_DIR",
 		"HERDR_ENV",
+		"HERDR_KITTY_GRAPHICS",
 		"HERDR_PANE_ID",
 		"HERDR_TAB_ID",
 		"HERDR_WORKSPACE_ID",
@@ -302,6 +303,20 @@ describe("Herdr image protocol mask", () => {
 
 		expect(terminalId).toBe("ghostty");
 		expect(resolveImageProtocol(terminalId, env, true)).toBeNull();
+	});
+
+	it("accepts Kitty from a neutral Herdr pane when retained graphics are advertised", () => {
+		const env = {
+			COLORTERM: "truecolor",
+			HERDR_ENV: "1",
+			HERDR_KITTY_GRAPHICS: "1",
+			TERM: "xterm-256color",
+		};
+		const terminalId = detectTerminalId(env);
+
+		expect(terminalId).toBe("trueColor");
+		expect(resolveImageProtocol(terminalId, env, true)).toBe(ImageProtocol.Kitty);
+		expect(resolveImageProtocol(terminalId, env, false)).toBeNull();
 	});
 
 	it("rejects a leaked Ghostty protocol when HERDR_PANE_ID is set without HERDR_ENV", () => {

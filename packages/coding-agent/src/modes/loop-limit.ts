@@ -150,12 +150,16 @@ export function createLoopLimitRuntime(
 	return { kind: "duration", durationMs: config.durationMs, deadlineMs: nowMs + config.durationMs };
 }
 
-export function consumeLoopLimitIteration(limit: LoopLimitRuntime | undefined, nowMs = Date.now()): boolean {
+/** Return whether another iteration may run without consuming its budget. */
+export function hasLoopLimitCapacity(limit: LoopLimitRuntime | undefined, nowMs = Date.now()): boolean {
 	if (!limit) return true;
-	if (limit.kind === "duration") {
-		return nowMs < limit.deadlineMs;
-	}
-	if (limit.remaining <= 0) return false;
+	if (limit.kind === "duration") return nowMs < limit.deadlineMs;
+	return limit.remaining > 0;
+}
+
+export function consumeLoopLimitIteration(limit: LoopLimitRuntime | undefined, nowMs = Date.now()): boolean {
+	if (!hasLoopLimitCapacity(limit, nowMs)) return false;
+	if (!limit || limit.kind === "duration") return true;
 	limit.remaining -= 1;
 	return true;
 }

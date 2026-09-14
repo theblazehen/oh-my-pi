@@ -7,9 +7,17 @@
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
-import { EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
+import { EventLoopKeepalive, recordHandoff, resolveTelemetry, Tokenizer } from "@oh-my-pi/pi-agent-core";
+import {
+	type CompactionSettings,
+	estimateRemoteCompactionInputTokens,
+	getCompactionV2PreserveData,
+	getPreservedOpenAiRemoteCompactionData,
+	resolveBudgetReserveTokens,
+} from "@oh-my-pi/pi-agent-core/compaction";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
+import * as snapcompact from "@oh-my-pi/snapcompact";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
@@ -52,6 +60,7 @@ import { type ArtifactManager, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
+import { buildSessionContext } from "../session/session-context";
 import type { SessionEntry } from "../session/session-entries";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
@@ -568,7 +577,133 @@ export interface ExecutorOptions {
 export interface ForkContextSnapshot {
 	sourceFile: string | null;
 	sourceLeafId: string | null;
+	/** Parent model active when the completed branch was captured. */
+	parentModel: { provider: string; id: string } | null;
 	entries: readonly SessionEntry[];
+}
+
+/** Model information needed to sanitize provider-specific inherited state. */
+export interface TaskForkModelContext {
+	parentModel: ForkContextSnapshot["parentModel"];
+	childModel: Model;
+}
+
+function hasMatchingClassicCompactionItem(
+	replacementHistory: readonly Record<string, unknown>[],
+	compactionItem: { type: "compaction" | "compaction_summary"; encrypted_content?: string; summary?: string },
+): boolean {
+	if (compactionItem.type === "compaction") {
+		return replacementHistory.some(
+			item => item.type === "compaction" && item.encrypted_content === compactionItem.encrypted_content,
+		);
+	}
+	return replacementHistory.some(
+		item =>
+			item.type === "compaction_summary" &&
+			(compactionItem.summary === undefined || item.summary === compactionItem.summary),
+	);
+}
+
+function isValidCompactionV2MessageContentPart(part: unknown): boolean {
+	if (!isRecord(part)) return false;
+	if (part.type === "input_text") return typeof part.text === "string";
+	if (part.type === "input_image") {
+		const detail = part.detail;
+		if (detail !== "low" && detail !== "high" && detail !== "auto" && detail !== "original") {
+			return false;
+		}
+		return (
+			(typeof part.image_url === "string" && part.image_url.length > 0) ||
+			(typeof part.file_id === "string" && part.file_id.length > 0)
+		);
+	}
+	if (part.type === "input_file") {
+		const detail = part.detail;
+		if (detail !== undefined && detail !== null && detail !== "low" && detail !== "high") return false;
+		return (
+			(typeof part.file_data === "string" && part.file_data.length > 0) ||
+			(typeof part.file_id === "string" && part.file_id.length > 0) ||
+			(typeof part.file_url === "string" && part.file_url.length > 0)
+		);
+	}
+	return false;
+}
+
+/** Validate the canonical retained-user-messages + terminal encrypted compaction V2 shape. */
+function hasValidCompactionV2ReplacementHistory(replacementHistory: readonly Record<string, unknown>[]): boolean {
+	const terminalItem = replacementHistory.at(-1);
+	if (
+		terminalItem?.type !== "compaction" ||
+		typeof terminalItem.encrypted_content !== "string" ||
+		terminalItem.encrypted_content.length === 0
+	) {
+		return false;
+	}
+	for (let index = 0; index < replacementHistory.length - 1; index++) {
+		const item = replacementHistory[index];
+		if (
+			item?.type !== "message" ||
+			item.role !== "user" ||
+			!Array.isArray(item.content) ||
+			item.content.length === 0 ||
+			!item.content.every(isValidCompactionV2MessageContentPart)
+		) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * Select the bounded region represented by the latest compaction.
+ *
+ * A session journal intentionally retains entries superseded by compaction for
+ * transcript/history views. A task fork needs the effective LLM region instead:
+ * the latest compaction, its retained pre-boundary tail, and entries after it.
+ * Older compactions are excluded even when they fall inside the retained range.
+ * Parent links are relinked shallowly so the selected region is a standalone
+ * branch; callers still own deep-cloning its nested data.
+ */
+export function selectEffectiveTaskForkEntries(entries: readonly SessionEntry[]): SessionEntry[] {
+	let compactionIndex = -1;
+	for (let index = entries.length - 1; index >= 0; index--) {
+		if (entries[index]?.type === "compaction") {
+			compactionIndex = index;
+			break;
+		}
+	}
+	if (compactionIndex < 0) return Array.from(entries);
+
+	const compaction = entries[compactionIndex];
+	if (compaction?.type !== "compaction") return Array.from(entries);
+	let firstKeptIndex = -1;
+	for (let index = 0; index < compactionIndex; index++) {
+		if (entries[index]?.id === compaction.firstKeptEntryId) {
+			firstKeptIndex = index;
+			break;
+		}
+	}
+	// A malformed/migrated boundary must remain bounded: the summary and its
+	// post-compaction tail are still useful even when the named kept row is gone.
+	const startIndex = firstKeptIndex >= 0 ? firstKeptIndex : compactionIndex;
+	const selected: SessionEntry[] = [];
+	for (let index = startIndex; index < entries.length; index++) {
+		const entry = entries[index];
+		if (!entry) continue;
+		if (entry.type === "compaction" && index !== compactionIndex) continue;
+		selected.push(entry);
+	}
+	const selectedCompactionIndex = selected.findIndex(entry => entry.id === compaction.id);
+	const firstRetainedId = selectedCompactionIndex > 0 ? selected[0]!.id : compaction.id;
+
+	return selected.map((entry, index) => {
+		const parentId = index === 0 ? null : selected[index - 1]!.id;
+		if (entry.type === "compaction" && entry.id === compaction.id) {
+			if (entry.parentId === parentId && entry.firstKeptEntryId === firstRetainedId) return entry;
+			return { ...entry, parentId, firstKeptEntryId: firstRetainedId };
+		}
+		return entry.parentId === parentId ? entry : { ...entry, parentId };
+	});
 }
 
 const FORK_CONTROL_TOOLS: Record<string, true> = { todo: true, checkpoint: true, rewind: true };
@@ -576,6 +711,38 @@ const FORK_CONTROL_CUSTOM_TYPES: Record<string, true> = {
 	"eager-task-prelude": true,
 	"eager-todo-prelude": true,
 };
+
+/** Drop tool calls/results that do not have their counterpart in the same retained region. */
+function removeUnpairedForkToolEntries(entries: readonly SessionEntry[]): SessionEntry[] {
+	const pairedResultIds = new Set<string>();
+	for (const entry of entries) {
+		if (entry.type === "message" && entry.message.role === "toolResult") {
+			pairedResultIds.add(entry.message.toolCallId);
+		}
+	}
+	const presentCallIds = new Set<string>();
+	for (const entry of entries) {
+		if (entry.type === "message" && entry.message.role === "assistant") {
+			for (const part of entry.message.content) if (part.type === "toolCall") presentCallIds.add(part.id);
+		}
+	}
+	const pairedEntries: SessionEntry[] = [];
+	for (const entry of entries) {
+		if (entry.type === "message" && entry.message.role === "toolResult") {
+			if (!presentCallIds.has(entry.message.toolCallId)) continue;
+			pairedEntries.push(entry);
+			continue;
+		}
+		if (entry.type === "message" && entry.message.role === "assistant") {
+			const content = entry.message.content.filter(part => part.type !== "toolCall" || pairedResultIds.has(part.id));
+			if (content.length === 0) continue;
+			pairedEntries.push({ ...entry, message: { ...entry.message, content } });
+			continue;
+		}
+		pairedEntries.push(entry);
+	}
+	return pairedEntries;
+}
 
 /** Entry types that are parent-only runtime/config state, never conversation. */
 const FORK_NON_CONVERSATION_TYPES: Record<string, true> = {
@@ -593,9 +760,9 @@ const FORK_NON_CONVERSATION_TYPES: Record<string, true> = {
 };
 
 /**
- * Clone the parent branch into fresh entry objects for the child, retaining
- * only conversation-bearing entries (messages, custom_message,
- * branch_summary) and scrubbing parent-only execution control.
+ * Clone the parent's bounded effective region into fresh entry objects for the
+ * child, retaining conversation-bearing entries and the active compaction
+ * while scrubbing parent-only execution control.
  *
  * "Clone before mutation": the returned entries are new objects, never
  * references into the parent session, so the in-place edits below cannot leak
@@ -603,11 +770,10 @@ const FORK_NON_CONVERSATION_TYPES: Record<string, true> = {
  *
  * Scrubbing:
  * - Non-conversation entry types (runtime/config) are dropped.
- * - Every `compaction` entry is dropped unconditionally — Snapcompact-backed
- *   or not — so no parent compaction boundary, archive, or provider-native
- *   replay payload reaches the child. The still-persisted pre- and
- *   post-compaction message entries become ordinary full textual history and
- *   the child compacts later under its own runtime.
+ * - Only the latest `compaction` is retained. Its summary and retained tail are
+ *   portable; details and arbitrary preserveData are stripped. Provider-native
+ *   remote replay survives only for the exact captured parent model, and a
+ *   Snapcompact archive survives only for image-capable children.
  * - `custom` messages with an eager task/todo prelude `customType` vanish.
  * - `todo`/`checkpoint`/`rewind` toolCall blocks and their paired toolResults
  *   are removed, both from the assistant turn that issued them and any
@@ -629,14 +795,18 @@ const FORK_NON_CONVERSATION_TYPES: Record<string, true> = {
  * deep-independent clones: no returned object (or nested `message.content`,
  * `preserveData`, …) is shared with the source session.
  */
-export function scrubTaskForkEntries(entries: readonly SessionEntry[]): SessionEntry[] {
+export function scrubTaskForkEntries(
+	entries: readonly SessionEntry[],
+	modelContext: TaskForkModelContext,
+): SessionEntry[] {
+	const effectiveEntries = selectEffectiveTaskForkEntries(entries);
 	const entriesById = new Map<string, SessionEntry>();
-	for (const entry of entries) entriesById.set(entry.id, entry);
+	for (const entry of effectiveEntries) entriesById.set(entry.id, entry);
 
 	const removedCallIds = new Set<string>();
 	const retained: SessionEntry[] = [];
 
-	for (const entry of entries) {
+	for (const entry of effectiveEntries) {
 		// Eager task/todo preludes are persisted as custom_message entries too;
 		// drop them regardless of representation so no parent-only prelude
 		// survives into the child.
@@ -672,77 +842,90 @@ export function scrubTaskForkEntries(entries: readonly SessionEntry[]): SessionE
 			continue;
 		}
 		if (FORK_NON_CONVERSATION_TYPES[entry.type]) continue;
-		// Every parent compaction boundary — Snapcompact-archived, remote-replay,
-		// or LLM-summarized — is dropped unconditionally so no compaction
-		// provider/replay state survives and every persisted raw message replays
-		// as full visible text; the child compacts later under its own runtime.
-		if (entry.type === "compaction") continue;
+		if (entry.type === "compaction") {
+			const preserveData: Record<string, unknown> = {};
+			const sameModel =
+				modelContext.parentModel !== null &&
+				modelContext.parentModel.provider === modelContext.childModel.provider &&
+				modelContext.parentModel.id === modelContext.childModel.id;
+			const remoteCompaction = entry.preserveData?.openaiRemoteCompaction;
+			const replacementHistory = isRecord(remoteCompaction) ? remoteCompaction.replacementHistory : undefined;
+			let validRemoteCompaction = false;
+			if (
+				sameModel &&
+				isRecord(remoteCompaction) &&
+				remoteCompaction.provider === modelContext.childModel.provider &&
+				Array.isArray(replacementHistory) &&
+				replacementHistory.length > 0 &&
+				replacementHistory.every(isRecord)
+			) {
+				if (remoteCompaction.version === "v2") {
+					const v2 = getCompactionV2PreserveData(entry.preserveData);
+					validRemoteCompaction =
+						v2?.provider === modelContext.childModel.provider &&
+						hasValidCompactionV2ReplacementHistory(replacementHistory);
+				} else {
+					const classic = getPreservedOpenAiRemoteCompactionData(entry.preserveData);
+					validRemoteCompaction =
+						classic?.provider === modelContext.childModel.provider &&
+						hasMatchingClassicCompactionItem(replacementHistory, classic.compactionItem);
+				}
+			}
+			if (validRemoteCompaction) {
+				preserveData.openaiRemoteCompaction = remoteCompaction;
+			}
+			const snapcompactArchive = snapcompact.getPreservedArchive(entry.preserveData);
+			if (modelContext.childModel.input.includes("image") && snapcompactArchive) {
+				preserveData[snapcompact.PRESERVE_KEY] = entry.preserveData?.[snapcompact.PRESERVE_KEY];
+			}
+			retained.push({
+				...entry,
+				details: undefined,
+				preserveData: Object.keys(preserveData).length > 0 ? preserveData : undefined,
+			});
+			continue;
+		}
 		retained.push(entry);
 	}
 
 	// Drop dangling toolCall blocks and orphan toolResults that survive the
 	// control scrub (e.g. a non-control call whose result was on a sibling path).
-	const pairedResultIds = new Set<string>();
-	for (const entry of retained) {
-		if (entry.type === "message" && entry.message.role === "toolResult")
-			pairedResultIds.add(entry.message.toolCallId);
-	}
-	const presentCallIds = new Set<string>();
-	for (const entry of retained) {
-		if (entry.type === "message" && entry.message.role === "assistant") {
-			for (const part of entry.message.content) if (part.type === "toolCall") presentCallIds.add(part.id);
-		}
-	}
-	const finalRetained: SessionEntry[] = [];
-	for (const entry of retained) {
-		if (entry.type === "message" && entry.message.role === "toolResult") {
-			if (!presentCallIds.has(entry.message.toolCallId)) continue; // orphaned result
-			finalRetained.push(entry);
-			continue;
-		}
-		if (entry.type === "message" && entry.message.role === "assistant") {
-			const content = entry.message.content.filter(part => part.type !== "toolCall" || pairedResultIds.has(part.id));
-			if (content.length === 0) continue; // dangling call turn dropped
-			// The first pass already neutralized protected reasoning and removed
-			// providerPayload; only the dangling-call filter runs here.
-			finalRetained.push({ ...entry, message: { ...entry.message, content } });
-			continue;
-		}
-		finalRetained.push(entry);
-	}
+	const finalRetained = removeUnpairedForkToolEntries(retained);
 
 	// Relink every retained parentId to the nearest surviving ancestor (or null
 	// when none remains), preserving original branch order.
 	const retainedById = new Map<string, SessionEntry>();
 	for (const entry of finalRetained) retainedById.set(entry.id, entry);
+	const retainedCompactionIndex = finalRetained.findIndex(entry => entry.type === "compaction");
+	const retainedFirstKeptId =
+		retainedCompactionIndex > 0
+			? finalRetained[0]!.id
+			: retainedCompactionIndex === 0
+				? finalRetained[retainedCompactionIndex]!.id
+				: undefined;
 	return finalRetained.map(entry => {
-		if (entry.parentId === null) return structuredClone(entry);
+		let normalizedEntry = entry;
+		if (
+			entry.type === "compaction" &&
+			retainedFirstKeptId !== undefined &&
+			entry.firstKeptEntryId !== retainedFirstKeptId
+		) {
+			normalizedEntry = { ...entry, firstKeptEntryId: retainedFirstKeptId };
+		}
+		if (normalizedEntry.parentId === null) return structuredClone(normalizedEntry);
 		const seen = new Set<string>();
-		let cursor: string | null = entry.parentId;
+		let cursor: string | null = normalizedEntry.parentId;
 		while (cursor !== null && !seen.has(cursor)) {
-			if (retainedById.has(cursor)) return structuredClone({ ...entry, parentId: cursor });
+			if (retainedById.has(cursor)) return structuredClone({ ...normalizedEntry, parentId: cursor });
 			seen.add(cursor);
 			cursor = entriesById.get(cursor)?.parentId ?? null;
 		}
-		return structuredClone({ ...entry, parentId: null });
+		return structuredClone({ ...normalizedEntry, parentId: null });
 	});
 }
 
-/**
- * Seed the child session with the parent's completed conversation as a native
- * branch: consume the frozen scheduling-time snapshot (`forkContext.entries`),
- * scrub runtime/control state, and ingest each surviving entry as a replicated
- * entry so the child owns all of its compaction/provider/runtime state. No
- * Snapcompact, no pending-summary folding; the parent's `compaction` entries
- * are all dropped by the scrub so every persisted raw message is visible.
- *
- * A non-null `sourceLeafId` must describe a valid snapshot before scrubbing:
- * the captured branch is non-empty, ends at exactly that leaf, and starts at a
- * root entry (`parentId === null`). A malformed snapshot is rejected with a
- * `Cannot fork task context` error rather than silently seeding a partial or
- * misplaced branch.
- */
-function seedForkContext(manager: SessionManager, forkContext: ForkContextSnapshot): void {
+/** Validate the frozen branch before any sanitization can conceal malformed ancestry. */
+function validateForkContextSnapshot(forkContext: ForkContextSnapshot): void {
 	const entries = forkContext.entries;
 	if (forkContext.sourceLeafId !== null) {
 		if (entries.length === 0) {
@@ -757,10 +940,116 @@ function seedForkContext(manager: SessionManager, forkContext: ForkContextSnapsh
 			throw new Error("Cannot fork task context: parent session snapshot does not start at a root entry");
 		}
 	}
-	const scrubbed = scrubTaskForkEntries(entries);
-	for (const entry of scrubbed) {
-		manager.ingestReplicatedEntry(structuredClone(entry));
+}
+
+interface PreparedForkContext {
+	/** Fresh, child-owned entries safe to ingest without another structural clone. */
+	entries: SessionEntry[];
+}
+
+/** Estimate the complete inherited request, including opaque native replay. */
+function estimateForkContextTokens(entries: SessionEntry[], tokenizer: Tokenizer): number {
+	if (entries.length === 0) return 0;
+	const leafId = entries.at(-1)?.id ?? null;
+	const messages = buildSessionContext(entries, leafId).messages;
+	let inheritedTokens = tokenizer.countMessages(messages);
+	// Provider replay is opaque to countMessage(compactionSummary). A positive
+	// V2 usage value is authoritative; classic and zero-usage payloads use the
+	// same conservative native-history estimator as remote compaction itself.
+	const activeCompaction = entries.findLast(
+		(entry): entry is Extract<SessionEntry, { type: "compaction" }> => entry.type === "compaction",
+	);
+	const remoteCompaction = activeCompaction?.preserveData?.openaiRemoteCompaction;
+	if (
+		isRecord(remoteCompaction) &&
+		Array.isArray(remoteCompaction.replacementHistory) &&
+		remoteCompaction.replacementHistory.every(isRecord)
+	) {
+		const usedTokens = remoteCompaction.usedTokens;
+		const replayTokens =
+			remoteCompaction.version === "v2" &&
+			typeof usedTokens === "number" &&
+			Number.isFinite(usedTokens) &&
+			usedTokens > 0
+				? Math.ceil(usedTokens)
+				: estimateRemoteCompactionInputTokens(remoteCompaction.replacementHistory, tokenizer, "");
+		const tailTokens = messages.slice(1).reduce((total, message) => total + tokenizer.countMessage(message), 0);
+		inheritedTokens = Math.max(inheritedTokens, replayTokens + tailTokens);
 	}
+	return inheritedTokens;
+}
+
+/** Remove opaque compaction payloads while retaining the portable summary and turns. */
+function stripForkCompactionPayloads(entries: readonly SessionEntry[]): SessionEntry[] {
+	return entries.map(entry => {
+		if (entry.type !== "compaction" || entry.preserveData === undefined) return entry;
+		const preserveData = { ...entry.preserveData };
+		delete preserveData.openaiRemoteCompaction;
+		delete preserveData[snapcompact.PRESERVE_KEY];
+		return {
+			...entry,
+			preserveData: Object.keys(preserveData).length > 0 ? preserveData : undefined,
+		};
+	});
+}
+
+/** A suffix may start only where a provider can receive a complete new turn. */
+function isCoherentForkBoundary(entry: SessionEntry): boolean {
+	if (entry.type === "message") return entry.message.role === "user" || entry.message.role === "custom";
+	return entry.type === "custom_message" || entry.type === "branch_summary";
+}
+
+/** Relink a retained suffix into a linear, standalone child branch. */
+function relinkStandaloneForkSuffix(entries: readonly SessionEntry[]): SessionEntry[] {
+	return entries.map((entry, index) => {
+		const parentId = index === 0 ? null : entries[index - 1]!.id;
+		return entry.parentId === parentId ? entry : { ...entry, parentId };
+	});
+}
+
+/** Select the largest recent suffix that starts coherently and fits the child budget. */
+function selectLargestFittingForkSuffix(
+	entries: readonly SessionEntry[],
+	usableBudget: number,
+	tokenizer: Tokenizer,
+): SessionEntry[] {
+	const withoutCompactions = entries.filter(entry => entry.type !== "compaction");
+	for (let index = 0; index < withoutCompactions.length; index++) {
+		const entry = withoutCompactions[index];
+		if (entry === undefined || !isCoherentForkBoundary(entry)) continue;
+		const suffix = relinkStandaloneForkSuffix(removeUnpairedForkToolEntries(withoutCompactions.slice(index)));
+		if (estimateForkContextTokens(suffix, tokenizer) <= usableBudget) return suffix;
+	}
+	return [];
+}
+
+/**
+ * Validate, sanitize, build, and size inherited context before opening a child
+ * journal. This is the fork's allocation/provider safety boundary: oversized
+ * valid snapshots degrade first to portable compaction, then to a coherent
+ * bounded tail, without changing the explicitly requested fork semantics.
+ */
+function prepareForkContext(
+	forkContext: ForkContextSnapshot,
+	childModel: Model,
+	compactionSettings: CompactionSettings,
+): PreparedForkContext {
+	validateForkContextSnapshot(forkContext);
+	const entries = scrubTaskForkEntries(forkContext.entries, {
+		parentModel: forkContext.parentModel,
+		childModel,
+	});
+	const contextWindow = childModel.contextWindow;
+	if (!contextWindow || contextWindow <= 0) return { entries };
+	const reserveTokens = resolveBudgetReserveTokens(contextWindow, compactionSettings);
+	const usableBudget = Math.max(0, contextWindow - reserveTokens);
+	const tokenizer = new Tokenizer(childModel);
+	if (estimateForkContextTokens(entries, tokenizer) <= usableBudget) return { entries };
+
+	const portableEntries = stripForkCompactionPayloads(entries);
+	if (estimateForkContextTokens(portableEntries, tokenizer) <= usableBudget) return { entries: portableEntries };
+
+	return { entries: selectLargestFittingForkSuffix(portableEntries, usableBudget, tokenizer) };
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -3448,33 +3737,45 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				// leaf means the parent had no work to hand off (or the snapshot
 				// is runtime-malformed) — never seed the child from it.
 				forkContext.sourceLeafId == null;
-			const sessionManagerPromise =
+			let preparedFork: PreparedForkContext | undefined;
+			if (
 				requestedContextSource === "fork" &&
 				forkContext !== undefined &&
 				!forkSnapshotUnavailable &&
 				sessionFile !== null
-					? SessionManager.open(sessionFile, undefined, undefined, {
+			) {
+				if (!model) {
+					throw new Error(
+						'Cannot fork task context: child model could not be resolved for inherited-context validation. Retry with source:"fresh".',
+					);
+				}
+				preparedFork = prepareForkContext(forkContext, model, subagentSettings.getGroup("compaction"));
+			}
+			const sessionManagerPromise = (async () => {
+				if (requestedContextSource === "fork" && preparedFork === undefined) {
+					throw new Error(
+						forkSnapshotUnavailable
+							? "Cannot fork task context: parent session snapshot or transcript is unavailable"
+							: "Cannot fork task context: child transcript path is unavailable",
+					);
+				}
+				const manager = sessionFile
+					? await SessionManager.open(sessionFile, undefined, undefined, {
 							initialCwd: effectiveCwd,
 							suppressBreadcrumb: true,
-						}).then(async manager => {
-							seedForkContext(manager, forkContext);
-							usedContextSource = "fork";
-							return manager;
 						})
-					: requestedContextSource === "fork" && (forkSnapshotUnavailable || sessionFile === null)
-						? Promise.reject(
-								new Error(
-									forkSnapshotUnavailable
-										? "Cannot fork task context: parent session snapshot or transcript is unavailable"
-										: "Cannot fork task context: child transcript path is unavailable",
-								),
-							)
-						: sessionFile
-							? SessionManager.open(sessionFile, undefined, undefined, {
-									initialCwd: effectiveCwd,
-									suppressBreadcrumb: true,
-								})
-							: Promise.resolve(SessionManager.inMemory(effectiveCwd));
+					: SessionManager.inMemory(effectiveCwd);
+				try {
+					if (preparedFork) {
+						for (const entry of preparedFork.entries) manager.ingestReplicatedEntry(entry);
+						usedContextSource = "fork";
+					}
+					return manager;
+				} catch (error) {
+					await manager.close();
+					throw error;
+				}
+			})();
 			// Setup below can fail before this promise's consumption boundary.
 			// Observe rejection immediately while preserving it for the later await.
 			sessionManagerPromise.catch(() => {});

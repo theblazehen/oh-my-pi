@@ -13,13 +13,15 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
-import { formatBytes } from "@oh-my-pi/pi-utils";
+import { formatBytes, sanitizeText } from "@oh-my-pi/pi-utils";
 import { theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt, matchesSelectDown, matchesSelectUp } from "../../modes/utils/keybinding-matchers";
 import type { SessionInfo, SessionStatus } from "../../session/session-listing";
 import { shortenPath } from "../../tools/render-utils";
 import { HookSelectorComponent } from "./hook-selector";
 import { bottomBorder, OverlayPanel, row, topBorder } from "./overlay-box";
+import { SessionPreviewComponent } from "./session-preview";
+import { sessionProjectLabels } from "./session-project-label";
 
 /**
  * Themed glyph + colored label for a session's lifecycle status, or `undefined`
@@ -273,6 +275,8 @@ class SessionList implements Component {
 	onCancel?: () => void;
 	onExit: () => void = () => {};
 	onToggleScope?: () => void;
+	onSelectionChange?: () => void;
+	onQueryChange?: () => void;
 	// Snapshot of the live terminal-row getter; the visible window is derived
 	// from it per render so the picker fits the viewport (and adapts to resize).
 	readonly #getTerminalRows: () => number;
@@ -282,6 +286,10 @@ class SessionList implements Component {
 	#allSessions: SessionInfo[];
 	#showCwd: boolean;
 	#pinnedIds: ReadonlySet<string>;
+	#projectLabels?: ReadonlyMap<string, string>;
+	#projectWidth = 0;
+	#compactHeight = 0;
+	#compactVisibleCount = 1;
 	readonly #historyMatcher?: SessionHistoryMatcher;
 	#historyMergeTimer: NodeJS.Timeout | undefined;
 	/** Re-render hook for async list updates (fuzzy scan chunks, history merge). */
@@ -351,7 +359,116 @@ class SessionList implements Component {
 
 	/** PageUp/PageDown jump, approximated from the worst-case session height. */
 	#pageSize(): number {
+		if (this.#projectLabels) return this.#compactVisibleCount;
 		return Math.max(2, Math.floor(this.#lineBudget() / 4));
+	}
+
+	setProjectLabels(labels: ReadonlyMap<string, string>): void {
+		this.#projectLabels = labels;
+		this.#projectWidth = visibleWidth("Project");
+		for (const label of labels.values()) this.#projectWidth = Math.max(this.#projectWidth, visibleWidth(label));
+	}
+
+	getProjectLabel(session: SessionInfo): string {
+		return this.#projectLabels?.get(session.cwd ?? "") ?? "Not recorded";
+	}
+
+	setViewportHeight(height: number): void {
+		this.#compactHeight = height;
+	}
+
+	#renderCompact(width: number): readonly string[] {
+		const lines = [...this.#searchInput.render(width), ""];
+		this.#hitRows = [];
+		this.#compactVisibleCount = Math.max(1, this.#compactHeight - lines.length - 1);
+		const overflow = this.#filteredSessions.length > this.#compactVisibleCount;
+		const rowWidth = Math.max(0, width - (overflow ? 1 : 0));
+		const cursorSymbol = `${theme.nav.cursor} `;
+		const cursorWidth = visibleWidth(cursorSymbol);
+		const available = Math.max(0, rowWidth - cursorWidth);
+		// At very small widths keep project identity rather than unreadable slivers of three columns.
+		const updatedWidth = available >= 24 ? 7 : 0;
+		const textWidth = Math.max(0, available - (updatedWidth ? updatedWidth + 2 : 0));
+		const projectWidth = Math.min(this.#projectWidth, Math.max(0, textWidth - (textWidth >= 16 ? 8 : 0)));
+		const titleWidth = Math.max(0, textWidth - projectWidth - 2);
+		const cell = (value: string, size: number, right = false): string => {
+			const clipped = truncateToWidth(value, size);
+			const space = padding(Math.max(0, size - visibleWidth(clipped)));
+			return right ? space + clipped : clipped + space;
+		};
+		const header =
+			padding(cursorWidth) +
+			cell("Project", projectWidth) +
+			(titleWidth ? `  ${cell("Session", titleWidth)}` : "") +
+			(updatedWidth ? `  ${cell("Updated", updatedWidth, true)}` : "");
+		lines.push(theme.fg("muted", truncateToWidth(header, rowWidth)));
+		if (this.#filteredSessions.length === 0) {
+			lines.push(
+				truncateToWidth(
+					theme.fg(
+						"muted",
+						this.#showCwd ? "  No matching sessions" : "  No sessions here. Tab views all projects.",
+					),
+					width,
+				),
+			);
+			return lines.slice(0, this.#compactHeight);
+		}
+		const start = Math.max(
+			0,
+			Math.min(
+				this.#selectedIndex - Math.floor(this.#compactVisibleCount / 2),
+				this.#filteredSessions.length - this.#compactVisibleCount,
+			),
+		);
+		const end = Math.min(start + this.#compactVisibleCount, this.#filteredSessions.length);
+		const now = Date.now();
+		const rows: string[] = [];
+		for (let index = start; index < end; index++) {
+			const session = this.#filteredSessions[index]!;
+			const selected = index === this.#selectedIndex;
+			const minutes = Math.max(0, Math.floor((now - session.modified.getTime()) / 60000));
+			const updated = !Number.isFinite(minutes)
+				? "—"
+				: minutes < 1
+					? "now"
+					: minutes < 60
+						? `${minutes}m ago`
+						: minutes < 1440
+							? `${Math.floor(minutes / 60)}h ago`
+							: minutes < 14400
+								? `${Math.floor(minutes / 1440)}d ago`
+								: session.modified.toISOString().slice(5, 10);
+			const title =
+				replaceTabs(sanitizeText(session.title ?? ""))
+					.replace(/\n/g, " ")
+					.trim() ||
+				replaceTabs(sanitizeText(session.firstMessage)).replace(/\n/g, " ").trim() ||
+				session.id;
+			const pinPrefix = this.#pinnedIds.has(session.id) ? `${theme.icon.pin} ` : "";
+			const project = cell(this.getProjectLabel(session), projectWidth);
+			const content =
+				theme.fg("accent", selected ? theme.bold(project) : project) +
+				(titleWidth
+					? `  ${selected ? theme.bold(cell(pinPrefix + title, titleWidth)) : cell(pinPrefix + title, titleWidth)}`
+					: "") +
+				(updatedWidth ? `  ${theme.fg("muted", cell(updated, updatedWidth, true))}` : "");
+			rows.push(
+				truncateToWidth((selected ? theme.fg("accent", cursorSymbol) : padding(cursorWidth)) + content, rowWidth),
+			);
+		}
+		const viewport = new ScrollView(rows, {
+			height: rows.length,
+			scrollbar: "auto",
+			totalRows: this.#filteredSessions.length,
+			theme: { track: text => theme.fg("muted", text), thumb: text => theme.fg("accent", text) },
+		});
+		viewport.setScrollOffset(start);
+		const offset = lines.length;
+		const rendered = viewport.render(width);
+		for (let row = 0; row < rendered.length; row++) this.#hitRows[offset + row] = start + row;
+		lines.push(...rendered);
+		return lines.slice(0, this.#compactHeight);
 	}
 
 	/** Replace the visible dataset, e.g. when toggling folder/all-projects scope. */
@@ -364,6 +481,7 @@ class SessionList implements Component {
 	}
 
 	#filterSessions(query: string): void {
+		this.onQueryChange?.();
 		this.#scanGeneration++;
 		if (this.#scanTimer !== undefined) {
 			clearTimeout(this.#scanTimer);
@@ -379,6 +497,7 @@ class SessionList implements Component {
 			this.#filteredSessions = this.#allSessions;
 			this.#selectedIndex = Math.min(this.#selectedIndex, Math.max(0, this.#filteredSessions.length - 1));
 			this.#scheduleHistoryMerge(query);
+			this.onSelectionChange?.();
 			return;
 		}
 
@@ -447,6 +566,7 @@ class SessionList implements Component {
 		this.#filteredSessions =
 			this.#historyIds.length > 0 ? mergeSessionRanking(this.#allSessions, base, this.#historyIds) : base;
 		this.#selectedIndex = Math.min(this.#selectedIndex, Math.max(0, this.#filteredSessions.length - 1));
+		this.onSelectionChange?.();
 	}
 
 	/**
@@ -502,6 +622,11 @@ class SessionList implements Component {
 		}
 	}
 
+	/** Current highlighted rollout, independent of list scroll position. */
+	getSelectedSession(): SessionInfo | undefined {
+		return this.#filteredSessions[this.#selectedIndex];
+	}
+
 	/** Resolve a list-local rendered-line index to a filtered-session index. */
 	hitTestSession(line: number): number | undefined {
 		return this.#hitRows[line];
@@ -527,6 +652,7 @@ class SessionList implements Component {
 	}
 
 	render(width: number): readonly string[] {
+		if (this.#projectLabels) return this.#renderCompact(width);
 		const lines: string[] = [];
 		this.#hitRows = [];
 
@@ -600,7 +726,7 @@ class SessionList implements Component {
 			const isSelected = i === this.#selectedIndex;
 
 			// Normalize first message to single line
-			const normalizedMessage = session.firstMessage.replace(/\n/g, " ").trim();
+			const normalizedMessage = replaceTabs(sanitizeText(session.firstMessage)).replace(/\n/g, " ").trim();
 
 			// First line: cursor + optional pin icon + title (or first message if no title)
 			const cursorSymbol = `${theme.nav.cursor} `;
@@ -615,7 +741,10 @@ class SessionList implements Component {
 
 			if (session.title) {
 				// Has title: show title on first line, dimmed first message on second line
-				const truncatedTitle = truncateToWidth(session.title, maxTextWidth);
+				const truncatedTitle = truncateToWidth(
+					replaceTabs(sanitizeText(session.title)).replace(/\n/g, " "),
+					maxTextWidth,
+				);
 				const titleLine = `${cursor}${pinPrefix}${isSelected ? theme.bold(truncatedTitle) : truncatedTitle}`;
 				sessionLines.push(titleLine);
 
@@ -644,7 +773,7 @@ class SessionList implements Component {
 				metadata += ` ${dot} ${dim(`${theme.icon.branch} fork`)}`;
 			}
 			if (this.#showCwd && session.cwd) {
-				metadata += ` ${dot} ${dim(shortenPath(session.cwd))}`;
+				metadata += ` ${dot} ${dim(replaceTabs(sanitizeText(shortenPath(session.cwd))).replace(/\n/g, " "))}`;
 			}
 			const metadataLine = truncateToWidth(metadata, rowWidth);
 
@@ -756,12 +885,16 @@ class SessionList implements Component {
 }
 
 export interface SessionSelectorOptions {
+	/** Native JSONL preview; foreign-format selectors leave this disabled. */
+	preview?: boolean;
 	onDelete?: (session: SessionInfo) => Promise<boolean>;
 	historyMatcher?: SessionHistoryMatcher;
 	/** Loads sessions across all projects for the all-projects scope toggle (Tab). */
 	loadAllSessions?: () => Promise<SessionInfo[]>;
 	/** Preloaded all-projects list; cached so the first Tab toggle is instant. */
 	allSessions?: SessionInfo[];
+	/** Initial scope; allSessions supplies the initial global dataset. */
+	initialScope?: "folder" | "all";
 	/** Picker heading; defaults to "Resume Session". */
 	title?: string;
 	/** Fixed scope label, or false to omit the scope suffix. */
@@ -819,6 +952,12 @@ export class SessionSelectorComponent extends OverlayPanel {
 	readonly #fillHeight: boolean;
 	readonly #title: string;
 	readonly #scopeLabel: string | false | undefined;
+	readonly #preview?: SessionPreviewComponent;
+	#previewPath?: string | null;
+	#previewFocused = false;
+	#previewPaused = false;
+	#previewColumn = -1;
+	#disposed = false;
 
 	constructor(
 		sessions: SessionInfo[],
@@ -834,10 +973,15 @@ export class SessionSelectorComponent extends OverlayPanel {
 		this.#loadAllSessions = options.loadAllSessions;
 		this.#folderSessions = sessions;
 		this.#globalSessions = options.allSessions ?? null;
+		this.#scope = options.initialScope ?? "folder";
 		this.#getTerminalRows = options.getTerminalRows ?? (() => 24);
 		this.#fillHeight = options.fillHeight ?? false;
 		this.#title = options.title ?? "Resume Session";
 		this.#scopeLabel = options.scopeLabel;
+		if (options.preview) {
+			this.#preview = new SessionPreviewComponent();
+			this.#preview.onRequestRender = () => this.#onRequestRender?.();
+		}
 		this.title = this.#headerLabel();
 		// One spacer of breathing room; OverlayPanel supplies the two outer
 		// border rows and the horizontal inset.
@@ -847,30 +991,41 @@ export class SessionSelectorComponent extends OverlayPanel {
 		// user to Tab into all-projects rather than silently surfacing other
 		// projects' history (issue #3099).
 		this.#sessionList = new SessionList(
-			sessions,
-			options.showCwd ?? false,
+			this.#scope === "all" ? (this.#globalSessions ?? sessions) : sessions,
+			options.showCwd ?? this.#scope === "all",
 			options.historyMatcher,
 			options.getTerminalRows,
 			options.pinnedIds,
 		);
+		if (this.#preview) {
+			this.#sessionList.setProjectLabels(sessionProjectLabels([...(this.#globalSessions ?? []), ...sessions]));
+		}
 		// Every exit path cancels the list's pending history merge, so a stale
 		// debounce timer can never run its SQLite lookup after the picker closed.
 		this.#sessionList.onSelect = session => {
+			this.#previewPaused = true;
 			this.#sessionList.dispose();
+			this.#cancelPreview();
 			onSelect(session);
 		};
 		this.#sessionList.onCancel = () => {
+			this.#previewPaused = true;
 			this.#sessionList.dispose();
+			this.#cancelPreview();
 			onCancel();
 		};
 		this.#sessionList.onExit = () => {
+			this.#previewPaused = true;
 			this.#sessionList.dispose();
+			this.#cancelPreview();
 			onExit();
 		};
 		this.#sessionList.onRequestRender = () => this.#onRequestRender?.();
-		this.#sessionList.onDeleteRequest = (session: SessionInfo) => {
-			this.#showDeleteConfirmation(session);
-		};
+		this.#sessionList.onSelectionChange = () => this.#syncPreview();
+		this.#sessionList.onQueryChange = () => this.#cancelPreview();
+		if (this.#onDelete) {
+			this.#sessionList.onDeleteRequest = session => this.#showDeleteConfirmation(session);
+		}
 		if (this.#loadAllSessions || this.#globalSessions) {
 			this.#sessionList.onToggleScope = () => {
 				void this.#toggleScope();
@@ -879,6 +1034,28 @@ export class SessionSelectorComponent extends OverlayPanel {
 		this.#contentSlot = new Container();
 		this.#contentSlot.addChild(this.#sessionList);
 		this.addChild(this.#contentSlot);
+		this.#syncPreview(true);
+	}
+
+	#cancelPreview(): void {
+		this.#preview?.cancel();
+		this.#previewPath = null;
+	}
+
+	#syncPreview(force = false): void {
+		if (
+			!this.#preview ||
+			this.#disposed ||
+			this.#previewPaused ||
+			this.#confirmationDialog ||
+			this.#toggling ||
+			this.#inputLocked
+		)
+			return;
+		const session = this.#sessionList.getSelectedSession();
+		if (!force && session?.path === this.#previewPath) return;
+		this.#previewPath = session?.path;
+		this.#preview.setSession(session, session ? this.#sessionList.getProjectLabel(session) : undefined);
 	}
 
 	#headerLabel(): string {
@@ -893,7 +1070,8 @@ export class SessionSelectorComponent extends OverlayPanel {
 	 * never pays for the cross-project scan.
 	 */
 	async #toggleScope(): Promise<void> {
-		if (this.#toggling || this.#confirmationDialog) return;
+		if (this.#toggling || this.#confirmationDialog || this.#disposed) return;
+		this.#cancelPreview();
 		if (this.#scope === "folder") {
 			let global = this.#globalSessions;
 			if (!global) {
@@ -904,13 +1082,18 @@ export class SessionSelectorComponent extends OverlayPanel {
 				this.#onRequestRender?.();
 				try {
 					global = await this.#loadAllSessions();
+					if (this.#disposed) return;
 				} catch (err) {
+					if (this.#disposed) return;
 					this.#showError(err instanceof Error ? err.message : String(err));
 					this.#toggling = false;
+					this.#syncPreview(true);
 					this.#onRequestRender?.();
 					return;
 				}
 				this.#globalSessions = global;
+				if (this.#preview)
+					this.#sessionList.setProjectLabels(sessionProjectLabels([...global, ...this.#folderSessions]));
 				this.#messageContainer.clear();
 				this.#toggling = false;
 			}
@@ -921,6 +1104,7 @@ export class SessionSelectorComponent extends OverlayPanel {
 			this.#sessionList.setSessions(this.#folderSessions, false);
 		}
 		this.title = this.#headerLabel();
+		this.#syncPreview();
 		this.#onRequestRender?.();
 	}
 
@@ -930,10 +1114,13 @@ export class SessionSelectorComponent extends OverlayPanel {
 	/** Ignore input after selection while the host resumes the session. */
 	lockInput(): void {
 		this.#inputLocked = true;
+		this.#cancelPreview();
 	}
 	/** Re-enable input after a failed resume so the user can pick again. */
 	unlockInput(): void {
 		this.#inputLocked = false;
+		this.#previewPaused = false;
+		this.#syncPreview(true);
 	}
 
 	/**
@@ -942,6 +1129,9 @@ export class SessionSelectorComponent extends OverlayPanel {
 	 * child-walking dispose would miss its pending history-merge timer.
 	 */
 	override dispose(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		this.#preview?.dispose();
 		this.#sessionList.dispose();
 		super.dispose();
 	}
@@ -952,19 +1142,24 @@ export class SessionSelectorComponent extends OverlayPanel {
 
 	#showError(message: string): void {
 		this.#messageContainer.clear();
-		this.#messageContainer.addChild(new Text(theme.fg("error", `Error: ${replaceTabs(message)}`), 0, 0));
+		this.#messageContainer.addChild(
+			new Text(theme.fg("error", `Error: ${replaceTabs(sanitizeText(message))}`), 0, 0),
+		);
 		this.#messageContainer.addChild(new Spacer(1));
 	}
 
 	#showDeleteConfirmation(session: SessionInfo): void {
-		const displayName = session.title || session.firstMessage.slice(0, 40) || session.id;
+		this.#cancelPreview();
+		const displayName = replaceTabs(sanitizeText(session.title || session.firstMessage.slice(0, 40) || session.id));
 		const closeDialog = () => {
+			if (this.#disposed) return;
 			this.#confirmationDialog = null;
 			// Restore the SessionList into the content slot so the picker is back
 			// to its normal layout on the very next render — the same frame the
 			// dialog disappears.
 			this.#contentSlot.clear();
 			this.#contentSlot.addChild(this.#sessionList);
+			this.#syncPreview(true);
 			this.#onRequestRender?.();
 		};
 		this.#confirmationDialog = new HookSelectorComponent(
@@ -975,6 +1170,7 @@ export class SessionSelectorComponent extends OverlayPanel {
 					this.#clearError();
 					try {
 						const deleted = await this.#onDelete(session);
+						if (this.#disposed) return;
 						if (deleted) {
 							this.#sessionList.removeSession(session.path);
 						}
@@ -1004,17 +1200,34 @@ export class SessionSelectorComponent extends OverlayPanel {
 	override render(width: number): readonly string[] {
 		const innerWidth = Math.max(1, width - 4);
 		const lines: string[] = [topBorder(width, this.title)];
+		const footer = this.#footerLines(width);
+		this.#previewColumn = -1;
 		for (const child of this.children) {
-			const childLines = child.render(innerWidth);
-			if (child === this.#contentSlot) this.#listLineOffset = lines.length;
+			let childLines: readonly string[];
+			if (child === this.#contentSlot) {
+				this.#listLineOffset = lines.length;
+				const height = Math.max(1, this.#getTerminalRows() - lines.length - footer.length);
+				this.#sessionList.setViewportHeight(height);
+				if (this.#preview && !this.#confirmationDialog && innerWidth >= 100) {
+					const listWidth = Math.floor((innerWidth - 3) * 0.55);
+					this.#previewColumn = listWidth + 5;
+					const left = this.#sessionList.render(listWidth);
+					const right = this.#preview.render(innerWidth - listWidth - 3, height);
+					const separator = theme.fg("border", ` ${theme.boxRound.vertical} `);
+					childLines = Array.from({ length: height }, (_, row) => {
+						const line = truncateToWidth(left[row] ?? "", listWidth);
+						return line + padding(Math.max(0, listWidth - visibleWidth(line))) + separator + (right[row] ?? "");
+					});
+				} else if (this.#preview && !this.#confirmationDialog && this.#previewFocused) {
+					this.#previewColumn = 2;
+					childLines = this.#preview.render(innerWidth, height);
+				} else childLines = child.render(innerWidth);
+			} else childLines = child.render(innerWidth);
 			for (const line of childLines) lines.push(row(line, width));
 		}
-		const footer = this.#footerLines(width);
-		if (this.#fillHeight) {
-			const target = Math.max(0, this.#getTerminalRows() - footer.length);
-			if (lines.length > target) lines.length = target;
-			else for (let i = lines.length; i < target; i++) lines.push(row("", width));
-		}
+		const target = Math.max(0, this.#getTerminalRows() - footer.length);
+		if (lines.length > target) lines.length = target;
+		else if (this.#fillHeight) for (let i = lines.length; i < target; i++) lines.push(row("", width));
 		this.#footerStart = lines.length;
 		for (const line of footer) lines.push(line);
 		return lines;
@@ -1023,12 +1236,23 @@ export class SessionSelectorComponent extends OverlayPanel {
 	/** Blank · keybinding hint · bottom border. Rendered by {@link render}. */
 	#footerLines(width: number): string[] {
 		const scopeHint = this.#scope === "all" ? "current folder" : "all projects";
-		const hint = theme.fg("muted", `[Del/⌫ delete · Enter select · Tab ${scopeHint} · Esc cancel]`);
-		return [row("", width), row(hint, width), row("", width), bottomBorder(width)];
+		const hints = ["Enter select", "Esc cancel"];
+		if (this.#onDelete) hints.push("Del/⌫ delete");
+		if (this.#loadAllSessions || this.#globalSessions) hints.push(`Tab ${scopeHint}`);
+		if (this.#preview)
+			hints.push(this.#previewFocused ? "Ctrl+P list · ↑↓/PgUp/PgDn scroll preview" : "Ctrl+P preview");
+		const hint = new Text(theme.fg("muted", hints.join(" · ")), 0, 0);
+		return [
+			row("", width),
+			...hint.render(Math.max(1, width - 4)).map(line => row(line, width)),
+			row("", width),
+			bottomBorder(width),
+		];
 	}
 
 	handleInput(keyData: string): void {
-		if (this.#inputLocked) return;
+		if (this.#inputLocked || this.#disposed) return;
+		this.#previewPaused = false;
 		if (keyData.startsWith("\x1b[<")) {
 			this.#handleMouse(keyData);
 			return;
@@ -1036,7 +1260,17 @@ export class SessionSelectorComponent extends OverlayPanel {
 		if (this.#confirmationDialog) {
 			this.#confirmationDialog.handleInput(keyData);
 		} else {
+			if (this.#preview && matchesKey(keyData, "ctrl+p")) {
+				this.#previewFocused = !this.#previewFocused;
+				this.#onRequestRender?.();
+				return;
+			}
+			if (this.#previewFocused && this.#preview?.handleInput(keyData)) {
+				this.#onRequestRender?.();
+				return;
+			}
 			this.#sessionList.handleInput(keyData);
+			this.#syncPreview();
 		}
 	}
 
@@ -1049,11 +1283,19 @@ export class SessionSelectorComponent extends OverlayPanel {
 	#handleMouse(data: string): void {
 		if (this.#confirmationDialog) return;
 		routeSgrMouseInput(data, event => {
-			if (event.wheel !== null) {
-				this.#sessionList.handleWheel(event.wheel);
+			const insideContent = event.row >= this.#listLineOffset && event.row < this.#footerStart;
+			if (insideContent && this.#previewColumn >= 0 && event.col >= this.#previewColumn) {
+				if (event.wheel !== null) this.#preview?.scroll(event.wheel);
+				if (event.leftClick) this.#previewFocused = true;
+				this.#onRequestRender?.();
 				return true;
 			}
-			if (!event.leftClick || event.row >= this.#footerStart) return true;
+			if (event.wheel !== null) {
+				this.#sessionList.handleWheel(event.wheel);
+				this.#syncPreview();
+				return true;
+			}
+			if (!event.leftClick || !insideContent) return true;
 			const index = this.#sessionList.hitTestSession(event.row - this.#listLineOffset);
 			if (index !== undefined) this.#sessionList.selectAndConfirm(index);
 			return true;

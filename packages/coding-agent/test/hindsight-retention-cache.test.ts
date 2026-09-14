@@ -270,7 +270,7 @@ describe("Hindsight incremental full-session retention cache", () => {
 		const session = {
 			sessionId: "test-session",
 			sessionManager: {
-				getEntries: () => [
+				getAllEntries: async () => [
 					{ type: "message", message: { role: "user", content: "hello first turn" } },
 					{
 						type: "message",

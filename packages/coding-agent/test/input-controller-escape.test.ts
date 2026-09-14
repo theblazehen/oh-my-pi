@@ -631,6 +631,35 @@ describe("InputController escape behavior", () => {
 		expect(ctx.viewSession.abortRetry as unknown as Spy).toHaveBeenCalledTimes(1);
 	});
 
+	it.each(["compaction", "handoff", "retry"] as const)(
+		"pauses an enabled loop when Esc aborts main-view %s",
+		maintenance => {
+			const { ctx, editor } = createContext();
+			const viewSession = abortViewSession(ctx);
+			viewSession.isCompacting = maintenance === "compaction";
+			viewSession.isGeneratingHandoff = maintenance === "handoff";
+			viewSession.isRetrying = maintenance === "retry";
+			ctx.loopModeEnabled = true;
+			ctx.loopModePaused = false;
+			ctx.loopPrompt = "retained prompt";
+			const pauseLoop = vi.fn(() => {
+				ctx.loopModePaused = true;
+			});
+			ctx.pauseLoop = pauseLoop;
+			const controller = new InputController(ctx);
+
+			controller.setupKeyHandlers();
+			editor.onEscape?.();
+
+			expect(pauseLoop).toHaveBeenCalledTimes(1);
+			expect(ctx.loopModePaused).toBe(true);
+			expect(ctx.loopPrompt).toBe("retained prompt");
+			if (maintenance === "compaction") expect(viewSession.abortCompaction).toHaveBeenCalledTimes(1);
+			if (maintenance === "handoff") expect(viewSession.abortHandoff).toHaveBeenCalledTimes(1);
+			if (maintenance === "retry") expect(viewSession.abortRetry).toHaveBeenCalledTimes(1);
+		},
+	);
+
 	it("logs abort failures while treating maintenance Esc as handled", () => {
 		const debugSpy = vi.spyOn(logger, "debug").mockImplementation(() => {});
 		const { ctx, editor, spies } = createContext();

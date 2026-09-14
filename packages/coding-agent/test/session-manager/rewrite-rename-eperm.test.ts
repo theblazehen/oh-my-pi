@@ -43,18 +43,21 @@ class RenameEpermOnceStorage extends FileSessionStorage {
 
 describe("SessionManager rewrite EPERM replacement fallback", () => {
 	let sessionDir: string;
+	let session: SessionManager | undefined;
 
 	beforeEach(async () => {
 		sessionDir = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-eperm-"));
 	});
 
 	afterEach(async () => {
+		await session?.close();
+		session = undefined;
 		await fsp.rm(sessionDir, { recursive: true, force: true });
 	});
 
 	it("keeps the active session healthy when replacing an existing file hits EPERM", async () => {
 		const storage = new RenameEpermOnceStorage();
-		const session = SessionManager.create(sessionDir, sessionDir, storage);
+		session = SessionManager.create(sessionDir, sessionDir, storage);
 		await session.ensureOnDisk();
 		const sessionFile = session.getSessionFile();
 		if (!sessionFile) throw new Error("Expected session file");

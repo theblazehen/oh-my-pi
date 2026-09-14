@@ -55,6 +55,9 @@ export type SubmittedUserInput = {
 	text: string;
 	images?: ImageContent[];
 	imageLinks?: (string | undefined)[];
+	/** Explicit `/loop …` prompt whose command-owned state is committed or rolled
+	 * back when this submission is accepted or rejected. */
+	loopCommandPrompt?: string;
 	customType?: string;
 	/** Route through `session.prompt(text, { synthetic: true })` so the text lands
 	 *  as a hidden agent-authored `developer` message rather than a visible user
@@ -311,6 +314,7 @@ export interface InteractiveModeContext {
 		text: string;
 		images?: ImageContent[];
 		imageLinks?: (string | undefined)[];
+		loopCommandPrompt?: string;
 		customType?: string;
 		display?: boolean;
 		streamingBehavior?: "steer" | "followUp";
@@ -509,7 +513,7 @@ export interface InteractiveModeContext {
 	handleGoalModeCommand(rest?: string, input?: Pick<SubmittedUserInput, "images" | "imageLinks">): Promise<boolean>;
 	handleGuidedGoalCommand(rest?: string, input?: Pick<SubmittedUserInput, "images" | "imageLinks">): Promise<boolean>;
 	handleLoopCommand(args?: string): Promise<string | undefined>;
-	setLoopPrompt(prompt: string): void;
+	finishLoopCommandSubmission(prompt: string, error?: unknown): void;
 	disableLoopMode(message?: string): void;
 	cancelGoalContinuation(): void;
 	disableGoalMode(message?: string): void;

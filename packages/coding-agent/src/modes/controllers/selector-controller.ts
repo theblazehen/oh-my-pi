@@ -1,4 +1,9 @@
-import { type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import {
+	type AgentMessage,
+	type AgentToolResult,
+	ThinkingLevel,
+	type ToolInterruptMode,
+} from "@oh-my-pi/pi-agent-core";
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import { type Model, PASTE_CODE_LOGIN_PROVIDERS, type UsageReport } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
@@ -537,7 +542,7 @@ export class SelectorController {
 				this.ctx.session.setFollowUpMode(value as "all" | "one-at-a-time");
 				break;
 			case "interruptMode":
-				this.ctx.session.setInterruptMode(value as "immediate" | "wait");
+				this.ctx.session.setInterruptMode(value as ToolInterruptMode);
 				break;
 			case "thinkingLevel":
 			case "defaultThinkingLevel":
@@ -1273,52 +1278,57 @@ export class SelectorController {
 		});
 	}
 
-	showUserMessageSelector(): void {
-		const entries = this.ctx.sessionManager
-			.getBranch()
-			.filter((entry): entry is SessionMessageEntry => entry.type === "message");
-		if (entries.length === 0) {
-			this.ctx.showStatus("No messages to branch from");
-			return;
-		}
+	async showUserMessageSelector(): Promise<void> {
+		try {
+			const entries = (await this.ctx.sessionManager.getBranchAsync()).filter(
+				(entry): entry is SessionMessageEntry => entry.type === "message",
+			);
+			if (entries.length === 0) {
+				this.ctx.showStatus("No messages to branch from");
+				return;
+			}
 
-		const done = () => {
-			overlayHandle?.hide();
-			selector?.dispose();
-			this.focusActiveEditorArea();
+			const done = () => {
+				overlayHandle?.hide();
+				selector?.dispose();
+				this.focusActiveEditorArea();
+				this.ctx.ui.requestRender();
+			};
+			const forest = await this.ctx.sessionManager.getFullTree();
+			const selector = new RewindSelectorComponent(entries, {
+				ui: this.ctx.ui,
+				getTool: name => this.ctx.session.getToolByName(name),
+				isBuiltInTool: name => this.ctx.session.hasBuiltInTool(name),
+				getMessageRenderer: type => this.ctx.session.extensionRunner?.getMessageRenderer(type),
+				cwd: this.ctx.sessionManager.getCwd(),
+				hideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,
+				proseOnlyThinking: () => this.ctx.proseOnlyThinking,
+				linkTargets: getAssistantMessageLinkTargets(this.ctx),
+				requestRender: () => this.ctx.ui.requestRender(),
+				siblingPaths: entryId => this.#siblingBranchPaths(entryId, forest),
+				onSelect: entryId => void this.#rewindFromTranscript(entryId, done),
+				onCancel: done,
+			});
+			if (selector.targetCount === 0) {
+				selector.dispose();
+				this.ctx.showStatus("No messages to branch from");
+				return;
+			}
+			// Fullscreen alternate-screen overlay: the transcript replica draws over
+			// the live one, and the normal screen stays untouched until the rewind
+			// itself rewrites it.
+			const overlayHandle = this.ctx.ui.showOverlay(selector, {
+				anchor: "bottom-center",
+				width: "100%",
+				maxHeight: "100%",
+				margin: 0,
+				fullscreen: true,
+			});
+			this.ctx.ui.setFocus(selector);
 			this.ctx.ui.requestRender();
-		};
-		const selector = new RewindSelectorComponent(entries, {
-			ui: this.ctx.ui,
-			getTool: name => this.ctx.session.getToolByName(name),
-			isBuiltInTool: name => this.ctx.session.hasBuiltInTool(name),
-			getMessageRenderer: type => this.ctx.session.extensionRunner?.getMessageRenderer(type),
-			cwd: this.ctx.sessionManager.getCwd(),
-			hideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,
-			proseOnlyThinking: () => this.ctx.proseOnlyThinking,
-			linkTargets: getAssistantMessageLinkTargets(this.ctx),
-			requestRender: () => this.ctx.ui.requestRender(),
-			siblingPaths: entryId => this.#siblingBranchPaths(entryId),
-			onSelect: entryId => void this.#rewindFromTranscript(entryId, done),
-			onCancel: done,
-		});
-		if (selector.targetCount === 0) {
-			selector.dispose();
-			this.ctx.showStatus("No messages to branch from");
-			return;
+		} catch (error) {
+			this.ctx.showError(error instanceof Error ? error.message : String(error));
 		}
-		// Fullscreen alternate-screen overlay: the transcript replica draws over
-		// the live one, and the normal screen stays untouched until the rewind
-		// itself rewrites it.
-		const overlayHandle = this.ctx.ui.showOverlay(selector, {
-			anchor: "bottom-center",
-			width: "100%",
-			maxHeight: "100%",
-			margin: 0,
-			fullscreen: true,
-		});
-		this.ctx.ui.setFocus(selector);
-		this.ctx.ui.requestRender();
 	}
 
 	/**
@@ -1327,10 +1337,7 @@ export class SelectorController {
 	 * descendants (children are timestamp-ordered, so the last child chain is
 	 * the branch's latest continuation) and filtered to message entries.
 	 */
-	#siblingBranchPaths(entryId: string): BranchVariantPath[] {
-		const entry = this.ctx.sessionManager.getEntry(entryId);
-		if (!entry) return [];
-		const forest = this.ctx.sessionManager.getTree();
+	#siblingBranchPaths(entryId: string, forest: SessionTreeNode[]): BranchVariantPath[] {
 		const byId = new Map<string, SessionTreeNode>();
 		const stack = [...forest];
 		while (stack.length > 0) {
@@ -1338,6 +1345,8 @@ export class SelectorController {
 			byId.set(node.entry.id, node);
 			stack.push(...node.children);
 		}
+		const entry = byId.get(entryId)?.entry;
+		if (!entry) return [];
 		const siblings =
 			entry.parentId === null
 				? forest.filter(node => node.entry.id !== entryId)
@@ -1365,21 +1374,21 @@ export class SelectorController {
 	 * rebuilt so the alternate screen never flashes a stale transcript.
 	 */
 	async #rewindFromTranscript(entryId: string, done: () => void): Promise<void> {
-		const entry = this.ctx.sessionManager.getEntry(entryId);
-		if (entry?.type !== "message") {
-			done();
-			return;
-		}
-
-		const isUserTarget = entry.message.role === "user";
-		const realLeafId = this.ctx.sessionManager.getLeafId();
-		if (entryId === realLeafId && !isUserTarget) {
-			done();
-			this.ctx.showStatus("Already at this point");
-			return;
-		}
-		const treeRewind = this.#treeRewindBoundary(entryId, realLeafId);
 		try {
+			const entry = (await this.ctx.sessionManager.getBranchAsync(entryId)).at(-1);
+			if (entry?.type !== "message") {
+				done();
+				return;
+			}
+
+			const isUserTarget = entry.message.role === "user";
+			const realLeafId = this.ctx.sessionManager.getLeafId();
+			if (entryId === realLeafId && !isUserTarget) {
+				done();
+				this.ctx.showStatus("Already at this point");
+				return;
+			}
+			const treeRewind = await this.#treeRewindBoundary(entryId, realLeafId);
 			const result = await this.ctx.session.navigateTree(entryId, { summarize: false });
 			if (result.cancelled) {
 				done();
@@ -1405,65 +1414,69 @@ export class SelectorController {
 		}
 	}
 
-	showCopySelector(): void {
-		const entries = this.ctx.sessionManager
-			.getBranch()
-			.filter((entry): entry is SessionMessageEntry => entry.type === "message");
-		if (entries.length === 0) {
-			this.ctx.showStatus("Nothing to copy yet.");
-			return;
-		}
+	async showCopySelector(): Promise<void> {
+		try {
+			const entries = (await this.ctx.sessionManager.getBranchAsync()).filter(
+				(entry): entry is SessionMessageEntry => entry.type === "message",
+			);
+			if (entries.length === 0) {
+				this.ctx.showStatus("Nothing to copy yet.");
+				return;
+			}
 
-		const done = () => {
-			overlayHandle?.hide();
-			selector?.dispose();
-			this.focusActiveEditorArea();
+			const done = () => {
+				overlayHandle?.hide();
+				selector?.dispose();
+				this.focusActiveEditorArea();
+				this.ctx.ui.requestRender();
+			};
+			const selector = new CopySelectorComponent(entries, {
+				ui: this.ctx.ui,
+				getTool: name => this.ctx.session.getToolByName(name),
+				isBuiltInTool: name => this.ctx.session.hasBuiltInTool(name),
+				getMessageRenderer: type => this.ctx.session.extensionRunner?.getMessageRenderer(type),
+				cwd: this.ctx.sessionManager.getCwd(),
+				hideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,
+				proseOnlyThinking: () => this.ctx.proseOnlyThinking,
+				linkTargets: getAssistantMessageLinkTargets(this.ctx),
+				requestRender: () => this.ctx.ui.requestRender(),
+				onPick: (content, label) => {
+					done();
+					if (!content.trim()) {
+						this.ctx.showStatus("Nothing to copy in that item");
+						return;
+					}
+					void copyToClipboard(content);
+					this.ctx.showStatus(`Copied ${label} to clipboard`);
+				},
+				onOpen: (href, label) => {
+					done();
+					openPath(href);
+					this.ctx.showStatus(`Opening ${label}: ${href}`);
+				},
+				onCancel: done,
+			});
+			if (selector.targetCount === 0) {
+				selector.dispose();
+				this.ctx.showStatus("Nothing to copy yet.");
+				return;
+			}
+			const overlayHandle = this.ctx.ui.showOverlay(selector, {
+				anchor: "bottom-center",
+				width: "100%",
+				maxHeight: "100%",
+				margin: 0,
+				fullscreen: true,
+			});
+			this.ctx.ui.setFocus(selector);
 			this.ctx.ui.requestRender();
-		};
-		const selector = new CopySelectorComponent(entries, {
-			ui: this.ctx.ui,
-			getTool: name => this.ctx.session.getToolByName(name),
-			isBuiltInTool: name => this.ctx.session.hasBuiltInTool(name),
-			getMessageRenderer: type => this.ctx.session.extensionRunner?.getMessageRenderer(type),
-			cwd: this.ctx.sessionManager.getCwd(),
-			hideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,
-			proseOnlyThinking: () => this.ctx.proseOnlyThinking,
-			linkTargets: getAssistantMessageLinkTargets(this.ctx),
-			requestRender: () => this.ctx.ui.requestRender(),
-			onPick: (content, label) => {
-				done();
-				if (!content.trim()) {
-					this.ctx.showStatus("Nothing to copy in that item");
-					return;
-				}
-				void copyToClipboard(content);
-				this.ctx.showStatus(`Copied ${label} to clipboard`);
-			},
-			onOpen: (href, label) => {
-				done();
-				openPath(href);
-				this.ctx.showStatus(`Opening ${label}: ${href}`);
-			},
-			onCancel: done,
-		});
-		if (selector.targetCount === 0) {
-			selector.dispose();
-			this.ctx.showStatus("Nothing to copy yet.");
-			return;
+		} catch (error) {
+			this.ctx.showError(error instanceof Error ? error.message : String(error));
 		}
-		const overlayHandle = this.ctx.ui.showOverlay(selector, {
-			anchor: "bottom-center",
-			width: "100%",
-			maxHeight: "100%",
-			margin: 0,
-			fullscreen: true,
-		});
-		this.ctx.ui.setFocus(selector);
-		this.ctx.ui.requestRender();
 	}
 
-	showTreeSelector(): void {
-		const tree = this.ctx.sessionManager.getTree();
+	async showTreeSelector(): Promise<void> {
+		const tree = await this.ctx.sessionManager.getFullTree();
 		const realLeafId = this.ctx.sessionManager.getLeafId();
 
 		if (tree.length === 0) {
@@ -1482,7 +1495,7 @@ export class SelectorController {
 					// must still be allowed to reopen the picker even though the leaf
 					// doesn't move (chatgpt-codex review on #5895).
 					if (entryId === realLeafId) {
-						const currentEntry = this.ctx.sessionManager.getEntry(entryId);
+						const currentEntry = (await this.ctx.sessionManager.getBranchAsync(entryId)).at(-1);
 						const currentIsAskResult =
 							currentEntry?.type === "message" &&
 							currentEntry.message.role === "toolResult" &&
@@ -1501,7 +1514,7 @@ export class SelectorController {
 					// target sits on the current leaf's path and no summary is added,
 					// the post-navigation transcript is a strict prefix of the rendered
 					// one and the tail can be dropped in place.
-					const treeRewind = this.#treeRewindBoundary(entryId, realLeafId);
+					const treeRewind = await this.#treeRewindBoundary(entryId, realLeafId);
 
 					// Loop until user makes a complete choice or cancels to tree.
 					// Shift+Enter in the tree selector pre-answers "Summarize" and
@@ -1520,7 +1533,7 @@ export class SelectorController {
 
 						if (summaryChoice === undefined) {
 							// User pressed escape - re-show tree selector
-							this.showTreeSelector();
+							await this.showTreeSelector();
 							return;
 						}
 
@@ -1585,7 +1598,7 @@ export class SelectorController {
 						if (result.aborted) {
 							// Summarization aborted - re-show tree selector
 							this.ctx.showStatus("Branch summarization cancelled");
-							this.showTreeSelector();
+							await this.showTreeSelector();
 							return;
 						}
 						if (result.cancelled) {
@@ -1653,22 +1666,24 @@ export class SelectorController {
 	 * cannot anchor an in-place truncation (non-message boundary; custom
 	 * messages render unkeyed components).
 	 */
-	#treeRewindBoundary(
+	async #treeRewindBoundary(
 		targetId: string,
 		leafId: string | null,
-	): { message: AgentMessage; expectedLeafId: string } | undefined {
+	): Promise<{ message: AgentMessage; expectedLeafId: string } | undefined> {
 		if (!leafId) return undefined;
-		const target = this.ctx.sessionManager.getEntry(targetId);
+		const branch = await this.ctx.sessionManager.getBranchAsync(leafId);
+		const entriesById = new Map(branch.map(entry => [entry.id, entry]));
+		const target = entriesById.get(targetId);
 		if (!target) return undefined;
 		const rewindsPastTarget = target.type === "message" && target.message.role === "user";
 		if (!rewindsPastTarget && target.type === "custom_message") return undefined;
 		// Walk leaf → root: proves the target is on the current path and finds
 		// the first entry the rewind drops.
 		let firstDropped: SessionEntry | undefined;
-		let cursor = this.ctx.sessionManager.getEntry(leafId);
+		let cursor = entriesById.get(leafId);
 		while (cursor && cursor.id !== targetId) {
 			firstDropped = cursor;
-			cursor = cursor.parentId ? this.ctx.sessionManager.getEntry(cursor.parentId) : undefined;
+			cursor = cursor.parentId ? entriesById.get(cursor.parentId) : undefined;
 		}
 		if (!cursor) return undefined;
 		const boundary = rewindsPastTarget ? target : firstDropped;
@@ -1807,12 +1822,14 @@ export class SelectorController {
 				historyMatcher,
 				loadAllSessions: () => SessionManager.listAll(),
 				pinnedIds,
+				preview: true,
 			};
 		}
 
 		// Keep the fullscreen picker on the alternate buffer while a selected
 		// session is loaded and its transcript is rebuilt.
 		const done = () => {
+			selector.dispose();
 			overlayHandle?.hide();
 			this.focusActiveEditorArea();
 			this.ctx.ui.requestRender();

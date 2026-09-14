@@ -473,7 +473,7 @@ export class MnemopiSessionState {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return undefined;
 		const latestPrompt = promptText.trim();
 		if (!latestPrompt) return undefined;
-		const history = extractMessages(this.session.sessionManager);
+		const history = await extractMessages(this.session.sessionManager);
 		const queryMessages = [...history, { role: "user" as const, content: latestPrompt }];
 		const query = composeRecallQuery(latestPrompt, queryMessages, this.config.recallContextTurns);
 		const truncated = truncateRecallQuery(query, latestPrompt, this.config.recallMaxQueryChars);
@@ -495,7 +495,7 @@ export class MnemopiSessionState {
 
 	async maybeRetainOnAgentEnd(_messages: AgentMessage[]): Promise<void> {
 		if (!this.config.autoRetain || this.aliasOf) return;
-		const flat = extractMessages(this.session.sessionManager);
+		const flat = await extractMessages(this.session.sessionManager);
 		this.#restoreRetainedTurnCursor();
 		const userTurns = flat.filter(message => message.role === "user").length;
 		if (userTurns - this.lastRetainedTurn < this.config.retainEveryNTurns) return;
@@ -509,7 +509,7 @@ export class MnemopiSessionState {
 
 	async forceRetainCurrentSession(options: { extract?: boolean } = {}): Promise<void> {
 		if (this.aliasOf) return;
-		const flat = extractMessages(this.session.sessionManager);
+		const flat = await extractMessages(this.session.sessionManager);
 		this.#restoreRetainedTurnCursor();
 		const userTurns = flat.filter(message => message.role === "user").length;
 		await this.retainMessages(sliceUnretainedMessages(flat, this.lastRetainedTurn), this.sessionId, {
@@ -598,7 +598,7 @@ export class MnemopiSessionState {
 
 	async maybeRecallOnAgentStart(): Promise<void> {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return;
-		const messages = extractMessages(this.session.sessionManager);
+		const messages = await extractMessages(this.session.sessionManager);
 		const lastUser = messages.findLast(message => message.role === "user");
 		if (!lastUser) return;
 		const query = composeRecallQuery(lastUser.content, messages, this.config.recallContextTurns);

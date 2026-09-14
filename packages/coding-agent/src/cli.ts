@@ -41,6 +41,7 @@ import { LSP_MUX_WORKER_ARG } from "./lsp/mux/protocol";
 import { STATS_ACTIVITY_WORKER_ARG } from "./stats/activity-protocol";
 import rootLicense from "./tools/browser/relay/extension-assets/LICENSE.txt" with { type: "text" };
 import thirdPartyNotices from "./tools/browser/relay/extension-assets/THIRD-PARTY-NOTICES.txt" with { type: "text" };
+import { SESSION_HISTORY_WORKER_ARG } from "./session/session-history-worker-protocol";
 import { COMPUTER_WORKER_ARG } from "./tools/computer/protocol";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -107,6 +108,7 @@ async function runSmokeTest(): Promise<void> {
 	const { smokeTestLspMux } = await import("./lsp/mux/daemon");
 	const { smokeTestBlobBroker } = await import("./blob-broker/daemon");
 	const { smokeTestTerminalOutputWorker } = await import("./launch/terminal-output-worker-client");
+	const { smokeTestSessionHistoryWorker } = await import("./session/session-history-worker-client");
 	await smokeTestSyncWorker();
 	await smokeTestStatsActivityWorker();
 
@@ -133,6 +135,7 @@ async function runSmokeTest(): Promise<void> {
 	await smokeTestLspMux();
 	await smokeTestBlobBroker();
 	await smokeTestTerminalOutputWorker();
+	await smokeTestSessionHistoryWorker();
 	process.stdout.write("smoke-test: ok\n");
 }
 
@@ -229,6 +232,13 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 		if (parentPort) installWorkerInbox(parentPort);
 		// This selector is the isolation boundary; a static import would evaluate xterm in normal CLI startup.
 		await import("./launch/terminal-output-worker");
+		return true;
+	}
+	if (arg === SESSION_HISTORY_WORKER_ARG) {
+		if (parentPort) installWorkerInbox(parentPort);
+		// Dynamic loading is the isolation boundary: the normal CLI must not evaluate the full-session scanner.
+		const { startSessionHistoryWorker } = await import("./session/session-history-worker-entry");
+		startSessionHistoryWorker();
 		return true;
 	}
 	if (arg === DAEMON_BROKER_WORKER_ARG) {

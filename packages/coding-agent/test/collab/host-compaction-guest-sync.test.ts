@@ -174,6 +174,43 @@ afterEach(async () => {
 });
 
 describe("collab host compaction → guest sync (#9781)", () => {
+	it("serves a complete cold snapshot without retaining historical payloads on the host", async () => {
+		const directory = TempDir.createSync("@pi-collab-cold-host-");
+		cleanups.push(() => directory.remove());
+		const writer = SessionManager.create(directory.path(), directory.path());
+		const coldId = writer.appendMessage({ role: "user", content: "historical question", timestamp: 1 });
+		writer.appendMessage(createAssistantMessage("x".repeat(17 * 1024 * 1024)));
+		const keptId = writer.appendMessage({ role: "user", content: "keep", timestamp: 2 });
+		writer.appendCompaction("SUMMARY", undefined, keptId, 100);
+		const snapshot = writer.snapshotForReplication();
+		await writer.flush();
+		const file = writer.getSessionFile();
+		if (!file) throw new Error("Expected persisted host history");
+		await writer.close();
+		// Normal persistence can externalize the large reply into a blob, leaving
+		// a small journal. Exercise a genuine large inline journal on cold open.
+		await Bun.write(file, [snapshot.header, ...snapshot.entries].map(entry => `${JSON.stringify(entry)}\n`).join(""));
+		const manager = await SessionManager.open(file, directory.path());
+		cleanups.push(() => manager.close());
+		expect(manager.hasColdHistory()).toBeTrue();
+		expect(manager.getEntry(coldId)).toBeUndefined();
+		const host = new CollabHost(makeHostContext(manager));
+		await host.start("ws://localhost:8788");
+		cleanups.push(() => host.stop("test done"));
+		expect(manager.hasColdHistory()).toBeTrue();
+		const harness = makeGuestHarness(model, modelRegistry);
+		cleanups.push(harness.dispose);
+		await harness.guest.join(host.link);
+		await settleFrames(() => harness.session.messages[0]?.role === "compactionSummary");
+		const guestHistory = await harness.session.sessionManager.getAllEntries();
+		expect(guestHistory.find(entry => entry.id === coldId)).toMatchObject({
+			type: "message",
+			message: { content: "historical question" },
+		});
+		expect(manager.hasColdHistory()).toBeTrue();
+		expect(manager.getEntry(coldId)).toBeUndefined();
+	}, 30_000);
+
 	it("collapses the guest's model context behind the summary after the host compacts", async () => {
 		const hostManager = SessionManager.inMemory();
 		hostManager.appendMessage({ role: "user", content: "first", timestamp: Date.now() });

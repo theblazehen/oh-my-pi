@@ -189,10 +189,10 @@ function sessionHeaderForExport(header: SessionHeader | null): SessionHeader | n
 }
 
 /** Snapshot the session (plus optional agent state) into the JSON shape the viewer renders. */
-export function buildSessionData(sm: SessionManager, state?: AgentState): SessionData {
+export async function buildSessionData(sm: SessionManager, state?: AgentState): Promise<SessionData> {
 	return {
 		header: sessionHeaderForExport(sm.getHeader()),
-		entries: sm.getEntries(),
+		entries: await sm.getAllEntries(),
 		leafId: sm.getLeafId(),
 		systemPrompt: state?.systemPrompt.join("\n\n"),
 		tools: state?.tools?.map(t => ({ name: t.name, description: t.description })),
@@ -275,7 +275,7 @@ export async function exportSessionToHtml(
 	const sessionFile = sm.getSessionFile();
 	if (!sessionFile) throw new Error("Cannot export in-memory session to HTML");
 
-	const sessionData = buildSessionData(sm, state);
+	const sessionData = await buildSessionData(sm, state);
 	if (opts.includeSubSessions !== false) {
 		const subSessions = await collectSubSessions(sessionFile);
 		if (Object.keys(subSessions).length > 0) sessionData.subSessions = subSessions;
@@ -303,7 +303,7 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 
 	const sessionData: SessionData = {
 		header: sessionHeaderForExport(sm.getHeader()),
-		entries: sm.getEntries(),
+		entries: await sm.getAllEntries(),
 		leafId: sm.getLeafId(),
 	};
 	if (opts.includeSubSessions !== false) {

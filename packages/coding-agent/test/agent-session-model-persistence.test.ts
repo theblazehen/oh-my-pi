@@ -9,7 +9,10 @@ import { type CreateAgentSessionResult, createAgentSession } from "@oh-my-pi/pi-
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { getRestorableSessionModels } from "@oh-my-pi/pi-coding-agent/session/session-context";
-import { EPHEMERAL_MODEL_CHANGE_ROLE } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import {
+	CURRENT_SESSION_VERSION,
+	EPHEMERAL_MODEL_CHANGE_ROLE,
+} from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -92,6 +95,73 @@ describe("AgentSession model persistence", () => {
 		);
 		return targetSessionFile;
 	}
+
+	async function writeColdControlSession(model: Model<Api>): Promise<string> {
+		const targetSessionFile = path.join(tempDir.path(), `cold-controls-${Bun.nanoseconds()}.jsonl`);
+		const timestamp = "2026-06-01T00:00:00.000Z";
+		const entries = [
+			{
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "cold-control-session",
+				timestamp,
+				cwd: tempDir.path(),
+			},
+			{
+				type: "model_change",
+				id: "cold-model",
+				parentId: null,
+				timestamp,
+				model: modelValue(model),
+				role: "default",
+			},
+			{
+				type: "thinking_level_change",
+				id: "cold-thinking",
+				parentId: "cold-model",
+				timestamp,
+				thinkingLevel: Effort.Low,
+				configured: Effort.Low,
+			},
+			{
+				type: "service_tier_change",
+				id: "cold-tier",
+				parentId: "cold-thinking",
+				timestamp,
+				serviceTier: { anthropic: "priority" },
+			},
+			{
+				type: "message",
+				id: "huge-cold-message",
+				parentId: "cold-tier",
+				timestamp,
+				message: {
+					role: "user",
+					content: `cold-${"x".repeat(17 * 1024 * 1024)}`,
+					timestamp: Date.parse(timestamp),
+				},
+			},
+			{
+				type: "message",
+				id: "kept-user",
+				parentId: "huge-cold-message",
+				timestamp,
+				message: { role: "user", content: "kept user", timestamp: Date.parse(timestamp) },
+			},
+			{
+				type: "compaction",
+				id: "latest-compaction",
+				parentId: "kept-user",
+				timestamp,
+				summary: "Retained compacted context",
+				firstKeptEntryId: "kept-user",
+				tokensBefore: 2_000,
+			},
+		];
+		await Bun.write(targetSessionFile, `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+		return targetSessionFile;
+	}
+
 	async function createSession(options?: {
 		initialModel?: Model<Api>;
 		selectInitialModel?: (availableModels: Model<Api>[]) => Model<Api>;
@@ -317,6 +387,39 @@ describe("AgentSession model persistence", () => {
 
 		expect(result.session.model?.id).toBe(smolModel.id);
 	});
+
+	it("restores cold thinking and service-tier controls during startup resume and session switching", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const targetSessionFile = await writeColdControlSession(model);
+		expect(Bun.file(targetSessionFile).size).toBeGreaterThan(8 * 1024 * 1024);
+		const settings = Settings.isolated({
+			defaultThinkingLevel: Effort.High,
+			"tier.anthropic": "none",
+		});
+
+		const resumed = await createStartupResumeSession(targetSessionFile, settings);
+		expect(resumed.session.sessionManager.hasColdHistory()).toBe(true);
+		expect(resumed.session.sessionManager.getBranch().some(entry => entry.type === "thinking_level_change")).toBe(
+			false,
+		);
+		expect(resumed.session.sessionManager.getBranch().some(entry => entry.type === "service_tier_change")).toBe(
+			false,
+		);
+		expect(resumed.session.configuredThinkingLevel()).toBe(Effort.Low);
+		expect(resumed.session.serviceTierByFamily).toEqual({ anthropic: "priority" });
+
+		await resumed.session.dispose();
+		session = undefined;
+
+		const current = await createSession({ initialModel: model, persist: true });
+		current.settings.set("defaultThinkingLevel", Effort.High);
+		current.settings.set("tier.anthropic", "none");
+
+		await expect(current.session.switchSession(targetSessionFile)).resolves.toBe(true);
+		expect(current.session.sessionManager.hasColdHistory()).toBe(true);
+		expect(current.session.configuredThinkingLevel()).toBe(Effort.Low);
+		expect(current.session.serviceTierByFamily).toEqual({ anthropic: "priority" });
+	}, 15_000);
 
 	it("falls back to the saved default model when switch-session role restore is unavailable", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");

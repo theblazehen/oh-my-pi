@@ -133,6 +133,9 @@ export function isSoftToolRequirement(directive: ToolChoiceDirective | undefined
  */
 export type SteeringInterruptSource = "user" | "agent" | "system" | "unknown";
 
+/** When queued steering may interrupt an executing tool batch. */
+export type ToolInterruptMode = "immediate" | "blocking" | "wait";
+
 /** Non-consuming summary of whether queued steering should interrupt a tool batch. */
 export interface SteeringQueueState {
 	/** True when at least one steering message is queued. */
@@ -149,10 +152,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 
 	/**
 	 * When to interrupt tool execution for steering messages.
-	 * - "immediate" = check after each tool call (default)
+	 * - "immediate" = watch every tool batch (default)
+	 * - "blocking" = watch only batches containing a hard-interruptible or
+	 *   cooperatively yieldable call; skip only passive waits, preserving work
 	 * - "wait" = defer steering until the current turn completes
 	 */
-	interruptMode?: "immediate" | "wait";
+	interruptMode?: ToolInterruptMode;
 
 	/**
 	 * Optional session identifier forwarded to LLM providers.
@@ -245,10 +250,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Peeks whether steering messages are queued, without consuming them.
 	 *
-	 * Polled while a tool batch runs (unless interruptMode is "wait") to decide
-	 * whether to abort in-flight and skip not-yet-started *interruptible* waits;
-	 * every other already-emitted call still executes and the message injects
-	 * at the batch boundary. The queue keeps
+	 * Polled during and after tool execution in a watched batch to detect steering.
+	 * `"immediate"` watches every batch and skips only pending passive waits;
+	 * `"blocking"` watches only batches with an `interruptible`, statically or
+	 * dynamically `steeringYieldable`, or successfully reserved cooperative-yield
+	 * call and skips only not-yet-started passive waits, preserving ordinary and
+	 * cooperative work; `"wait"` watches none. The queue keeps
 	 * owning its messages until the loop reaches the next injection boundary and
 	 * dequeues via {@link getSteeringMessages} — so callers can still cancel or
 	 * restore queued messages while in-flight tools settle, and an external
@@ -272,11 +279,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	waitForSteeringMessages?: (signal?: AbortSignal) => Promise<void>;
 
 	/**
-	 * Peeks whether IRC messages should interrupt an interruptible waiting tool.
+	 * Peeks whether IRC messages should interrupt a watched tool batch.
 	 *
 	 * Uses the same delivery rules as steering: the poll is non-consuming, only
-	 * runs for interruptible tools, and is ignored when interruptMode is "wait".
-	 * The host owns message injection at the next boundary.
+	 * runs for batches selected by {@link interruptMode}, and is ignored when
+	 * `interruptMode` is `"wait"`. The host owns message injection at the next
+	 * boundary.
 	 */
 	hasIrcInterrupts?: () => boolean | Promise<boolean>;
 
@@ -541,6 +549,16 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	telemetry?: AgentTelemetryConfig;
 }
 
+/** Reservation that makes a call eligible for cooperative blocking steering. */
+export interface SteeringYieldLease {
+	/**
+	 * Releases the resource reserved for this call's cooperative steering yield.
+	 * Implementations MUST be idempotent: the tool may consume the reservation
+	 * before the agent loop performs its unconditional cleanup release.
+	 */
+	release(): void;
+}
+
 /**
  * Batch/sequencing metadata for the tool call currently being processed.
  */
@@ -549,6 +567,10 @@ export interface ToolCallContext {
 	index: number;
 	total: number;
 	toolCalls: Array<{ id: string; name: string }>;
+	/** Whether blocking-mode reservation preparation ran for this call. Absence means false. */
+	steeringYieldPreparationAttempted?: boolean;
+	/** Reservation acquired for this call's cooperative steering yield, when available. */
+	steeringYieldLease?: SteeringYieldLease;
 	/** Provider-native metadata for the current call, when present. */
 	providerMetadata?: ToolCallProviderMetadata;
 	/**
@@ -748,7 +770,9 @@ export type ToolApproval = ToolApprovalDecision | ((args: unknown) => ToolApprov
  * Apps can extend via declaration merging.
  */
 export interface AgentToolContext {
-	// Empty by default - apps extend via declaration merging
+	/** Loop-owned metadata for the tool call currently being executed. */
+	toolCall?: ToolCallContext;
+	// Apps extend with their own fields via declaration merging.
 }
 
 export type AgentToolExecFn<TParameters extends TSchema = TSchema, TDetails = any, TTheme = unknown> = (
@@ -809,17 +833,37 @@ export interface AgentTool<
 	/** If true, argument validation errors are non-fatal: raw args are passed to execute() instead of returning an error to the LLM. */
 	lenientArgValidation?: boolean;
 	/**
-	 * Whether the agent loop may abort this tool mid-execution — or skip it
-	 * before it starts — to deliver a queued steering message. A function
-	 * resolves this per call from the raw, pre-validation arguments.
+	 * Whether the agent loop may hard-abort this tool mid-execution or skip it
+	 * before starting to deliver queued steering. A function resolves this from the
+	 * prepared, possibly hook-revised arguments; resolver failures are false.
 	 *
-	 * Enable only for calls that purely *wait* and observe their abort signal
-	 * cleanly (e.g. `job` poll), so the abort surfaces the tool's current
-	 * snapshot rather than corrupting a side effect. Every other call runs to
-	 * completion even when steering is queued; the message lands at the next
-	 * batch boundary. Honored only when `interruptMode` is "immediate".
+	 * Enable only for calls that purely wait and observe their hard abort signal
+	 * cleanly (e.g. a job poll), so aborting cannot leave a partial side effect.
+	 * This metadata also makes a batch eligible for `"blocking"` mode.
 	 */
 	interruptible?: boolean | ((args: Partial<Static<TParameters>>) => boolean);
+	/**
+	 * Whether this tool can cooperatively yield to queued steering by observing
+	 * {@link ToolCallContext.steeringSignal} and then finishing or safely moving
+	 * its work to the background. A function resolves this per call from the
+	 * prepared, possibly hook-revised arguments; resolver failures are false.
+	 *
+	 * This is not permission to hard-abort the tool. It only makes the batch
+	 * eligible for `"blocking"` mode; when steering arrives, the loop soft-signals
+	 * the whole batch and hard-aborts only calls marked {@link interruptible}.
+	 */
+	steeringYieldable?: boolean | ((args: Partial<Static<TParameters>>) => boolean);
+	/**
+	 * Atomically reserves the resource needed for this call to yield
+	 * cooperatively. Invoked only in `"blocking"` mode, after validation and
+	 * `beforeToolCall` argument revision. A returned lease makes the batch
+	 * eligible for blocking steering; failures and `undefined` do not.
+	 *
+	 * The exact lease is passed through {@link ToolCallContext} and released by
+	 * the agent loop after execution or when the call is skipped. Its
+	 * {@link SteeringYieldLease.release} method MUST therefore be idempotent.
+	 */
+	prepareSteeringYield?: (args: Partial<Static<TParameters>>) => SteeringYieldLease | undefined;
 	/**
 	 * Controls how the INTENT_FIELD (`i`) is handled for this tool.
 	 * - `"require"` (default): `i` is injected and required in the parameter schema.

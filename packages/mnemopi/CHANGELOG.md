@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Finalized outstanding statements when closing owned database connections so backing files are released immediately.
+
 ## [18.0.11] - 2026-08-29
 
 ### Fixed

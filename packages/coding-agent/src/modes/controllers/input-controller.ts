@@ -90,6 +90,17 @@ function isExpandable(obj: unknown): obj is Expandable {
 	return typeof obj === "object" && obj !== null && "setExpanded" in obj && typeof obj.setExpanded === "function";
 }
 
+function isLoopBuiltinInvocation(text: string): boolean {
+	if (!text.startsWith("/")) return false;
+	const body = text.slice(1);
+	const firstWhitespace = body.search(/\s/);
+	const firstColon = body.indexOf(":");
+	const separator =
+		firstWhitespace === -1 ? firstColon : firstColon === -1 ? firstWhitespace : Math.min(firstWhitespace, firstColon);
+	const name = separator === -1 ? body : body.slice(0, separator);
+	return name === "loop";
+}
+
 /** Minimal contract for any component that can receive a paste payload directly. */
 interface PasteTarget {
 	pasteText(text: string): void;
@@ -388,7 +399,10 @@ export class InputController {
 					safeAbort("retry", () => viewSession.abortRetry());
 					aborted = true;
 				}
-				if (aborted) return;
+				if (aborted) {
+					if (this.ctx.loopModeEnabled) this.ctx.pauseLoop();
+					return;
+				}
 			}
 
 			if (vocalizer.isSpeaking()) {
@@ -810,7 +824,9 @@ export class InputController {
 			}
 
 			// Handle built-in slash commands
+			let loopCommandPrompt: string | undefined;
 			if (text) {
+				const loopInvocation = isLoopBuiltinInvocation(text);
 				this.#recordSlashCommandUsage(text);
 				const input =
 					(inputImages?.length ?? 0) > 0 || (inputImageLinks?.length ?? 0) > 0
@@ -822,6 +838,7 @@ export class InputController {
 					return;
 				}
 				if (typeof slashResult === "string") {
+					if (loopInvocation) loopCommandPrompt = slashResult;
 					// Command handled but returned remaining text to use as prompt.
 					// Record the original slash command text so Up Arrow recalls
 					// "/loop 10 fix bug" rather than just "fix bug".
@@ -861,7 +878,7 @@ export class InputController {
 			// free-text Enter semantics below); Ctrl+Enter routes through `handleFollowUp`.
 			// During compaction, queue immediately so bash/python/loop-mode branches do
 			// not consume the skill before the compaction-resume path re-parses it.
-			if (text && isKnownSkillCommand(this.ctx, text)) {
+			if (!loopCommandPrompt && text && isKnownSkillCommand(this.ctx, text)) {
 				if (this.ctx.session.isCompacting) {
 					const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
 					this.ctx.queueCompactionMessage(text, "steer", images);
@@ -873,7 +890,7 @@ export class InputController {
 			}
 
 			// Handle bash command (! for normal, !! for excluded from context)
-			if (text.startsWith("!")) {
+			if (!loopCommandPrompt && text.startsWith("!")) {
 				const isExcluded = text.startsWith("!!");
 				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
 				if (command) {
@@ -892,7 +909,7 @@ export class InputController {
 
 			// Handle python command (`$ <code>` for normal, `$$ <code>` for excluded from context).
 			// Shell-style variables such as `$HOME` are normal prose unless a space follows the sigil.
-			const pythonCommand = parsePythonCommandInput(text);
+			const pythonCommand = loopCommandPrompt ? null : parsePythonCommandInput(text);
 			if (pythonCommand) {
 				const { code, isExcluded } = pythonCommand;
 				if (code) {
@@ -912,20 +929,20 @@ export class InputController {
 			// Queue input during compaction
 			if (this.ctx.session.isCompacting) {
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
-				this.ctx.queueCompactionMessage(text, "steer", images);
-				// An inline `/loop` body queued here arms the loop only when it is
-				// an actual model prompt. Skill/bash/python bodies never reach this
-				// branch, but an extension-command body would otherwise be retained
-				// as loopPrompt while the drain executes it locally — and idle
-				// submissions never arm commands.
-				if (submittedMode === "loop" && !this.#isLocalExtensionCommand(text)) this.ctx.setLoopPrompt(text);
+				try {
+					this.ctx.queueCompactionMessage(text, "steer", images);
+					if (loopCommandPrompt) this.ctx.finishLoopCommandSubmission(loopCommandPrompt);
+				} catch (error) {
+					if (loopCommandPrompt) this.ctx.finishLoopCommandSubmission(loopCommandPrompt, error);
+					throw error;
+				}
 				return;
 			}
 
 			// Extension commands are local actions. Execute them before the normal
 			// submission path creates an optimistic user message; otherwise a
 			// consumed command remains rendered like a prompt sent to the model.
-			if (this.#isLocalExtensionCommand(text)) {
+			if (!loopCommandPrompt && this.#isLocalExtensionCommand(text)) {
 				this.ctx.editor.clearDraft(text);
 				try {
 					await this.ctx.session.prompt(text, { images: inputImages });
@@ -957,17 +974,7 @@ export class InputController {
 				// typed since queuing intact. Same protection as #783, applied to
 				// the streaming/queue path.
 				try {
-					const forwarded = await this.ctx.withLocalSubmission(
-						text,
-						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
-						{ imageCount: images?.length ?? 0 },
-					);
-					// An inline `/loop` body arms the loop only after dispatch
-					// confirms it was forwarded: arming before the await would
-					// retain a body whose dispatch rejects, resubmitting a failed
-					// prompt after every yield. A rejection leaves prior loop
-					// state untouched, so the previous body (if any) survives.
-					if (submittedMode === "loop" && forwarded) this.ctx.setLoopPrompt(text);
+					await this.#dispatchPrompt(text, images, "steer", loopCommandPrompt);
 				} catch (error) {
 					// Don't lose the queued steer draft: restore images then the collapsed
 					// text so chip tokens (and band cards) survive the retry.
@@ -986,15 +993,6 @@ export class InputController {
 				return;
 			}
 			// Normal message submission
-			// While loop mode is on, an idle user-typed prompt becomes the new loop
-			// prompt that auto-resubmits after each yield. This arms synchronously,
-			// before any await: arming after a turn-length dispatch would race the
-			// reschedule timer and strand the waiter. Non-forward outcomes (local
-			// consume, rejection) park the loop at their own dispatch sites, so a
-			// failed body degrades to idle instead of looping errors.
-			if (this.ctx.loopModeEnabled) {
-				this.ctx.setLoopPrompt(text);
-			}
 			// First, move any pending bash components to chat
 			this.ctx.flushPendingBashComponents();
 
@@ -1015,6 +1013,7 @@ export class InputController {
 					text,
 					images,
 					imageLinks: inputImageLinks,
+					loopCommandPrompt,
 					streamingBehavior: "steer",
 				});
 				// Start titling only after the optimistic row painted, so the local
@@ -1036,17 +1035,7 @@ export class InputController {
 				this.ctx.editor.pendingImageLinks = [];
 				this.#maybeStartTitleGeneration(text);
 				try {
-					const forwarded = await this.ctx.withLocalSubmission(
-						text,
-						() => this.ctx.session.prompt(text, { streamingBehavior: "steer", images }),
-						{
-							imageCount: images?.length ?? 0,
-						},
-					);
-					// The idle block above already armed this body synchronously.
-					// A locally-consumed dispatch starts no turn: park the armed
-					// loop instead of resubmitting a local action on next idle.
-					if (!forwarded && this.ctx.loopPrompt === text) this.ctx.pauseLoop();
+					await this.#dispatchPrompt(text, images, "steer", loopCommandPrompt);
 				} catch (error) {
 					// Don't lose the message: hand images then collapsed text back to the
 					// editor so the user can retry (e.g. prompt dispatch rejecting an
@@ -1060,9 +1049,6 @@ export class InputController {
 					}
 					this.ctx.editor.setCollapsedText(text);
 					this.ctx.showError(error instanceof Error ? error.message : String(error));
-					// Dispatch rejected after the body was armed: park it so the
-					// failed prompt is not resubmitted on next idle.
-					if (this.ctx.loopPrompt === text) this.ctx.pauseLoop();
 				}
 				this.ctx.updatePendingMessagesDisplay();
 				this.ctx.ui.requestRender();
@@ -1481,7 +1467,9 @@ export class InputController {
 			return;
 		}
 
+		let loopCommandPrompt: string | undefined;
 		if (text) {
+			const loopInvocation = isLoopBuiltinInvocation(text);
 			const input = (images?.length ?? 0) > 0 || (imageLinks?.length ?? 0) > 0 ? { images, imageLinks } : undefined;
 			const slashResult = await executeBuiltinSlashCommand(text, { ctx: this.ctx, input });
 			if (slashResult === true) {
@@ -1489,6 +1477,7 @@ export class InputController {
 				return;
 			}
 			if (typeof slashResult === "string") {
+				if (loopInvocation) loopCommandPrompt = slashResult;
 				// Command handled but returned remaining text to use as prompt.
 				// Record the original slash command text so Up Arrow recalls it.
 				if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
@@ -1499,7 +1488,7 @@ export class InputController {
 		// Skill commands invoke through the custom-message path regardless of
 		// which keybinding submitted them. Enter routes them as `steer`;
 		// Ctrl+Enter (this handler) routes them as `followUp`.
-		if (text && (await this.#invokeSkillCommand(text, "followUp", images, imageLinks))) {
+		if (!loopCommandPrompt && text && (await this.#invokeSkillCommand(text, "followUp", images, imageLinks))) {
 			return;
 		}
 
@@ -1520,11 +1509,7 @@ export class InputController {
 		if (this.ctx.session.isStreaming) {
 			this.ctx.editor.clearDraft(text);
 			try {
-				await this.ctx.withLocalSubmission(
-					text,
-					() => this.ctx.session.prompt(text, { streamingBehavior: "followUp", images }),
-					{ imageCount: images?.length ?? 0 },
-				);
+				await this.#dispatchPrompt(text, images, "followUp", loopCommandPrompt);
 			} catch (error) {
 				restoreOnError(error);
 			}
@@ -1533,14 +1518,55 @@ export class InputController {
 			return;
 		}
 
+		if (loopCommandPrompt && this.ctx.onInputCallback) {
+			this.ctx.editor.clearDraft(text);
+			const submission = this.ctx.startPendingSubmission({
+				text,
+				images,
+				imageLinks,
+				loopCommandPrompt,
+				streamingBehavior: "followUp",
+			});
+			this.ctx.onInputCallback(submission);
+			return;
+		}
+
 		// Not streaming — just submit normally
 		this.ctx.editor.clearDraft(text);
 		try {
-			await this.ctx.withLocalSubmission(text, () => this.ctx.session.prompt(text, { images }), {
-				imageCount: images?.length ?? 0,
-			});
+			await this.#dispatchPrompt(text, images, undefined, loopCommandPrompt);
 		} catch (error) {
 			restoreOnError(error);
+		}
+	}
+
+	/** Direct submissions share upstream delivery tracking and explicit-loop settlement. */
+	async #dispatchPrompt(
+		text: string,
+		images: ImageContent[] | undefined,
+		streamingBehavior: "steer" | "followUp" | undefined,
+		loopCommandPrompt: string | undefined,
+	): Promise<void> {
+		try {
+			const forwarded = await this.ctx.withLocalSubmission(
+				text,
+				() =>
+					this.ctx.session.prompt(text, {
+						images,
+						...(streamingBehavior ? { streamingBehavior } : {}),
+						...(loopCommandPrompt ? { expandPromptTemplates: false } : {}),
+					}),
+				{ imageCount: images?.length ?? 0 },
+			);
+			if (loopCommandPrompt) {
+				this.ctx.finishLoopCommandSubmission(
+					loopCommandPrompt,
+					forwarded === false ? new Error("Loop prompt was consumed locally") : undefined,
+				);
+			}
+		} catch (error) {
+			if (loopCommandPrompt) this.ctx.finishLoopCommandSubmission(loopCommandPrompt, error);
+			throw error;
 		}
 	}
 

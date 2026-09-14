@@ -92,6 +92,69 @@ describe("estimate cache settle gate", () => {
 	});
 });
 
+describe("estimate content contracts", () => {
+	test("counts substantial custom-message text", () => {
+		const message = {
+			role: "custom",
+			customType: "estimator-fixture",
+			content: "substantial custom message content ".repeat(2000),
+			display: false,
+			timestamp: 1,
+		} as AgentMessage;
+
+		expect(tokenizer.countMessage(message)).toBeGreaterThan(1000);
+	});
+
+	test("charges the fixed image estimate for user image blocks", () => {
+		const textOnly = {
+			role: "user",
+			content: [{ type: "text", text: "same user text" }],
+			timestamp: 1,
+		} as AgentMessage;
+		const withImage = {
+			role: "user",
+			content: [
+				{ type: "text", text: "same user text" },
+				{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+			],
+			timestamp: 1,
+		} as AgentMessage;
+
+		expect(tokenizer.countMessage(withImage) - tokenizer.countMessage(textOnly)).toBe(1200);
+	});
+
+	test("counts developer string and text-block content", () => {
+		const text = "substantial developer instruction content ".repeat(2000);
+		const stringContent = { role: "developer", content: text, timestamp: 1 } as AgentMessage;
+		const textBlockContent = {
+			role: "developer",
+			content: [{ type: "text", text }],
+			timestamp: 1,
+		} as AgentMessage;
+
+		expect(tokenizer.countMessage(stringContent)).toBeGreaterThan(1000);
+		expect(tokenizer.countMessage(textBlockContent)).toBe(tokenizer.countMessage(stringContent));
+	});
+
+	test("charges the fixed image estimate for developer image blocks", () => {
+		const textOnly = {
+			role: "developer",
+			content: [{ type: "text", text: "same developer text" }],
+			timestamp: 1,
+		} as AgentMessage;
+		const withImage = {
+			role: "developer",
+			content: [
+				{ type: "text", text: "same developer text" },
+				{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+			],
+			timestamp: 1,
+		} as AgentMessage;
+
+		expect(tokenizer.countMessage(withImage) - tokenizer.countMessage(textOnly)).toBe(1200);
+	});
+});
+
 describe("estimate cache option split", () => {
 	test("default and floored estimates do not collide in one map", () => {
 		const blob = "blob ".repeat(4000);

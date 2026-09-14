@@ -247,8 +247,14 @@ agent.followUp({
 });
 ```
 
-Steering messages are checked after each tool call by default. Set `interruptMode` to `"wait"` to defer
-steering until the current turn completes.
+`interruptMode` controls whether steering is watched while a tool batch runs: `"immediate"` watches every batch,
+`"blocking"` watches only batches containing an `interruptible` call, a declaratively `steeringYieldable` call, or a
+call that successfully acquires an atomic cooperative-yield reservation through `prepareSteeringYield`; `"wait"`
+watches none, deferring steering until the current turn completes. Steering hard-aborts only `interruptible` calls;
+yieldable and reserved calls instead receive `ToolCallContext.steeringSignal` to cooperate. In `"blocking"` mode,
+only not-yet-started passive waits are skipped: ordinary, yieldable, and reserved calls still execute, even in a
+mixed batch. In `"immediate"` mode, all not-yet-started calls are skipped. Messages are injected after the batch settles. A
+`prepareSteeringYield` lease must make `release()` idempotent so cleanup remains safe after the tool consumes it.
 
 ## Custom Message Types
 

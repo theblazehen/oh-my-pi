@@ -219,7 +219,8 @@ export class Tokenizer {
 		}
 
 		switch (message.role) {
-			case "user": {
+			case "user":
+			case "developer": {
 				const content: string | Array<{ type: string; text?: string }> = message.content;
 				if (typeof content === "string") {
 					fragments.push(content);
@@ -227,6 +228,8 @@ export class Tokenizer {
 					for (const block of content) {
 						if (block.type === "text" && block.text) {
 							fragments.push(block.text);
+						} else if (block.type === "image") {
+							extra += IMAGE_TOKEN_ESTIMATE;
 						}
 					}
 				}
@@ -266,6 +269,7 @@ export class Tokenizer {
 				}
 				break;
 			}
+			case "custom":
 			case "hookMessage":
 			case "toolResult": {
 				if (typeof message.content === "string") {

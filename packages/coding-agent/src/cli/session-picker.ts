@@ -10,6 +10,7 @@ import { FileSessionStorage } from "../session/session-storage";
 /** Presentation and capability controls for the standalone session picker. */
 export interface SessionPickerOptions {
 	allSessions?: SessionInfo[];
+	initialScope?: "folder" | "all";
 	title?: string;
 	scopeLabel?: string | false;
 	showCwd?: boolean;
@@ -17,6 +18,7 @@ export interface SessionPickerOptions {
 	allowGlobalScope?: boolean;
 	historySearch?: boolean;
 	pinnedIds?: ReadonlySet<string>;
+	preview?: boolean;
 }
 
 /**
@@ -55,6 +57,7 @@ export async function selectSession(
 			(session: SessionInfo) => {
 				if (!resolved) {
 					resolved = true;
+					selector.dispose();
 					ui.stop();
 					resolve(session);
 				}
@@ -62,6 +65,7 @@ export async function selectSession(
 			() => {
 				if (!resolved) {
 					resolved = true;
+					selector.dispose();
 					ui.stop();
 					resolve(null);
 				}
@@ -69,6 +73,7 @@ export async function selectSession(
 			() => {
 				if (!resolved) {
 					resolved = true;
+					selector.dispose();
 					ui.stop();
 					process.exit(0);
 				}
@@ -84,12 +89,14 @@ export async function selectSession(
 				historyMatcher,
 				loadAllSessions: options.allowGlobalScope === false ? undefined : () => SessionManager.listAll(storage),
 				allSessions: options.allSessions,
+				initialScope: options.initialScope,
 				getTerminalRows: () => ui.terminal.rows,
 				fillHeight: true,
 				title: options.title,
 				scopeLabel: options.scopeLabel,
 				showCwd: options.showCwd,
 				pinnedIds,
+				preview: options.preview ?? true,
 			},
 		);
 		return selector;

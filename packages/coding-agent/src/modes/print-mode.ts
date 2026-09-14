@@ -139,11 +139,12 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 	// the deadline (issue #8272). So do not honor the startup default here; the
 	// supported headless plan flow is `--plan-yolo` (auto-approve → implement),
 	// which is wired independently through the prewalk coordinator.
+	const startupContext = session.sessionManager.buildSessionContext();
 	const planStartupIgnored =
 		session.settings.get("plan.defaultOnStartup") &&
 		session.settings.get("plan.enabled") &&
-		session.sessionManager.buildSessionContext().messages.length === 0 &&
-		!session.sessionManager.getEntries().some(entry => entry.type === "mode_change") &&
+		startupContext.messages.length === 0 &&
+		startupContext.mode === "none" &&
 		!planYolo;
 	if (planStartupIgnored) {
 		process.stderr.write(

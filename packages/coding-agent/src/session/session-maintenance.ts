@@ -549,41 +549,43 @@ export class SessionMaintenance {
 	 * skips the disk rewrite.
 	 */
 	async dropImages(): Promise<{ removed: number }> {
-		const branchEntries = this.#host.sessionManager.getBranch();
-		let removed = 0;
-		for (const entry of branchEntries) {
-			if (entry.type === "message") {
-				removed += stripImagesFromMessage(entry.message);
-				continue;
-			}
-			if (entry.type === "custom_message" && typeof entry.content !== "string") {
-				const kept: typeof entry.content = [];
-				let dropped = 0;
-				for (const part of entry.content) {
-					if (part.type === "image") {
-						dropped++;
-					} else {
-						kept.push(part);
+		return this.#host.sessionManager.withFullHistory(async () => {
+			const branchEntries = this.#host.sessionManager.getBranch();
+			let removed = 0;
+			for (const entry of branchEntries) {
+				if (entry.type === "message") {
+					removed += stripImagesFromMessage(entry.message);
+					continue;
+				}
+				if (entry.type === "custom_message" && typeof entry.content !== "string") {
+					const kept: typeof entry.content = [];
+					let dropped = 0;
+					for (const part of entry.content) {
+						if (part.type === "image") {
+							dropped++;
+						} else {
+							kept.push(part);
+						}
+					}
+					if (dropped > 0) {
+						if (kept.length === 0) {
+							kept.push({ type: "text", text: "[image removed]" });
+						}
+						entry.content = kept;
+						removed += dropped;
 					}
 				}
-				if (dropped > 0) {
-					if (kept.length === 0) {
-						kept.push({ type: "text", text: "[image removed]" });
-					}
-					entry.content = kept;
-					removed += dropped;
-				}
 			}
-		}
-		if (removed === 0) {
-			return { removed: 0 };
-		}
-		await this.#host.sessionManager.rewriteEntries();
-		const sessionContext = this.#host.buildDisplaySessionContext();
-		this.#host.agent.replaceMessages(sessionContext.messages);
-		this.#host.resetAdvisorRuntimes("drop-images");
-		this.#host.closeCodexProviderSessionsForHistoryRewrite();
-		return { removed };
+			if (removed === 0) {
+				return { removed: 0 };
+			}
+			await this.#host.sessionManager.rewriteEntries();
+			const sessionContext = this.#host.buildDisplaySessionContext();
+			this.#host.agent.replaceMessages(sessionContext.messages);
+			this.#host.resetAdvisorRuntimes("drop-images");
+			this.#host.closeCodexProviderSessionsForHistoryRewrite();
+			return { removed };
+		});
 	}
 
 	/**
@@ -607,30 +609,32 @@ export class SessionMaintenance {
 		}
 
 		if (mode === "thinking") {
-			const branchEntries = this.#host.sessionManager.getBranch();
-			let removed = 0;
-			for (const entry of branchEntries) {
-				if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-				const message = entry.message;
-				const kept = message.content.filter(
-					block => block.type !== "thinking" && block.type !== "redactedThinking",
-				);
-				const dropped = message.content.length - kept.length;
-				if (dropped === 0) continue;
-				// Provider serializers omit empty assistant turns, so don't invent model-authored text.
-				message.content = kept;
-				invalidateMessageCache(message);
-				removed += dropped;
-			}
-			if (removed === 0) {
-				return { mode, toolResultsDropped: 0, blocksDropped: 0, thinkingBlocksDropped: 0, tokensFreed: 0 };
-			}
-			await this.#host.sessionManager.rewriteEntries();
-			const sessionContext = this.#host.buildDisplaySessionContext();
-			this.#host.agent.replaceMessages(sessionContext.messages);
-			this.#host.resetAdvisorRuntimes("shake");
-			this.#host.closeCodexProviderSessionsForHistoryRewrite();
-			return { mode, toolResultsDropped: 0, blocksDropped: 0, thinkingBlocksDropped: removed, tokensFreed: 0 };
+			return this.#host.sessionManager.withFullHistory(async () => {
+				const branchEntries = this.#host.sessionManager.getBranch();
+				let removed = 0;
+				for (const entry of branchEntries) {
+					if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+					const message = entry.message;
+					const kept = message.content.filter(
+						block => block.type !== "thinking" && block.type !== "redactedThinking",
+					);
+					const dropped = message.content.length - kept.length;
+					if (dropped === 0) continue;
+					// Provider serializers omit empty assistant turns, so don't invent model-authored text.
+					message.content = kept;
+					invalidateMessageCache(message);
+					removed += dropped;
+				}
+				if (removed === 0) {
+					return { mode, toolResultsDropped: 0, blocksDropped: 0, thinkingBlocksDropped: 0, tokensFreed: 0 };
+				}
+				await this.#host.sessionManager.rewriteEntries();
+				const sessionContext = this.#host.buildDisplaySessionContext();
+				this.#host.agent.replaceMessages(sessionContext.messages);
+				this.#host.resetAdvisorRuntimes("shake");
+				this.#host.closeCodexProviderSessionsForHistoryRewrite();
+				return { mode, toolResultsDropped: 0, blocksDropped: 0, thinkingBlocksDropped: removed, tokensFreed: 0 };
+			});
 		}
 
 		const branchEntries = this.#host.sessionManager.getBranch();

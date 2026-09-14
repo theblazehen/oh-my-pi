@@ -26,7 +26,12 @@ import type {
 	SessionEntry,
 	SessionMessageEntry,
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
-import { runSubprocess, scrubTaskForkEntries } from "@oh-my-pi/pi-coding-agent/task/executor";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import {
+	runSubprocess,
+	scrubTaskForkEntries,
+	selectEffectiveTaskForkEntries,
+} from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
@@ -125,6 +130,57 @@ function createModelRegistry(model: Model): ModelRegistry {
 		getAvailable: () => [model],
 		getApiKey: async () => "test-key",
 	} as unknown as ModelRegistry;
+}
+
+function taskForkModel(): Model {
+	const model = getBundledModel("openai-codex", "gpt-5.6-sol");
+	if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
+	return model;
+}
+
+function scrubForModel(entries: readonly SessionEntry[], childModel: Model = taskForkModel()): SessionEntry[] {
+	return scrubTaskForkEntries(entries, { parentModel: null, childModel });
+}
+
+function resolvedForkModelOptions() {
+	const model = taskForkModel();
+	const settings = Settings.isolated();
+	settings.setModelRole("task", `${model.provider}/${model.id}`);
+	return {
+		agent: { ...baseAgent, model: ["@task"] },
+		settings,
+		modelRegistry: createModelRegistry(model),
+	};
+}
+
+function remoteReplayForkEntries(remoteCompaction: unknown): SessionEntry[] {
+	return [
+		{
+			type: "message",
+			id: "remote-kept",
+			parentId: null,
+			timestamp: "2026-08-23T00:00:00.000Z",
+			message: { role: "user", content: "portable kept tail", timestamp: 1 },
+		},
+		{
+			type: "compaction",
+			id: "remote-compaction",
+			parentId: "remote-kept",
+			timestamp: "2026-08-23T00:00:01.000Z",
+			summary: "portable compacted summary",
+			shortSummary: "remote",
+			firstKeptEntryId: "remote-kept",
+			tokensBefore: 20,
+			preserveData: { openaiRemoteCompaction: remoteCompaction },
+		},
+		{
+			type: "message",
+			id: "remote-after",
+			parentId: "remote-compaction",
+			timestamp: "2026-08-23T00:00:02.000Z",
+			message: { role: "user", content: "portable post-compaction tail", timestamp: 2 },
+		},
+	];
 }
 
 describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
@@ -621,17 +677,17 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			},
 		];
 
-		const cloned = scrubTaskForkEntries(forkEntries);
+		const cloned = scrubForModel(forkEntries);
 
 		// Non-conversation runtime/config entries are gone; control custom message gone.
 		const ids = cloned.map(entry => entry.id);
-		expect(ids).toEqual(["e1", "e2", "e4", "e6", "e7"]);
+		expect(ids).toEqual(["e1", "e2", "e4", "e5", "e6", "e7"]);
 		expect(cloned.some(entry => entry.type === "session_init")).toBe(false);
 		expect(cloned.some(entry => entry.type === "custom_message")).toBe(false);
 		expect(cloned.some(entry => entry.type === "ttsr_injection")).toBe(false);
-		// Every parent compaction is dropped unconditionally so the retained
-		// raw messages replay as full text; the child compacts later on its own.
-		expect(cloned.some(entry => entry.id === "e5" && entry.type === "compaction")).toBe(false);
+		// The effective compaction stays structural so inherited context remains
+		// bounded to its summary plus retained tail.
+		expect(cloned.some(entry => entry.id === "e5" && entry.type === "compaction")).toBe(true);
 
 		// The todo control call and its result are gone; the read pair survives.
 		const assistant = cloned.find(
@@ -659,7 +715,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(parentById.get("e1")).toBeNull();
 		expect(parentById.get("e2")).toBe("e1"); // skipped removed prelude parent
 		expect(parentById.get("e4")).toBe("e2"); // skipped removed todo result
-		expect(parentById.get("e6")).toBe("e4"); // skipped removed session_init + compaction
+		expect(parentById.get("e5")).toBe("e4"); // skipped removed session_init
+		expect(parentById.get("e6")).toBe("e5");
 		expect(parentById.get("e7")).toBe("e6"); // skipped removed ttsr_injection parent
 
 		// Source entries are untouched by the clone.
@@ -706,7 +763,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			},
 		];
 
-		const cloned = scrubTaskForkEntries(entries);
+		const cloned = scrubForModel(entries);
 
 		expect(cloned.map(entry => entry.id)).toEqual(["u1", "u2"]);
 		expect(cloned.some(entry => entry.type === "custom")).toBe(false);
@@ -764,7 +821,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			},
 		];
 
-		const cloned = scrubTaskForkEntries(source);
+		const cloned = scrubForModel(source);
 
 		// Every returned entry is structurally independent: mutating returned
 		// nested state must never touch the source session.
@@ -792,7 +849,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		).toBe("plain");
 	});
 
-	it("seeds from frozen entries directly, dropping the parent compaction and keeping ordered raw text", async () => {
+	it("seeds only the latest compaction's bounded summary and retained tail in order", async () => {
 		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
 		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
 		const textOnlyModel = { ...model, input: ["text"] } as Model;
@@ -805,12 +862,22 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 				id: "e1",
 				parentId: null,
 				timestamp: "2026-08-23T00:00:00.000Z",
-				message: { role: "user", content: "before-boundary", timestamp: 1 },
+				message: { role: "user", content: "superseded-before-boundary", timestamp: 1 },
+			},
+			{
+				type: "compaction",
+				id: "e-old-compaction",
+				parentId: "e1",
+				timestamp: "2026-08-23T00:00:00.500Z",
+				summary: "superseded summary",
+				shortSummary: "old",
+				firstKeptEntryId: "e1",
+				tokensBefore: 20,
 			},
 			{
 				type: "message",
 				id: "e2",
-				parentId: "e1",
+				parentId: "e-old-compaction",
 				timestamp: "2026-08-23T00:00:01.000Z",
 				message: { role: "user", content: "first-retained", timestamp: 2 },
 			},
@@ -821,7 +888,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 				timestamp: "2026-08-23T00:00:03.000Z",
 				summary: "compacted summary",
 				shortSummary: "short",
-				firstKeptEntryId: "e1",
+				firstKeptEntryId: "e2",
 				tokensBefore: 10,
 			},
 			{
@@ -832,6 +899,9 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 				message: { role: "user", content: "after-boundary", timestamp: 3 },
 			},
 		];
+		const boundedEntries = selectEffectiveTaskForkEntries(forkEntries);
+		expect(boundedEntries.map(entry => entry.id)).toEqual(["e2", "e5", "e3"]);
+		expect(boundedEntries[0]?.parentId).toBeNull();
 
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
@@ -848,7 +918,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			forkContext: {
 				sourceFile: "/tmp/source.jsonl",
 				sourceLeafId: "e3",
-				entries: forkEntries,
+				parentModel: { provider: model.provider, id: model.id },
+				entries: boundedEntries,
 			},
 		});
 
@@ -857,15 +928,18 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(childManager).toBeDefined();
 		if (!childManager) throw new Error("Expected a child SessionManager");
 		const childEntries = childManager.getEntries();
-		// The parent compaction is dropped unconditionally; both sides of its
-		// boundary survive as ordinary raw text in original order.
-		expect(childEntries.map(entry => entry.id)).toEqual(["e1", "e2", "e3"]);
-		expect(childEntries.some(entry => entry.type === "compaction")).toBe(false);
+		expect(childEntries.map(entry => entry.id)).toEqual(["e2", "e5", "e3"]);
+		expect(childEntries.find(entry => entry.id === "e5")?.type).toBe("compaction");
+		expect(childManager.buildSessionContext().messages.map(message => message.role)).toEqual([
+			"compactionSummary",
+			"user",
+			"user",
+		]);
 		expect(
-			childEntries.map(entry =>
-				entry.type === "message" && entry.message.role === "user" ? entry.message.content : undefined,
-			),
-		).toEqual(["before-boundary", "first-retained", "after-boundary"]);
+			childManager
+				.buildSessionContext()
+				.messages.map(message => ("content" in message ? message.content : undefined)),
+		).toEqual([undefined, "first-retained", "after-boundary"]);
 	});
 
 	it("neutralizes protected reasoning on control-only assistant rewrites", () => {
@@ -907,7 +981,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			},
 		];
 
-		const cloned = scrubTaskForkEntries(forkEntries);
+		const cloned = scrubForModel(forkEntries);
 		const assistant = cloned.find(isAssistantEntry);
 		if (!assistant) throw new Error("Expected assistant entry in cloned output");
 		// The control scrub dropped the todo call; the second-pass dangling
@@ -922,17 +996,221 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(assistant.message.content.some(part => part.type === "redactedThinking")).toBe(false);
 	});
 
-	it("drops every parent compaction — Snapcompact, remote, and LLM — keeping full ordered raw text", async () => {
+	it("preserves remote replay only for the exact captured parent and child model", async () => {
+		const model = taskForkModel();
+		const settings = Settings.isolated();
+		settings.setModelRole("task", `${model.provider}/${model.id}`);
+		const compactionItem = { type: "compaction", encrypted_content: "opaque-compatible-compaction" };
+		const replacementHistory = [
+			{ type: "message", role: "user", content: "opaque compatible replay" },
+			compactionItem,
+		];
+		const forkEntries: SessionEntry[] = [
+			{
+				type: "message",
+				id: "remote-superseded",
+				parentId: null,
+				timestamp: "2026-08-23T00:00:00.000Z",
+				message: { role: "user", content: "must-not-replay-as-raw-text", timestamp: 1 },
+			},
+			{
+				type: "message",
+				id: "remote-kept",
+				parentId: "remote-superseded",
+				timestamp: "2026-08-23T00:00:01.000Z",
+				message: { role: "user", content: "kept-by-native-replay", timestamp: 2 },
+			},
+			{
+				type: "compaction",
+				id: "remote-compaction",
+				parentId: "remote-kept",
+				timestamp: "2026-08-23T00:00:02.000Z",
+				summary: "compatible remote summary",
+				shortSummary: "remote",
+				firstKeptEntryId: "remote-kept",
+				tokensBefore: 20,
+				details: { privateExtensionState: true },
+				preserveData: {
+					openaiRemoteCompaction: {
+						provider: model.provider,
+						replacementHistory,
+						compactionItem,
+					},
+					artifactIndex: { version: 1 },
+				},
+			},
+			{
+				type: "message",
+				id: "remote-after",
+				parentId: "remote-compaction",
+				timestamp: "2026-08-23T00:00:03.000Z",
+				message: { role: "user", content: "after-compatible-replay", timestamp: 3 },
+			},
+		];
+
+		const session = yieldEmittingSession();
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const artifactsDir = fs.mkdtempSync(path.join(os.tmpdir(), "executor-pass-through-"));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			agent: { ...baseAgent, model: ["@task"] },
+			id: "subagent-compatible-remote-replay",
+			artifactsDir,
+			settings,
+			modelRegistry: createModelRegistry(model),
+			contextSource: "fork",
+			forkContext: {
+				sourceFile: "/tmp/source.jsonl",
+				sourceLeafId: "remote-after",
+				parentModel: { provider: model.provider, id: model.id },
+				entries: selectEffectiveTaskForkEntries(forkEntries),
+			},
+		});
+
+		expect(result.exitCode).toBe(0);
+		const childManager = spy.mock.calls[0]?.[0]?.sessionManager;
+		expect(childManager).toBeDefined();
+		if (!childManager) throw new Error("Expected a child SessionManager");
+		expect(childManager.getEntries().map(entry => entry.id)).toEqual([
+			"remote-kept",
+			"remote-compaction",
+			"remote-after",
+		]);
+		const compaction = childManager.getEntries().find(entry => entry.id === "remote-compaction");
+		expect(compaction?.type).toBe("compaction");
+		if (compaction?.type !== "compaction") throw new Error("Expected remote compaction");
+		expect(compaction.details).toBeUndefined();
+		expect(compaction.preserveData).toEqual({
+			openaiRemoteCompaction: { provider: model.provider, replacementHistory, compactionItem },
+		});
+		const context = childManager.buildSessionContext();
+		expect(context.messages.map(message => message.role)).toEqual(["compactionSummary", "user"]);
+		const summary = context.messages.find(message => message.role === "compactionSummary");
+		expect(summary?.providerPayload).toEqual({
+			type: "openaiResponsesHistory",
+			provider: model.provider,
+			items: replacementHistory,
+		});
+	});
+
+	for (const malformedReplay of [
+		{
+			name: "provider mismatch",
+			value: {
+				provider: "different-provider",
+				replacementHistory: [{ type: "message", role: "user", content: "wrong-provider replay" }],
+			},
+		},
+		{
+			name: "malformed replacementHistory",
+			value: {
+				provider: taskForkModel().provider,
+				replacementHistory: [{ type: "message", role: "user", content: "valid item" }, "not-a-record"],
+			},
+		},
+		{
+			name: "empty replacementHistory",
+			value: {
+				provider: taskForkModel().provider,
+				replacementHistory: [],
+			},
+		},
+		{
+			name: "record-only replacementHistory without a compaction item",
+			value: {
+				provider: taskForkModel().provider,
+				replacementHistory: [
+					{ type: "message", role: "user", content: "native replay without compaction" },
+					{ type: "reasoning", encrypted_content: "opaque-reasoning" },
+				],
+			},
+		},
+		{
+			name: "V2 compaction discriminator without encrypted content",
+			value: {
+				version: "v2",
+				provider: taskForkModel().provider,
+				replacementHistory: [
+					{ type: "message", role: "user", content: "native replay before malformed compaction" },
+					{ type: "compaction" },
+				],
+			},
+		},
+		{
+			name: "V2 valid compaction with a bogus retained sibling",
+			value: {
+				version: "v2",
+				provider: taskForkModel().provider,
+				replacementHistory: [
+					{
+						type: "message",
+						role: "user",
+						content: [{ type: "input_text", text: "well-formed retained user message" }],
+					},
+					{ type: "bogus_replay_item", content: "must not pass V2 replay validation" },
+					{ type: "compaction", encrypted_content: "otherwise-valid-terminal-compaction" },
+				],
+			},
+		},
+	]) {
+		it(`strips same-model remote replay with ${malformedReplay.name} and keeps portable summary and tail`, async () => {
+			const model = taskForkModel();
+			const settings = Settings.isolated();
+			settings.setModelRole("task", `${model.provider}/${model.id}`);
+			const session = yieldEmittingSession();
+			const createSpy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+			const artifactsDir = fs.mkdtempSync(path.join(os.tmpdir(), "executor-pass-through-"));
+			const forkEntries = remoteReplayForkEntries(malformedReplay.value);
+
+			const result = await runSubprocess({
+				...baseOptions,
+				agent: { ...baseAgent, model: ["@task"] },
+				id: `subagent-malformed-remote-${malformedReplay.name.replaceAll(" ", "-")}`,
+				artifactsDir,
+				settings,
+				modelRegistry: createModelRegistry(model),
+				contextSource: "fork",
+				forkContext: {
+					sourceFile: "/tmp/source.jsonl",
+					sourceLeafId: "remote-after",
+					parentModel: { provider: model.provider, id: model.id },
+					entries: forkEntries,
+				},
+			});
+
+			expect(result.exitCode).toBe(0);
+			expect(createSpy).toHaveBeenCalledTimes(1);
+			const childManager = createSpy.mock.calls[0]?.[0]?.sessionManager;
+			expect(childManager).toBeDefined();
+			if (!childManager) throw new Error("Expected a child SessionManager");
+			const childCompaction = childManager.getEntries().find(entry => entry.id === "remote-compaction");
+			expect(childCompaction?.type).toBe("compaction");
+			if (childCompaction?.type !== "compaction") throw new Error("Expected retained compaction");
+			expect(childCompaction.preserveData).toBeUndefined();
+
+			const context = childManager.buildSessionContext();
+			expect(context.messages.map(message => message.role)).toEqual(["compactionSummary", "user", "user"]);
+			const summary = context.messages[0];
+			expect(summary?.role).toBe("compactionSummary");
+			if (summary?.role !== "compactionSummary") throw new Error("Expected portable compaction summary");
+			expect(summary.summary).toBe("portable compacted summary");
+			expect(summary.providerPayload).toBeUndefined();
+			expect(context.messages[1]).toMatchObject({ role: "user", content: "portable kept tail" });
+			expect(context.messages[2]).toMatchObject({ role: "user", content: "portable post-compaction tail" });
+		});
+	}
+
+	it("keeps summary and tail but strips remote and Snapcompact payloads for an incompatible text-only child", async () => {
 		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
 		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
 		const textOnlyModel = { ...model, input: ["text"] } as Model;
 		const settings = Settings.isolated();
 		settings.setModelRole("task", `${textOnlyModel.provider}/${textOnlyModel.id}`);
 
-		// A parent branch carrying raw message history bracketed by three
-		// distinct compaction kinds — a Snapcompact archive, a remote (OpenAI)
-		// replay payload, and a plain LLM summary — all of which the fork must
-		// drop unconditionally so every persisted message replays as full text.
+		// The latest effective compaction carries both opaque remote replay and
+		// image-only Snapcompact state. Neither may cross to a different model
+		// whose input capabilities are text-only.
 		const forkEntries: SessionEntry[] = [
 			{
 				type: "message",
@@ -1011,8 +1289,30 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 				timestamp: "2026-08-23T00:00:04.000Z",
 				summary: "llm summarized",
 				shortSummary: "short",
-				firstKeptEntryId: "e1",
+				firstKeptEntryId: "e-llm-in",
 				tokensBefore: 5,
+				details: { privateExtensionState: true },
+				preserveData: {
+					openaiRemoteCompaction: {
+						provider: "openai",
+						replacementHistory: [{ type: "message", role: "user", content: "opaque latest replay" }],
+					},
+					snapcompact: {
+						frames: [
+							{
+								data: "aW1hZ2UtcG5nLWJhc2U2NA==",
+								mimeType: "image/png",
+								cols: 80,
+								rows: 24,
+								chars: 900,
+							},
+						],
+						totalChars: 900,
+						truncatedChars: 0,
+						text: "latest archived history",
+					},
+					artifactIndex: { version: 1 },
+				},
 			},
 			{
 				type: "message",
@@ -1038,7 +1338,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			forkContext: {
 				sourceFile: "/tmp/source.jsonl",
 				sourceLeafId: "e3",
-				entries: forkEntries,
+				parentModel: { provider: "openai", id: "different-parent-model" },
+				entries: selectEffectiveTaskForkEntries(forkEntries),
 			},
 		});
 
@@ -1048,29 +1349,23 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		if (!childManager) throw new Error("Expected a child SessionManager");
 		const childEntries = childManager.getEntries();
 
-		// Every compaction kind is dropped; the raw text messages on both
-		// sides of each boundary survive in original order with no parent
-		// compaction/replay data.
-		expect(childEntries.map(entry => entry.id)).toEqual(["e1", "e2", "e-remote-in", "e-llm-in", "e3"]);
-		expect(childEntries.filter(entry => entry.type === "compaction")).toEqual([]);
-		expect(
-			childEntries.map(entry =>
-				entry.type === "message" && entry.message.role === "user" ? entry.message.content : undefined,
-			),
-		).toEqual(["pre-snapcompact", "pre-remote", "pre-llm", "pre-llm", "after-all-compactions"]);
+		expect(childEntries.map(entry => entry.id)).toEqual(["e-llm-in", "e-llm", "e3"]);
+		const retainedCompaction = childEntries.find(entry => entry.id === "e-llm");
+		expect(retainedCompaction?.type).toBe("compaction");
+		if (retainedCompaction?.type !== "compaction") {
+			throw new Error("Expected retained compaction");
+		}
+		expect(retainedCompaction.summary).toBe("llm summarized");
+		expect(retainedCompaction.details).toBeUndefined();
+		expect(retainedCompaction.preserveData).toBeUndefined();
 
-		// Built context: every persisted raw text message is present in order,
-		// with no compactionSummary and no archive/replay/image data anywhere.
+		// Built context remains bounded to summary + kept tail and cannot carry
+		// remote replay or image blocks into the incompatible text-only model.
 		const context = childManager.buildSessionContext();
 		const roles = context.messages.map(message => message.role);
-		expect(roles).toEqual(["user", "user", "user", "user", "user"]);
-		expect(context.messages.map(message => ("content" in message ? message.content : message))).toEqual([
-			"pre-snapcompact",
-			"pre-remote",
-			"pre-llm",
-			"pre-llm",
-			"after-all-compactions",
-		]);
+		expect(roles).toEqual(["compactionSummary", "user", "user"]);
+		const summary = context.messages.find(message => message.role === "compactionSummary");
+		expect(summary?.providerPayload).toBeUndefined();
 		for (const message of context.messages) {
 			const content = "content" in message ? message.content : [];
 			if (Array.isArray(content)) {
@@ -1083,7 +1378,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		}
 	});
 
-	it("provider-neutralizes every inherited assistant while dropping its compaction, keeping visible evidence", async () => {
+	it("provider-neutralizes inherited assistants while retaining the bounded compaction summary", async () => {
 		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
 		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
 		const textOnlyModel = { ...model, input: ["text"] } as Model;
@@ -1093,9 +1388,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		// A parent branch with an UNMODIFIED assistant (no control calls to
 		// scrub, so the first-pass neutralization is the only rewrite) that
 		// still carries signed thinking + redactedThinking + providerPayload,
-		// and a compaction whose preserveData carries an openaiRemoteCompaction
-		// replay payload. The compaction is dropped wholesale so no replay
-		// payload ever reaches the child.
+		// and a compaction whose preserveData carries an incompatible remote
+		// replay payload. The summary remains, but opaque replay state does not.
 		const forkEntries: SessionEntry[] = [
 			{
 				type: "message",
@@ -1177,7 +1471,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			forkContext: {
 				sourceFile: "/tmp/source.jsonl",
 				sourceLeafId: "u2",
-				entries: forkEntries,
+				parentModel: { provider: "openai", id: "different-parent-model" },
+				entries: selectEffectiveTaskForkEntries(forkEntries),
 			},
 		});
 
@@ -1186,9 +1481,12 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(childManager).toBeDefined();
 		if (!childManager) throw new Error("Expected a child SessionManager");
 		const childEntries = childManager.getEntries();
-		// The compaction is dropped; the raw assistant + surrounding text survive.
-		expect(childEntries.map(entry => entry.id)).toEqual(["u1", "a1", "u2"]);
-		expect(childEntries.some(entry => entry.type === "compaction")).toBe(false);
+		// The bounded compaction and its visible retained assistant survive.
+		expect(childEntries.map(entry => entry.id)).toEqual(["u1", "a1", "c1", "u2"]);
+		const childCompaction = childEntries.find(entry => entry.id === "c1");
+		expect(childCompaction?.type).toBe("compaction");
+		if (childCompaction?.type !== "compaction") throw new Error("Expected child compaction");
+		expect(childCompaction.preserveData).toBeUndefined();
 
 		// Raw child assistant: visible thinking/text survive, but no
 		// redactedThinking, no thinking signature, and no providerPayload.
@@ -1210,11 +1508,11 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(childAssistant.message.providerPayload).toBeUndefined();
 
 		// Built child context: the assistant's visible text/thinking survive,
-		// no compactionSummary is emitted, and no provider-native replay state
-		// anywhere.
+		// its compactionSummary is emitted, and no provider-native replay state
+		// appears anywhere.
 		const context = childManager.buildSessionContext();
-		expect(context.messages.map(message => message.role)).toEqual(["user", "assistant", "user"]);
-		expect(context.messages.some(message => message.role === "compactionSummary")).toBe(false);
+		expect(context.messages.map(message => message.role)).toEqual(["compactionSummary", "user", "assistant", "user"]);
+		expect(context.messages.some(message => message.role === "compactionSummary")).toBe(true);
 		// Every built message that can carry provider-native replay state is free
 		// of it: no providerPayload, no redactedThinking, and no thinking
 		// signature anywhere in the inherited conversation.
@@ -1266,6 +1564,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			forkContext: {
 				sourceFile: "/tmp/source.jsonl",
 				sourceLeafId: "fork-e1",
+				parentModel: null,
 				entries: forkEntries,
 			},
 		});
@@ -1281,25 +1580,34 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 	});
 
 	it("fails explicit fork when the scheduling snapshot is unavailable", async () => {
+		const openSpy = vi.spyOn(SessionManager, "open");
+		const createSpy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockResolvedValue(createSessionResult(yieldEmittingSession()));
 		const result = await runSubprocess({ ...baseOptions, contextSource: "fork" });
 
 		expect(result.exitCode).toBe(1);
 		expect(result.error).toContain("Cannot fork task context");
+		expect(openSpy).not.toHaveBeenCalled();
+		expect(createSpy).not.toHaveBeenCalled();
 	});
 
 	it("fails an explicit fork whose frozen snapshot is empty", async () => {
 		const session = yieldEmittingSession();
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+		const openSpy = vi.spyOn(SessionManager, "open");
+		const createSpy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
 		const artifactsDir = fs.mkdtempSync(path.join(os.tmpdir(), "executor-pass-through-"));
 
 		const result = await runSubprocess({
 			...baseOptions,
+			...resolvedForkModelOptions(),
 			id: "subagent-empty-snapshot",
 			artifactsDir,
 			contextSource: "fork",
 			forkContext: {
 				sourceFile: "/tmp/source.jsonl",
 				sourceLeafId: "e7",
+				parentModel: null,
 				entries: [],
 			},
 		});
@@ -1307,10 +1615,15 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(result.exitCode).toBe(1);
 		expect(result.error).toContain("Cannot fork task context");
 		expect(result.error).toContain("empty");
+		expect(openSpy).not.toHaveBeenCalled();
+		expect(createSpy).not.toHaveBeenCalled();
 	});
 
 	it("fails an explicit fork whose snapshot does not end at the located leaf", async () => {
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(yieldEmittingSession()));
+		const openSpy = vi.spyOn(SessionManager, "open");
+		const createSpy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockResolvedValue(createSessionResult(yieldEmittingSession()));
 		const artifactsDir = fs.mkdtempSync(path.join(os.tmpdir(), "executor-pass-through-"));
 		const forkEntries: SessionEntry[] = [
 			{
@@ -1331,12 +1644,14 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 
 		const result = await runSubprocess({
 			...baseOptions,
+			...resolvedForkModelOptions(),
 			id: "subagent-leaf-mismatch",
 			artifactsDir,
 			contextSource: "fork",
 			forkContext: {
 				sourceFile: "/tmp/source.jsonl",
 				sourceLeafId: "e-other",
+				parentModel: null,
 				entries: forkEntries,
 			},
 		});
@@ -1344,10 +1659,15 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(result.exitCode).toBe(1);
 		expect(result.error).toContain("Cannot fork task context");
 		expect(result.error).toContain("does not end at the located leaf");
+		expect(openSpy).not.toHaveBeenCalled();
+		expect(createSpy).not.toHaveBeenCalled();
 	});
 
 	it("fails an explicit fork whose snapshot does not start at a root entry", async () => {
-		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(yieldEmittingSession()));
+		const openSpy = vi.spyOn(SessionManager, "open");
+		const createSpy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockResolvedValue(createSessionResult(yieldEmittingSession()));
 		const artifactsDir = fs.mkdtempSync(path.join(os.tmpdir(), "executor-pass-through-"));
 		const forkEntries: SessionEntry[] = [
 			{
@@ -1361,12 +1681,14 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 
 		const result = await runSubprocess({
 			...baseOptions,
+			...resolvedForkModelOptions(),
 			id: "subagent-non-root-snapshot",
 			artifactsDir,
 			contextSource: "fork",
 			forkContext: {
 				sourceFile: "/tmp/source.jsonl",
 				sourceLeafId: "e2",
+				parentModel: null,
 				entries: forkEntries,
 			},
 		});
@@ -1374,9 +1696,451 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(result.exitCode).toBe(1);
 		expect(result.error).toContain("Cannot fork task context");
 		expect(result.error).toContain("does not start at a root entry");
+		expect(openSpy).not.toHaveBeenCalled();
+		expect(createSpy).not.toHaveBeenCalled();
 	});
 
-	it("forks native context for a text-only resolved model with raw child entries and built context", async () => {
+	it("falls back from oversized portable compaction to the largest fitting coherent tail", async () => {
+		const model = { ...taskForkModel(), contextWindow: 512 } as Model;
+		const settings = Settings.isolated();
+		settings.setModelRole("task", `${model.provider}/${model.id}`);
+		const createSpy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockResolvedValue(createSessionResult(yieldEmittingSession()));
+		const artifactsDir = fs.mkdtempSync(path.join(os.tmpdir(), "executor-pass-through-"));
+		const forkEntries: SessionEntry[] = [
+			{
+				type: "message",
+				id: "portable-kept",
+				parentId: null,
+				timestamp: "2026-08-23T00:00:00.000Z",
+				message: { role: "user", content: "retained before compaction", timestamp: 1 },
+			},
+			{
+				type: "compaction",
+				id: "portable-compaction",
+				parentId: "portable-kept",
+				timestamp: "2026-08-23T00:00:01.000Z",
+				summary: `inherited summary ${"large ".repeat(2_000)}`,
+				shortSummary: "oversized",
+				firstKeptEntryId: "portable-kept",
+				tokensBefore: 10_000,
+			},
+			{
+				type: "message",
+				id: "portable-too-large",
+				parentId: "portable-compaction",
+				timestamp: "2026-08-23T00:00:02.000Z",
+				message: { role: "user", content: `older tail ${"large ".repeat(1_000)}`, timestamp: 2 },
+			},
+			{
+				type: "custom_message",
+				id: "portable-custom-boundary",
+				parentId: "portable-too-large",
+				timestamp: "2026-08-23T00:00:03.000Z",
+				customType: "portable-context",
+				content: "coherent custom boundary",
+				display: true,
+			},
+			{
+				type: "message",
+				id: "portable-final",
+				parentId: "portable-custom-boundary",
+				timestamp: "2026-08-23T00:00:04.000Z",
+				message: { role: "user", content: "small final turn", timestamp: 4 },
+			},
+		];
+
+		const result = await runSubprocess({
+			...baseOptions,
+			description: "portable tail fallback",
+			agent: { ...baseAgent, model: ["@task"] },
+			id: "subagent-portable-tail-fallback",
+			artifactsDir,
+			settings,
+			modelRegistry: createModelRegistry(model),
+			contextSource: "fork",
+			forkContext: {
+				sourceFile: "/tmp/source.jsonl",
+				sourceLeafId: "portable-final",
+				parentModel: { provider: model.provider, id: model.id },
+				entries: selectEffectiveTaskForkEntries(forkEntries),
+			},
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.error).toBeUndefined();
+		expect(createSpy).toHaveBeenCalledTimes(1);
+		const childManager = createSpy.mock.calls[0]?.[0]?.sessionManager;
+		expect(childManager).toBeDefined();
+		if (!childManager) throw new Error("Expected a child SessionManager");
+		expect(childManager.getEntries().map(entry => ({ id: entry.id, parentId: entry.parentId }))).toEqual([
+			{ id: "portable-custom-boundary", parentId: null },
+			{ id: "portable-final", parentId: "portable-custom-boundary" },
+		]);
+		expect(childManager.getEntries().some(entry => entry.type === "compaction")).toBe(false);
+	});
+
+	it("removes an orphaned tool result created by coherent suffix slicing", async () => {
+		const model = { ...taskForkModel(), contextWindow: 512 } as Model;
+		const settings = Settings.isolated();
+		settings.setModelRole("task", `${model.provider}/${model.id}`);
+		const createSpy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockResolvedValue(createSessionResult(yieldEmittingSession()));
+		const artifactsDir = fs.mkdtempSync(path.join(os.tmpdir(), "executor-pass-through-"));
+		const forkEntries: SessionEntry[] = [
+			{
+				type: "compaction",
+				id: "pairing-compaction",
+				parentId: null,
+				timestamp: "2026-08-23T00:00:00.000Z",
+				summary: `oversized pairing summary ${"large ".repeat(2_000)}`,
+				shortSummary: "pairing",
+				firstKeptEntryId: "pairing-compaction",
+				tokensBefore: 10_000,
+			},
+			{
+				type: "message",
+				id: "pairing-older-user",
+				parentId: "pairing-compaction",
+				timestamp: "2026-08-23T00:00:01.000Z",
+				message: { role: "user", content: `older turn ${"large ".repeat(1_000)}`, timestamp: 2 },
+			},
+			{
+				type: "message",
+				id: "pairing-call",
+				parentId: "pairing-older-user",
+				timestamp: "2026-08-23T00:00:02.000Z",
+				message: {
+					role: "assistant",
+					content: [{ type: "toolCall", id: "split-read-call", name: "read", arguments: { path: "x" } }],
+					api: "openai-responses",
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: 3,
+				},
+			},
+			{
+				type: "custom_message",
+				id: "pairing-custom-boundary",
+				parentId: "pairing-call",
+				timestamp: "2026-08-23T00:00:03.000Z",
+				customType: "portable-context",
+				content: "coherent boundary between call and result",
+				display: true,
+			},
+			{
+				type: "message",
+				id: "pairing-result",
+				parentId: "pairing-custom-boundary",
+				timestamp: "2026-08-23T00:00:04.000Z",
+				message: {
+					role: "toolResult",
+					toolCallId: "split-read-call",
+					toolName: "read",
+					content: [{ type: "text", text: "must not become an orphan" }],
+					isError: false,
+					timestamp: 4,
+				},
+			},
+			{
+				type: "message",
+				id: "pairing-final",
+				parentId: "pairing-result",
+				timestamp: "2026-08-23T00:00:05.000Z",
+				message: { role: "user", content: "small final turn", timestamp: 5 },
+			},
+		];
+
+		const result = await runSubprocess({
+			...baseOptions,
+			description: "paired suffix fallback",
+			agent: { ...baseAgent, model: ["@task"] },
+			id: "subagent-paired-suffix-fallback",
+			artifactsDir,
+			settings,
+			modelRegistry: createModelRegistry(model),
+			contextSource: "fork",
+			forkContext: {
+				sourceFile: "/tmp/source.jsonl",
+				sourceLeafId: "pairing-final",
+				parentModel: { provider: model.provider, id: model.id },
+				entries: forkEntries,
+			},
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(createSpy).toHaveBeenCalledTimes(1);
+		const childManager = createSpy.mock.calls[0]?.[0]?.sessionManager;
+		expect(childManager).toBeDefined();
+		if (!childManager) throw new Error("Expected a child SessionManager");
+		expect(childManager.getEntries().map(entry => ({ id: entry.id, parentId: entry.parentId }))).toEqual([
+			{ id: "pairing-custom-boundary", parentId: null },
+			{ id: "pairing-final", parentId: "pairing-custom-boundary" },
+		]);
+		expect(childManager.buildSessionContext().messages.some(message => message.role === "toolResult")).toBe(false);
+	});
+
+	it("conservatively sizes classic replay despite stale positive usedTokens", async () => {
+		const model = { ...taskForkModel(), contextWindow: 4_096 } as Model;
+		const settings = Settings.isolated();
+		settings.setModelRole("task", `${model.provider}/${model.id}`);
+		const createSpy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockResolvedValue(createSessionResult(yieldEmittingSession()));
+		const artifactsDir = fs.mkdtempSync(path.join(os.tmpdir(), "executor-pass-through-"));
+		const compactionItem = { type: "compaction", encrypted_content: "classic-opaque-summary" };
+		const forkEntries = remoteReplayForkEntries({
+			provider: model.provider,
+			replacementHistory: [
+				{ type: "message", role: "user", content: `oversized classic replay ${"history ".repeat(20_000)}` },
+				compactionItem,
+			],
+			compactionItem,
+			usedTokens: 1,
+		});
+
+		const result = await runSubprocess({
+			...baseOptions,
+			description: "classic stale usage fallback",
+			agent: { ...baseAgent, model: ["@task"] },
+			id: "subagent-classic-stale-usage-fallback",
+			artifactsDir,
+			settings,
+			modelRegistry: createModelRegistry(model),
+			contextSource: "fork",
+			forkContext: {
+				sourceFile: "/tmp/source.jsonl",
+				sourceLeafId: "remote-after",
+				parentModel: { provider: model.provider, id: model.id },
+				entries: forkEntries,
+			},
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(createSpy).toHaveBeenCalledTimes(1);
+		const childManager = createSpy.mock.calls[0]?.[0]?.sessionManager;
+		expect(childManager).toBeDefined();
+		if (!childManager) throw new Error("Expected a child SessionManager");
+		expect(childManager.getEntries().map(entry => entry.id)).toEqual([
+			"remote-kept",
+			"remote-compaction",
+			"remote-after",
+		]);
+		const childCompaction = childManager.getEntries().find(entry => entry.id === "remote-compaction");
+		expect(childCompaction?.type).toBe("compaction");
+		if (childCompaction?.type !== "compaction") throw new Error("Expected retained compaction");
+		expect(childCompaction.preserveData).toBeUndefined();
+		const summary = childManager.buildSessionContext().messages[0];
+		expect(summary?.role).toBe("compactionSummary");
+		if (summary?.role !== "compactionSummary") throw new Error("Expected portable compaction summary");
+		expect(summary.providerPayload).toBeUndefined();
+	});
+
+	it("falls back from oversized native replay and archive to portable compaction", async () => {
+		const model = { ...taskForkModel(), contextWindow: 4_096, input: ["text", "image"] } as Model;
+		const settings = Settings.isolated();
+		settings.setModelRole("task", `${model.provider}/${model.id}`);
+		const createSpy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockResolvedValue(createSessionResult(yieldEmittingSession()));
+		const artifactsDir = fs.mkdtempSync(path.join(os.tmpdir(), "executor-pass-through-"));
+		const forkEntries = remoteReplayForkEntries({
+			version: "v2",
+			provider: model.provider,
+			replacementHistory: [
+				{ type: "message", role: "user", content: "opaque native replay" },
+				{ type: "compaction", encrypted_content: "opaque remote summary" },
+			],
+			usedTokens: 20_000,
+		});
+		const sourceCompaction = forkEntries.find(entry => entry.type === "compaction");
+		if (sourceCompaction?.type !== "compaction") throw new Error("Expected source compaction");
+		sourceCompaction.preserveData = {
+			...sourceCompaction.preserveData,
+			snapcompact: {
+				frames: [
+					{
+						data: "aW1hZ2UtcG5nLWJhc2U2NA==",
+						mimeType: "image/png",
+						cols: 80,
+						rows: 24,
+						chars: 900,
+					},
+				],
+				totalChars: 900,
+				truncatedChars: 0,
+				text: "archived native history",
+			},
+		};
+
+		const result = await runSubprocess({
+			...baseOptions,
+			description: "oversized native replay fallback",
+			agent: { ...baseAgent, model: ["@task"] },
+			id: "subagent-oversized-native-fallback",
+			artifactsDir,
+			settings,
+			modelRegistry: createModelRegistry(model),
+			contextSource: "fork",
+			forkContext: {
+				sourceFile: "/tmp/source.jsonl",
+				sourceLeafId: "remote-after",
+				parentModel: { provider: model.provider, id: model.id },
+				entries: forkEntries,
+			},
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.error).toBeUndefined();
+		expect(createSpy).toHaveBeenCalledTimes(1);
+		const childManager = createSpy.mock.calls[0]?.[0]?.sessionManager;
+		expect(childManager).toBeDefined();
+		if (!childManager) throw new Error("Expected a child SessionManager");
+		expect(childManager.getEntries().map(entry => ({ id: entry.id, parentId: entry.parentId }))).toEqual([
+			{ id: "remote-kept", parentId: null },
+			{ id: "remote-compaction", parentId: "remote-kept" },
+			{ id: "remote-after", parentId: "remote-compaction" },
+		]);
+		const childCompaction = childManager.getEntries().find(entry => entry.id === "remote-compaction");
+		expect(childCompaction?.type).toBe("compaction");
+		if (childCompaction?.type !== "compaction") throw new Error("Expected child compaction");
+		expect(childCompaction.preserveData).toBeUndefined();
+		expect(childManager.buildSessionContext().messages.map(message => message.role)).toEqual([
+			"compactionSummary",
+			"user",
+			"user",
+		]);
+	});
+
+	it("uses the reserve-adjusted budget when selecting a coherent tail", async () => {
+		const model = { ...taskForkModel(), contextWindow: 10_000 } as Model;
+		const settings = Settings.isolated();
+		settings.setModelRole("task", `${model.provider}/${model.id}`);
+		settings.set("compaction.reserveTokens", 6_000);
+		const createSpy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockResolvedValue(createSessionResult(yieldEmittingSession()));
+		const artifactsDir = fs.mkdtempSync(path.join(os.tmpdir(), "executor-pass-through-"));
+		const forkEntries: SessionEntry[] = [
+			{
+				type: "compaction",
+				id: "reserve-compaction",
+				parentId: null,
+				timestamp: "2026-08-23T00:00:00.000Z",
+				summary: `under full window, over usable budget ${"summary ".repeat(1_000)}`,
+				shortSummary: "reserve-boundary",
+				firstKeptEntryId: "reserve-compaction",
+				tokensBefore: 20_000,
+			},
+			{
+				type: "message",
+				id: "reserve-too-large",
+				parentId: "reserve-compaction",
+				timestamp: "2026-08-23T00:00:01.000Z",
+				message: { role: "user", content: `older turn ${"budget ".repeat(3_000)}`, timestamp: 2 },
+			},
+			{
+				type: "branch_summary",
+				id: "reserve-summary-boundary",
+				parentId: "reserve-too-large",
+				timestamp: "2026-08-23T00:00:02.000Z",
+				fromId: "reserve-too-large",
+				summary: `fitting recent summary ${"fit ".repeat(1_000)}`,
+			},
+			{
+				type: "message",
+				id: "reserve-final",
+				parentId: "reserve-summary-boundary",
+				timestamp: "2026-08-23T00:00:03.000Z",
+				message: { role: "user", content: "small post-summary turn", timestamp: 3 },
+			},
+		];
+
+		const result = await runSubprocess({
+			...baseOptions,
+			description: "reserve-adjusted fork preflight",
+			agent: { ...baseAgent, model: ["@task"] },
+			id: "subagent-reserve-adjusted-fork",
+			artifactsDir,
+			settings,
+			modelRegistry: createModelRegistry(model),
+			contextSource: "fork",
+			forkContext: {
+				sourceFile: "/tmp/source.jsonl",
+				sourceLeafId: "reserve-final",
+				parentModel: { provider: model.provider, id: model.id },
+				entries: forkEntries,
+			},
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.error).toBeUndefined();
+		expect(createSpy).toHaveBeenCalledTimes(1);
+		const childManager = createSpy.mock.calls[0]?.[0]?.sessionManager;
+		expect(childManager).toBeDefined();
+		if (!childManager) throw new Error("Expected a child SessionManager");
+		expect(childManager.getEntries().map(entry => ({ id: entry.id, parentId: entry.parentId }))).toEqual([
+			{ id: "reserve-summary-boundary", parentId: null },
+			{ id: "reserve-final", parentId: "reserve-summary-boundary" },
+		]);
+	});
+
+	it("creates the fork with empty inheritance when the final user turn alone is oversized", async () => {
+		const model = { ...taskForkModel(), contextWindow: 512 } as Model;
+		const settings = Settings.isolated();
+		settings.setModelRole("task", `${model.provider}/${model.id}`);
+		const createSpy = vi
+			.spyOn(sdkModule, "createAgentSession")
+			.mockResolvedValue(createSessionResult(yieldEmittingSession()));
+		const artifactsDir = fs.mkdtempSync(path.join(os.tmpdir(), "executor-pass-through-"));
+		const forkEntries: SessionEntry[] = [
+			{
+				type: "message",
+				id: "oversized-final-user",
+				parentId: null,
+				timestamp: "2026-08-23T00:00:00.000Z",
+				message: { role: "user", content: `final ${"oversized ".repeat(2_000)}`, timestamp: 1 },
+			},
+		];
+
+		const result = await runSubprocess({
+			...baseOptions,
+			description: "empty bounded fork fallback",
+			agent: { ...baseAgent, model: ["@task"] },
+			id: "subagent-empty-bounded-fork",
+			artifactsDir,
+			settings,
+			modelRegistry: createModelRegistry(model),
+			contextSource: "fork",
+			forkContext: {
+				sourceFile: "/tmp/source.jsonl",
+				sourceLeafId: "oversized-final-user",
+				parentModel: { provider: model.provider, id: model.id },
+				entries: forkEntries,
+			},
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.error).toBeUndefined();
+		expect(createSpy).toHaveBeenCalledTimes(1);
+		const childManager = createSpy.mock.calls[0]?.[0]?.sessionManager;
+		expect(childManager).toBeDefined();
+		if (!childManager) throw new Error("Expected a child SessionManager");
+		expect(childManager.getEntries()).toEqual([]);
+	});
+
+	it("forks bounded summary context for a text-only resolved model", async () => {
 		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
 		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
 		const textOnlyModel = { ...model, input: ["text"] } as Model;
@@ -1466,12 +2230,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 				shortSummary: "short",
 				firstKeptEntryId: "e1",
 				tokensBefore: 10,
-				preserveData: {
-					// Unrelated, non-Snapcompact hook data that must be carried
-					// verbatim across the fork — never dropped with Snapcompact
-					// archives and never regenerated.
-					artifactIndex: { version: 1, count: 3 },
-				},
+				preserveData: { artifactIndex: { version: 1, count: 3 } },
 			},
 			{
 				type: "branch_summary",
@@ -1509,7 +2268,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			forkContext: {
 				sourceFile: "/tmp/source.jsonl",
 				sourceLeafId: "e7",
-				entries: forkEntries,
+				parentModel: { provider: model.provider, id: model.id },
+				entries: selectEffectiveTaskForkEntries(forkEntries),
 			},
 		});
 
@@ -1521,17 +2281,20 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(setTodoPhases).toHaveBeenCalledWith([]);
 
 		// Assert the actual child SessionManager passed to createAgentSession:
-		// raw persisted entries preserve structural order, exclude runtime/config
+		// bounded persisted entries preserve structural order, exclude runtime/config
 		// and control state, and keep valid parent links + tool pairing.
 		const childManager = spy.mock.calls[0]?.[0]?.sessionManager;
 		expect(childManager).toBeDefined();
 		if (!childManager) throw new Error("Expected a child SessionManager");
 		const childEntries = childManager.getEntries();
-		// The parent compaction is dropped; runtime/config + control are gone;
-		// the branch summary stays structural.
-		expect(childEntries.map(entry => entry.id)).toEqual(["e1", "e2", "e4", "e6", "e7"]);
+		// Runtime/config + control are gone; the compaction and branch summary stay
+		// structural while unrelated compaction payloads are discarded.
+		expect(childEntries.map(entry => entry.id)).toEqual(["e1", "e2", "e4", "e5", "e6", "e7"]);
 		expect(childEntries.some(entry => entry.type === "session_init")).toBe(false);
-		expect(childEntries.some(entry => entry.type === "compaction")).toBe(false);
+		const childCompaction = childEntries.find(entry => entry.id === "e5");
+		expect(childCompaction?.type).toBe("compaction");
+		if (childCompaction?.type !== "compaction") throw new Error("Expected child compaction");
+		expect(childCompaction.preserveData).toBeUndefined();
 		expect(childEntries.find(entry => entry.id === "e6")?.type).toBe("branch_summary");
 
 		// Parent links are relinked to nearest surviving ancestor, forming a chain.
@@ -1539,7 +2302,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(childParentById.get("e1")).toBeNull();
 		expect(childParentById.get("e2")).toBe("e1");
 		expect(childParentById.get("e4")).toBe("e2");
-		expect(childParentById.get("e6")).toBe("e4"); // skipped removed session_init + compaction
+		expect(childParentById.get("e5")).toBe("e4");
+		expect(childParentById.get("e6")).toBe("e5"); // skipped removed session_init
 		expect(childParentById.get("e7")).toBe("e6");
 
 		// Tool pairing: the read call/result survive, the todo call/result do not.
@@ -1556,17 +2320,18 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(childEntries.some(entry => entry.type === "message" && entry.message.role === "toolResult")).toBe(true);
 
 		// Built context is ordered inherited text, with no dangling tool calls or
-		// orphan results, no compactionSummary, and no newly-created archive/image
+		// orphan results, a bounded compactionSummary, and no archive/image
 		// data.
 		const context = childManager.buildSessionContext();
 		expect(context.messages.map(message => message.role)).toEqual([
+			"compactionSummary",
 			"user",
 			"assistant",
 			"toolResult",
 			"branchSummary",
 			"user",
 		]);
-		expect(context.messages.some(message => message.role === "compactionSummary")).toBe(false);
+		expect(context.messages.some(message => message.role === "compactionSummary")).toBe(true);
 		const assistantContext = context.messages.find(
 			(message): message is AssistantMessage => message.role === "assistant",
 		);

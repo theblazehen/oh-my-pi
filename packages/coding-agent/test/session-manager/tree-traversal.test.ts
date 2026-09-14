@@ -422,14 +422,14 @@ describe("SessionManager append and tree traversal", () => {
 });
 
 describe("createBranchedSession", () => {
-	it("throws for non-existent entry", () => {
+	it("throws for non-existent entry", async () => {
 		const session = SessionManager.inMemory();
 		session.appendMessage(userMsg("hello"));
 
-		expect(() => session.createBranchedSession("nonexistent")).toThrow("Entry nonexistent not found");
+		await expect(session.createBranchedSession("nonexistent")).rejects.toThrow("Entry nonexistent not found");
 	});
 
-	it("creates new session with path to specified leaf (in-memory)", () => {
+	it("creates new session with path to specified leaf (in-memory)", async () => {
 		const session = SessionManager.inMemory();
 
 		// Build: 1 -> 2 -> 3 -> 4
@@ -443,7 +443,7 @@ describe("createBranchedSession", () => {
 		session.appendMessage(userMsg("5"));
 
 		// Create branched session from id2 (should only have 1 -> 2)
-		const result = session.createBranchedSession(id2);
+		const result = await session.createBranchedSession(id2);
 		expect(result).toBeUndefined(); // in-memory returns null
 
 		// Session should now only have entries 1 and 2
@@ -458,7 +458,7 @@ describe("createBranchedSession", () => {
 		const leafId = session.appendMessage(userMsg("hello"));
 		await session.setSessionName("new-ds", "user");
 
-		session.createBranchedSession(leafId);
+		await session.createBranchedSession(leafId);
 
 		expect(session.getSessionName()).toBe("new-ds");
 		expect(session.titleSource).toBe("user");
@@ -466,7 +466,7 @@ describe("createBranchedSession", () => {
 		expect(session.getSessionName()).toBe("new-ds");
 	});
 
-	it("extracts correct path from branched tree", () => {
+	it("extracts correct path from branched tree", async () => {
 		const session = SessionManager.inMemory();
 
 		// Build: 1 -> 2 -> 3
@@ -480,7 +480,7 @@ describe("createBranchedSession", () => {
 		const id5 = session.appendMessage(assistantMsg("5"));
 
 		// Create branched session from id5 (should have 1 -> 2 -> 4 -> 5)
-		session.createBranchedSession(id5);
+		await session.createBranchedSession(id5);
 
 		const entries = session.getEntries();
 		expect(entries).toHaveLength(4);

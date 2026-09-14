@@ -14,6 +14,7 @@ import type {
 	AgentMessage,
 	AgentTool,
 	AgentToolContext,
+	SteeringYieldLease,
 	ToolCallContext,
 } from "@oh-my-pi/pi-agent-core/types";
 import { ASIDE_MESSAGE_COMMIT, ASIDE_MESSAGE_DISCARD } from "@oh-my-pi/pi-agent-core/types";
@@ -1755,6 +1756,888 @@ describe("agentLoop with AgentMessage", () => {
 			m => m.role === "user" && typeof m.content === "string" && m.content === "interrupt",
 		);
 		expect(sawInterruptInContext).toBe(true);
+	});
+
+	it("blocking mode finishes ordinary exclusive calls before injecting queued steering", async () => {
+		const toolSchema = type({ value: "string" });
+		const executed: string[] = [];
+		let steeringQueued = false;
+		let steeringDrained = false;
+
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Ordinary exclusive tool",
+			parameters: toolSchema,
+			concurrency: "exclusive",
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				if (params.value === "first") steeringQueued = true;
+				return {
+					content: [{ type: "text", text: `ok:${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "first" } },
+						{ type: "toolCall", id: "tool-2", name: "echo", arguments: { value: "second" } },
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			interruptMode: "blocking",
+			hasSteeringMessages: () => steeringQueued && !steeringDrained,
+			getSteeringMessages: async () => {
+				if (!steeringQueued || steeringDrained) return [];
+				steeringDrained = true;
+				return [createUserMessage("interrupt")];
+			},
+		};
+
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop([createUserMessage("start")], context, config, undefined, mock.stream)) {
+			events.push(event);
+		}
+
+		expect(executed).toEqual(["first", "second"]);
+		expect(steeringDrained).toBe(true);
+		const toolEnds = events.filter(
+			(e): e is Extract<AgentEvent, { type: "tool_execution_end" }> => e.type === "tool_execution_end",
+		);
+		expect(toolEnds.map(event => [event.toolCallId, event.isError])).toEqual([
+			["tool-1", false],
+			["tool-2", false],
+		]);
+		const deliveryOrder = events.flatMap(event => {
+			if (event.type !== "message_start") return [];
+			if (event.message.role === "toolResult") return [`tool:${event.message.toolCallId}`];
+			if (event.message.role === "user" && event.message.content === "interrupt") return ["interrupt"];
+			return [];
+		});
+		expect(deliveryOrder).toEqual(["tool:tool-1", "tool:tool-2", "interrupt"]);
+		expect(
+			mock.calls[1]?.context.messages.some(message => message.role === "user" && message.content === "interrupt"),
+		).toBe(true);
+	});
+
+	for (const { source, queuedAtStart } of [
+		{ source: "system", queuedAtStart: true },
+		{ source: "system", queuedAtStart: false },
+		{ source: "user", queuedAtStart: false },
+		{ source: "irc", queuedAtStart: false },
+	] as const) {
+		it(`blocking mode preserves useful mixed-batch calls with ${source} steering ${queuedAtStart ? "queued at start" : "arriving mid-wait"}`, async () => {
+			const toolSchema = type({ value: "string" });
+			const executed: string[] = [];
+			const executionSignals = new Map<string, { hard: boolean | undefined; soft: boolean | undefined }>();
+			const steeringWake = Promise.withResolvers<void>();
+			let steeringQueued = false;
+			let deliveryCount = 0;
+			let leaseReleases = 0;
+			let waitAborted = false;
+			const steeringText = `${source} steering`;
+			const steeringMessage: AgentMessage =
+				source === "system"
+					? {
+							role: "custom",
+							customType: "advisor",
+							content: steeringText,
+							display: true,
+							attribution: "agent",
+							timestamp: 1,
+						}
+					: createUserMessage(steeringText);
+			const tool: AgentTool<typeof toolSchema, { value: string }> = {
+				name: "mixed",
+				label: "Mixed",
+				description: "Passive waits and useful work in shared and exclusive slots",
+				parameters: toolSchema,
+				concurrency: args =>
+					args.value === "ordinary-shared" || args.value === "cooperative" ? "shared" : "exclusive",
+				interruptible: args => args.value === "wait" || args.value === "skipped-wait",
+				steeringYieldable: args => args.value === "cooperative",
+				prepareSteeringYield: args =>
+					args.value === "reserved"
+						? {
+								release() {
+									leaseReleases++;
+								},
+							}
+						: undefined,
+				async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+					executed.push(params.value);
+					if (params.value === "wait") {
+						if (!signal) throw new Error("passive wait must receive an abort signal");
+						steeringQueued = true;
+						steeringWake.resolve();
+						if (!signal.aborted) {
+							const aborted = Promise.withResolvers<void>();
+							signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+							await aborted.promise;
+						}
+						waitAborted = signal.aborted;
+					}
+					executionSignals.set(params.value, {
+						hard: signal?.aborted,
+						soft: ctx?.toolCall?.steeringSignal?.aborted,
+					});
+					return { content: [{ type: "text", text: `real:${params.value}` }], details: { value: params.value } };
+				},
+			};
+			const values = ["wait", "ordinary-shared", "cooperative", "reserved", "skipped-wait", "ordinary-exclusive"];
+			const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+			const mock = createMockModel({
+				responses: [
+					{
+						content: values.map(value => ({
+							type: "toolCall" as const,
+							id: value,
+							name: "mixed",
+							arguments: { value },
+						})),
+					},
+					{ content: ["done"] },
+				],
+			});
+			const config: AgentLoopConfig = {
+				model: mock.model,
+				convertToLlm: messages =>
+					identityConverter(
+						messages.map(message =>
+							message.role === "custom" &&
+							message.customType === "advisor" &&
+							typeof message.content === "string"
+								? createUserMessage(message.content)
+								: message,
+						),
+					),
+				interruptMode: "blocking",
+				beforeToolCall: async () => {
+					if (queuedAtStart) steeringQueued = true;
+					return undefined;
+				},
+				...(source === "irc"
+					? {
+							hasIrcInterrupts: () => steeringQueued && deliveryCount === 0,
+							getAsideMessages: async () => {
+								if (!steeringQueued || deliveryCount > 0) return [];
+								deliveryCount++;
+								return [() => steeringMessage];
+							},
+						}
+					: {
+							hasSteeringMessages: () => ({ queued: steeringQueued && deliveryCount === 0, source }),
+							waitForSteeringMessages: () => steeringWake.promise,
+							getSteeringMessages: async () => {
+								if (!steeringQueued || deliveryCount > 0) return [];
+								deliveryCount++;
+								return [steeringMessage];
+							},
+						}),
+			};
+			const events: AgentEvent[] = [];
+			for await (const event of agentLoop([createUserMessage("start")], context, config, undefined, mock.stream)) {
+				events.push(event);
+			}
+
+			const usefulValues = ["ordinary-shared", "cooperative", "reserved", "ordinary-exclusive"];
+			const successfulValues = queuedAtStart ? usefulValues : ["wait", ...usefulValues];
+			expect(executed).toEqual(successfulValues);
+			expect(waitAborted).toBe(!queuedAtStart);
+			for (const value of usefulValues) {
+				expect(executionSignals.get(value)).toEqual({ hard: false, soft: true });
+			}
+			expect(leaseReleases).toBe(1);
+			expect(deliveryCount).toBe(1);
+			const toolEnds = events.filter(
+				(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> =>
+					event.type === "tool_execution_end",
+			);
+			expect(toolEnds).toHaveLength(values.length);
+			for (const value of successfulValues) {
+				const result = toolEnds.find(event => event.toolCallId === value);
+				expect(result?.isError).toBe(false);
+				expect(result?.result.content).toEqual([{ type: "text", text: `real:${value}` }]);
+				expect(result?.result.details).toEqual({ value });
+			}
+			expect(toolEnds.filter(event => event.isError).map(event => event.toolCallId)).toEqual(
+				queuedAtStart ? ["wait", "skipped-wait"] : ["skipped-wait"],
+			);
+			const deliveredMessages = events.flatMap(event => (event.type === "message_start" ? [event.message] : []));
+			expect(deliveredMessages.filter(message => message === steeringMessage)).toHaveLength(1);
+			const steeringIndex = deliveredMessages.indexOf(steeringMessage);
+			const deliveredResults = deliveredMessages.filter(
+				(message): message is ToolResultMessage => message.role === "toolResult",
+			);
+			expect(deliveredResults).toHaveLength(values.length);
+			for (const result of deliveredResults) {
+				expect(deliveredMessages.indexOf(result)).toBeLessThan(steeringIndex);
+			}
+			const nextMessages = mock.calls[1]?.context.messages ?? [];
+			expect(nextMessages.filter(message => message.role === "toolResult")).toEqual(deliveredResults);
+			expect(
+				nextMessages.filter(message => message.role === "user" && message.content === steeringText),
+			).toHaveLength(1);
+		});
+	}
+
+	it("blocking steering does not abort an active provider response stream", async () => {
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
+		const runController = new AbortController();
+		const providerStarted = Promise.withResolvers<void>();
+		const finishProvider = Promise.withResolvers<void>();
+		let providerSignal: AbortSignal | undefined;
+		let providerSignalAborted = false;
+		let steeringQueued = false;
+		let steeringDrained = false;
+		let streamCalls = 0;
+		const mock = createMockModel({ responses: [{ content: ["done after steering"] }] });
+		const streamFn: typeof mock.stream = (model, callContext, options) => {
+			streamCalls++;
+			if (streamCalls > 1) return mock.stream(model, callContext, options);
+
+			providerSignal = options?.signal;
+			providerSignal?.addEventListener(
+				"abort",
+				() => {
+					providerSignalAborted = true;
+				},
+				{ once: true },
+			);
+			const response = createAssistantMessage([{ type: "text", text: "provider response" }]);
+			const providerStream = new AssistantMessageEventStream();
+			providerStream.push({ type: "start", partial: response });
+			providerStarted.resolve();
+			void finishProvider.promise.then(() => {
+				providerStream.push({ type: "done", reason: "stop", message: response });
+			});
+			return providerStream;
+		};
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			interruptMode: "blocking",
+			hasSteeringMessages: () => steeringQueued && !steeringDrained,
+			getSteeringMessages: async () => {
+				if (!steeringQueued || steeringDrained) return [];
+				steeringDrained = true;
+				return [createUserMessage("interrupt")];
+			},
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("start")], context, config, runController.signal, streamFn);
+		const drain = (async () => {
+			for await (const event of stream) events.push(event);
+		})();
+
+		await providerStarted.promise;
+		steeringQueued = true;
+		await Promise.resolve();
+		if (!providerSignal) throw new Error("provider must receive the live run signal");
+		expect(providerSignal).toBe(runController.signal);
+		expect(providerSignalAborted).toBe(false);
+		expect(providerSignal.aborted).toBe(false);
+
+		finishProvider.resolve();
+		await drain;
+
+		expect(steeringDrained).toBe(true);
+		expect(streamCalls).toBe(2);
+		expect(
+			events.some(
+				event =>
+					event.type === "message_start" && event.message.role === "user" && event.message.content === "interrupt",
+			),
+		).toBe(true);
+	});
+
+	it("blocking mode promptly hard-aborts an interruptible passive wait and drains steering", async () => {
+		const toolSchema = type({});
+		const steeringWake = Promise.withResolvers<void>();
+		let steeringQueued = false;
+		let steeringDrained = false;
+		let releasedByAbort = false;
+		let hardSignalAborted = false;
+
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "wait",
+			label: "Wait",
+			description: "Passive wait that exits on its hard abort signal",
+			parameters: toolSchema,
+			interruptible: true,
+			async execute(_toolCallId, _params, signal) {
+				if (!signal) throw new Error("interruptible tool must receive a hard signal");
+				steeringQueued = true;
+				steeringWake.resolve();
+				if (!signal.aborted) {
+					const aborted = Promise.withResolvers<void>();
+					signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+					await aborted.promise;
+				}
+				releasedByAbort = true;
+				hardSignalAborted = signal.aborted;
+				return { content: [{ type: "text", text: "wait released" }], details: {} };
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "wait", arguments: {} }] },
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			interruptMode: "blocking",
+			hasSteeringMessages: () => steeringQueued && !steeringDrained,
+			waitForSteeringMessages: () => steeringWake.promise,
+			getSteeringMessages: async () => {
+				if (!steeringQueued || steeringDrained) return [];
+				steeringDrained = true;
+				return [createUserMessage("interrupt")];
+			},
+		};
+
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop([createUserMessage("start")], context, config, undefined, mock.stream)) {
+			events.push(event);
+		}
+
+		expect(releasedByAbort).toBe(true);
+		expect(hardSignalAborted).toBe(true);
+		expect(steeringDrained).toBe(true);
+		expect(
+			events.some(
+				event =>
+					event.type === "message_start" && event.message.role === "user" && event.message.content === "interrupt",
+			),
+		).toBe(true);
+	});
+
+	it("blocking mode cooperatively signals a steering-yieldable tool without hard-aborting it", async () => {
+		const toolSchema = type({});
+		const steeringWake = Promise.withResolvers<void>();
+		let steeringQueued = false;
+		let steeringDrained = false;
+		let releasedBySteering = false;
+		let hardSignalAborted = true;
+		let cooperativeSignal: AbortSignal | undefined;
+
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "foreground",
+			label: "Foreground",
+			description: "Non-interruptible work that can cooperatively yield",
+			parameters: toolSchema,
+			steeringYieldable: true,
+			async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+				cooperativeSignal = ctx?.toolCall?.steeringSignal;
+				if (!cooperativeSignal) throw new Error("steering-yieldable tool must receive a cooperative signal");
+				steeringQueued = true;
+				steeringWake.resolve();
+				if (!cooperativeSignal.aborted) {
+					const steered = Promise.withResolvers<void>();
+					cooperativeSignal.addEventListener("abort", () => steered.resolve(), { once: true });
+					await steered.promise;
+				}
+				releasedBySteering = true;
+				hardSignalAborted = signal?.aborted === true;
+				return { content: [{ type: "text", text: "yielded cooperatively" }], details: {} };
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "foreground", arguments: {} }] },
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			interruptMode: "blocking",
+			hasSteeringMessages: () => steeringQueued && !steeringDrained,
+			waitForSteeringMessages: () => steeringWake.promise,
+			getSteeringMessages: async () => {
+				if (!steeringQueued || steeringDrained) return [];
+				steeringDrained = true;
+				return [createUserMessage("interrupt")];
+			},
+		};
+
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop([createUserMessage("start")], context, config, undefined, mock.stream)) {
+			events.push(event);
+		}
+
+		expect(releasedBySteering).toBe(true);
+		expect(cooperativeSignal?.aborted).toBe(true);
+		expect(hardSignalAborted).toBe(false);
+		expect(steeringDrained).toBe(true);
+		const toolEnd = events.find(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> =>
+				event.type === "tool_execution_end" && event.toolCallId === "tool-1",
+		);
+		expect(toolEnd?.isError).toBe(false);
+		expect(toolEnd?.result.content).toContainEqual({ type: "text", text: "yielded cooperatively" });
+		expect(
+			events.some(
+				event =>
+					event.type === "message_start" && event.message.role === "user" && event.message.content === "interrupt",
+			),
+		).toBe(true);
+	});
+
+	it("wait mode neither watches nor prepares an otherwise interruptible and yieldable batch", async () => {
+		const toolSchema = type({ value: "string" });
+		const executed: string[] = [];
+		const contexts: ToolCallContext[] = [];
+		let preparationCalls = 0;
+		let steeringChecks = 0;
+		let steeringQueued = false;
+		let steeringDrained = false;
+
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "waitable",
+			label: "Waitable",
+			description: "A call with both blocking steering capabilities",
+			parameters: toolSchema,
+			concurrency: "exclusive",
+			interruptible: true,
+			steeringYieldable: true,
+			prepareSteeringYield() {
+				preparationCalls++;
+				return { release() {} };
+			},
+			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+				const toolCall = (ctx as (AgentToolContext & { toolCall?: ToolCallContext }) | undefined)?.toolCall;
+				if (!toolCall) throw new Error("expected tool-call context");
+				contexts.push(toolCall);
+				executed.push(params.value);
+				if (params.value === "first") steeringQueued = true;
+				expect(signal?.aborted).toBe(false);
+				return { content: [{ type: "text", text: params.value }], details: {} };
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "tool-1", name: "waitable", arguments: { value: "first" } },
+						{ type: "toolCall", id: "tool-2", name: "waitable", arguments: { value: "second" } },
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			interruptMode: "wait",
+			getToolContext: toolCall => ({ toolCall }) as AgentToolContext,
+			hasSteeringMessages: () => {
+				steeringChecks++;
+				return steeringQueued && !steeringDrained;
+			},
+			getSteeringMessages: async () => {
+				if (!steeringQueued || steeringDrained) return [];
+				steeringDrained = true;
+				return [createUserMessage("interrupt")];
+			},
+		};
+
+		for await (const _event of agentLoop([createUserMessage("start")], context, config, undefined, mock.stream)) {
+			// Drain the stream.
+		}
+
+		expect(executed).toEqual(["first", "second"]);
+		expect(preparationCalls).toBe(0);
+		expect(steeringChecks).toBe(0);
+		expect(steeringDrained).toBe(true);
+		expect(contexts).toHaveLength(2);
+		for (const toolCall of contexts) {
+			expect(toolCall.steeringYieldPreparationAttempted).toBe(false);
+			expect(toolCall.steeringYieldLease).toBeUndefined();
+		}
+	});
+
+	it("immediate mode does not prepare a blocking steering lease", async () => {
+		const toolSchema = type({});
+		let preparationCalls = 0;
+		let executionContext: ToolCallContext | undefined;
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "foreground",
+			label: "Foreground",
+			description: "Immediate-mode tool",
+			parameters: toolSchema,
+			prepareSteeringYield() {
+				preparationCalls++;
+				return { release() {} };
+			},
+			async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+				executionContext = (ctx as (AgentToolContext & { toolCall?: ToolCallContext }) | undefined)?.toolCall;
+				return { content: [{ type: "text", text: "done" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "foreground", arguments: {} }] },
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			interruptMode: "immediate",
+			getToolContext: toolCall => ({ toolCall }) as AgentToolContext,
+		};
+
+		for await (const _event of agentLoop([createUserMessage("start")], context, config, undefined, mock.stream)) {
+			// Drain the stream.
+		}
+
+		expect(preparationCalls).toBe(0);
+		expect(executionContext?.steeringYieldPreparationAttempted).toBe(false);
+		expect(executionContext?.steeringYieldLease).toBeUndefined();
+	});
+
+	it("resolves steering metadata and prepares a lease from beforeToolCall-revised args", async () => {
+		const toolSchema = type({ value: "string" });
+		const interruptibleArgs: unknown[] = [];
+		const yieldableArgs: unknown[] = [];
+		const preparationArgs: unknown[] = [];
+		let releaseCalls = 0;
+		let executionContext: ToolCallContext | undefined;
+		const lease: SteeringYieldLease = {
+			release() {
+				releaseCalls++;
+			},
+		};
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "foreground",
+			label: "Foreground",
+			description: "Prepared foreground tool",
+			parameters: toolSchema,
+			interruptible: args => {
+				interruptibleArgs.push(args.value);
+				return false;
+			},
+			steeringYieldable: args => {
+				yieldableArgs.push(args.value);
+				return false;
+			},
+			prepareSteeringYield(args) {
+				preparationArgs.push(args.value);
+				return lease;
+			},
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+				expect(params.value).toBe("revised");
+				executionContext = ctx?.toolCall;
+				return { content: [{ type: "text", text: "real result" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "foreground", arguments: { value: "original" } }] },
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			interruptMode: "blocking",
+			beforeToolCall: async () => ({ args: { value: "revised" } }),
+		};
+
+		for await (const _event of agentLoop([createUserMessage("start")], context, config, undefined, mock.stream)) {
+			// Drain the stream.
+		}
+
+		expect(interruptibleArgs).toEqual(["revised"]);
+		expect(yieldableArgs).toEqual(["revised"]);
+		expect(preparationArgs).toEqual(["revised"]);
+		expect(executionContext?.steeringYieldPreparationAttempted).toBe(true);
+		expect(executionContext?.steeringYieldLease).toBe(lease);
+		expect(releaseCalls).toBe(1);
+	});
+
+	it("composes tool-call metadata onto an app context without mutating shared app state", async () => {
+		const toolSchema = type({});
+		const appState = { label: "shared" };
+		const appContext = Object.freeze({ appState }) as AgentToolContext & { appState: { label: string } };
+		let loopToolCall: ToolCallContext | undefined;
+		let executionContext: (AgentToolContext & { appState: { label: string } }) | undefined;
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "foreground",
+			label: "Foreground",
+			description: "Tool receiving app and loop context",
+			parameters: toolSchema,
+			steeringYieldable: true,
+			async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+				executionContext = ctx as (AgentToolContext & { appState: { label: string } }) | undefined;
+				return { content: [{ type: "text", text: "done" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "foreground", arguments: {} }] },
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			interruptMode: "blocking",
+			getToolContext: toolCall => {
+				loopToolCall = toolCall;
+				return appContext;
+			},
+		};
+
+		for await (const _event of agentLoop([createUserMessage("start")], context, config, undefined, mock.stream)) {
+			// Drain the stream.
+		}
+
+		expect(loopToolCall).toBeDefined();
+		expect(executionContext).not.toBe(appContext);
+		expect(executionContext?.appState).toBe(appState);
+		expect(executionContext?.toolCall).toBe(loopToolCall);
+		expect(appContext.toolCall).toBeUndefined();
+		expect("toolCall" in appContext).toBe(false);
+	});
+
+	it("releases an acquired steering lease when tool execution errors without masking the result", async () => {
+		const toolSchema = type({});
+		let releaseCalls = 0;
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "foreground",
+			label: "Foreground",
+			description: "Failing prepared tool",
+			parameters: toolSchema,
+			prepareSteeringYield: () => ({
+				release() {
+					releaseCalls++;
+					throw new Error("cleanup failed");
+				},
+			}),
+			async execute() {
+				throw new Error("execution failed");
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "foreground", arguments: {} }] },
+				{ content: ["done"] },
+			],
+		});
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop(
+			[createUserMessage("start")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter, interruptMode: "blocking" },
+			undefined,
+			mock.stream,
+		)) {
+			events.push(event);
+		}
+
+		expect(releaseCalls).toBe(1);
+		const toolEnd = events.find(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(toolEnd?.isError).toBe(true);
+		expect(toolEnd?.result.content).toContainEqual({ type: "text", text: "execution failed" });
+	});
+
+	it("executes reserved-only calls after blocking steering and releases both leases once", async () => {
+		const toolSchema = type({ value: "string" });
+		const executed: string[] = [];
+		const prepared: string[] = [];
+		const releaseCalls = new Map<string, number>();
+		const executionSignals = new Map<string, { hard: boolean | undefined; soft: boolean | undefined }>();
+		let steeringQueued = false;
+		let steeringDrained = false;
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "foreground",
+			label: "Foreground",
+			description: "Prepared exclusive tool",
+			parameters: toolSchema,
+			concurrency: "exclusive",
+			prepareSteeringYield(args) {
+				const value = args.value;
+				if (typeof value !== "string") throw new Error("expected prepared value");
+				prepared.push(value);
+				return {
+					release() {
+						releaseCalls.set(value, (releaseCalls.get(value) ?? 0) + 1);
+					},
+				};
+			},
+			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+				executed.push(params.value);
+				executionSignals.set(params.value, { hard: signal?.aborted, soft: ctx?.toolCall?.steeringSignal?.aborted });
+				if (params.value === "first") steeringQueued = true;
+				return { content: [{ type: "text", text: params.value }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "tool-1", name: "foreground", arguments: { value: "first" } },
+						{ type: "toolCall", id: "tool-2", name: "foreground", arguments: { value: "second" } },
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop(
+			[createUserMessage("start")],
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				interruptMode: "blocking",
+				hasSteeringMessages: () => steeringQueued && !steeringDrained,
+				getSteeringMessages: async () => {
+					if (!steeringQueued || steeringDrained) return [];
+					steeringDrained = true;
+					return [createUserMessage("interrupt")];
+				},
+			},
+			undefined,
+			mock.stream,
+		)) {
+			events.push(event);
+		}
+
+		expect(prepared).toEqual(["first", "second"]);
+		expect(executed).toEqual(["first", "second"]);
+		expect(executionSignals.get("first")).toEqual({ hard: false, soft: false });
+		expect(executionSignals.get("second")).toEqual({ hard: false, soft: true });
+		expect(releaseCalls).toEqual(
+			new Map([
+				["first", 1],
+				["second", 1],
+			]),
+		);
+		const toolEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(toolEnds.map(event => [event.toolCallId, event.isError, event.result.content])).toEqual([
+			["tool-1", false, [{ type: "text", text: "first" }]],
+			["tool-2", false, [{ type: "text", text: "second" }]],
+		]);
+		expect(steeringDrained).toBe(true);
+		const deliveryOrder = events.flatMap(event => {
+			if (event.type !== "message_start") return [];
+			if (event.message.role === "toolResult") return [`tool:${event.message.toolCallId}`];
+			if (event.message.role === "user" && event.message.content === "interrupt") return ["interrupt"];
+			return [];
+		});
+		expect(deliveryOrder).toEqual(["tool:tool-1", "tool:tool-2", "interrupt"]);
+		expect(mock.calls[1]?.context.messages.filter(message => message.role === "toolResult")).toEqual(
+			events.flatMap(event =>
+				event.type === "message_start" && event.message.role === "toolResult" ? [event.message] : [],
+			),
+		);
+	});
+
+	it("does not grant blocking eligibility when steering resolvers and preparation throw", async () => {
+		const toolSchema = type({ value: "string" });
+		const executed: string[] = [];
+		const contexts: ToolCallContext[] = [];
+		let steeringQueued = false;
+		let steeringDrained = false;
+		let steeringChecks = 0;
+		let preparationCalls = 0;
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "foreground",
+			label: "Foreground",
+			description: "Tool whose steering declarations fail",
+			parameters: toolSchema,
+			concurrency: "exclusive",
+			interruptible() {
+				throw new Error("interruptibility resolver failed");
+			},
+			steeringYieldable() {
+				throw new Error("yieldability resolver failed");
+			},
+			prepareSteeringYield() {
+				preparationCalls++;
+				throw new Error("reservation failed");
+			},
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+				const toolCall = (ctx as (AgentToolContext & { toolCall?: ToolCallContext }) | undefined)?.toolCall;
+				if (!toolCall) throw new Error("expected tool-call context");
+				contexts.push(toolCall);
+				executed.push(params.value);
+				if (params.value === "first") steeringQueued = true;
+				return { content: [{ type: "text", text: params.value }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "tool-1", name: "foreground", arguments: { value: "first" } },
+						{ type: "toolCall", id: "tool-2", name: "foreground", arguments: { value: "second" } },
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			interruptMode: "blocking",
+			getToolContext: toolCall => ({ toolCall }) as AgentToolContext,
+			hasSteeringMessages: () => {
+				steeringChecks++;
+				return steeringQueued && !steeringDrained;
+			},
+			getSteeringMessages: async () => {
+				if (!steeringQueued || steeringDrained) return [];
+				steeringDrained = true;
+				return [createUserMessage("interrupt")];
+			},
+		};
+
+		for await (const _event of agentLoop([createUserMessage("start")], context, config, undefined, mock.stream)) {
+			// Drain the stream.
+		}
+
+		expect(executed).toEqual(["first", "second"]);
+		expect(preparationCalls).toBe(2);
+		expect(steeringChecks).toBe(0);
+		expect(steeringDrained).toBe(true);
+		expect(contexts).toHaveLength(2);
+		for (const toolCall of contexts) {
+			expect(toolCall.steeringYieldPreparationAttempted).toBe(true);
+			expect(toolCall.steeringYieldLease).toBeUndefined();
+		}
 	});
 
 	it("should skip remaining interruptible waits with system advisory wording when advisor steering is queued", async () => {

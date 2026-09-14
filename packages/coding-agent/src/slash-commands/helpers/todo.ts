@@ -91,8 +91,10 @@ function findTaskFuzzy(phases: TodoPhase[], query: string): TodoTaskMatch | unde
 }
 
 function currentPhases(runtime: SlashCommandRuntime): TodoPhase[] {
-	const fromEntries = getLatestTodoPhasesFromEntries(runtime.sessionManager.getBranch());
-	return fromEntries.length > 0 ? fromEntries : runtime.session.getTodoPhases();
+	return getLatestTodoPhasesFromEntries(
+		runtime.sessionManager.getBranch(),
+		runtime.sessionManager.getTodoPhasesSeed() ?? runtime.session.getTodoPhases(),
+	);
 }
 
 function commitTodos(runtime: SlashCommandRuntime, phases: TodoPhase[]): void {

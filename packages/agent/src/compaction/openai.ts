@@ -158,6 +158,16 @@ function probeRemoteCompactionInputBudget(
 	return { tokens: budget.tokens + flatTokens, fits: budget.fits };
 }
 
+/** Conservatively estimate provider-native Responses history plus request framing. */
+export function estimateRemoteCompactionInputTokens(
+	input: Array<Record<string, unknown>>,
+	tokenizer: Tokenizer,
+	instructions: string,
+	tools?: unknown[],
+): number {
+	return probeRemoteCompactionInputBudget(input, tokenizer, instructions, tools, undefined).tokens;
+}
+
 function rewriteToolOutputForContextWindow(item: Record<string, unknown>): Record<string, unknown> | undefined {
 	if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
 		return { ...item, output: CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE };

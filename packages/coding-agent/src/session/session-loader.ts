@@ -3,7 +3,13 @@ import { getBlobsDir, isEnoent, parseJsonlLenient } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { BlobStore, isBlobRef, resolveImageData, resolveImageDataUrl } from "./blob-store";
 import { buildSessionContext } from "./session-context";
-import type { FileEntry, RawFileEntry, SessionEntry, SessionHeader } from "./session-entries";
+import {
+	type FileEntry,
+	type RawFileEntry,
+	type SessionEntry,
+	type SessionHeader,
+	SESSION_TITLE_SLOT_BYTES,
+} from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { isExternalizableImagePosition, isPersistenceTruncatedString } from "./session-persistence";
 import { FileSessionStorage, type SessionStorage } from "./session-storage";
@@ -14,9 +20,23 @@ import {
 	titleUpdateFromSlot,
 } from "./session-title-slot";
 
-const STREAM_LOAD_THRESHOLD_BYTES = 8 * 1024 * 1024;
+export const STREAM_LOAD_THRESHOLD_BYTES = 8 * 1024 * 1024;
 const STREAM_YIELD_BYTES = 1 * 1024 * 1024;
 const STREAM_YIELD_ENTRIES = 8_192;
+
+/** Read only the fixed-width title prefix through the configured storage backend. */
+export async function readTitleSlotFromFile(
+	filePath: string,
+	storage: SessionStorage = new FileSessionStorage(),
+): Promise<SessionTitleUpdate | undefined> {
+	try {
+		const [prefix] = await storage.readTextSlices(filePath, SESSION_TITLE_SLOT_BYTES, 0);
+		return titleUpdateFromSlot(parseTitleSlotFromContent(prefix));
+	} catch (error) {
+		if (isEnoent(error)) return undefined;
+		throw error;
+	}
+}
 
 export interface VisitEntriesFromFileStreamOptions {
 	/** Stop after the visitor returns `false`. */

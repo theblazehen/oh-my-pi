@@ -5,6 +5,7 @@ import type {
 	AgentToolContext,
 	AgentToolResult,
 	AgentToolUpdateCallback,
+	SteeringYieldLease,
 	ToolApprovalDecision,
 } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
@@ -709,6 +710,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 	// run alone.
 	readonly concurrency = (args: Partial<BashToolInput>): "shared" | "exclusive" =>
 		args.pty === true ? "exclusive" : "shared";
+	readonly prepareSteeringYield = (args: Partial<BashToolInput>): SteeringYieldLease | undefined =>
+		this.#getAutoBackgroundManager(args)?.tryReserveSlot();
 	readonly strict = true;
 	readonly #asyncEnabled: boolean;
 	readonly #autoBackgroundEnabled: boolean;
@@ -904,6 +907,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		resolvedEnv?: Record<string, string>;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
 		forwardUpdates: boolean;
+		steeringYieldLease?: SteeringYieldLease;
 	}): ManagedBashJobHandle {
 		const manager = this.session.asyncJobManager;
 		if (!manager) {
@@ -915,10 +919,11 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		let latestProgressDetails: BashProgressDetails | undefined;
 		let forwardUpdates = options.forwardUpdates;
 		const completion = Promise.withResolvers<ManagedBashJobCompletion>();
+		const registerJob = options.steeringYieldLease
+			? manager.registerReserved.bind(manager, options.steeringYieldLease, "bash", label)
+			: manager.register.bind(manager, "bash", label);
 
-		const jobId = manager.register(
-			"bash",
-			label,
+		const jobId = registerJob(
 			async ({ jobId, signal: runSignal, reportProgress }) => {
 				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
 				const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
@@ -999,6 +1004,17 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				forwardUpdates = false;
 			},
 		};
+	}
+
+	#getAutoBackgroundManager(args: Partial<BashToolInput>, clientBridge = this.session.getClientBridge?.()) {
+		if (this.#autoBackgroundEnabled === false || args.async === true || args.pty === true) return undefined;
+		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal) return undefined;
+		return this.session.asyncJobManager;
+	}
+
+	#getEligibleAutoBackgroundManager(args: Partial<BashToolInput>, clientBridge = this.session.getClientBridge?.()) {
+		const manager = this.#getAutoBackgroundManager(args, clientBridge);
+		return manager && !manager.atCapacity ? manager : undefined;
 	}
 
 	async execute(
@@ -1147,20 +1163,19 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// when available it wins over auto-backgrounding (both are opt-in, and
 		// auto-background would otherwise silently disable the terminal route).
 		const clientBridge = this.session.getClientBridge?.();
-		const bridgeTerminalAvailable = Boolean(
-			clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty,
-		);
-
-		const autoBgManager = this.session.asyncJobManager;
+		const steeringYieldPreparationAttempted = ctx?.toolCall?.steeringYieldPreparationAttempted === true;
+		const steeringYieldLease = steeringYieldPreparationAttempted ? ctx?.toolCall?.steeringYieldLease : undefined;
+		const autoBgManager = steeringYieldPreparationAttempted
+			? steeringYieldLease
+				? this.session.asyncJobManager
+				: undefined
+			: this.#getEligibleAutoBackgroundManager({ async: asyncRequested, pty }, clientBridge);
 		// At the running-job cap, fall through to direct foreground execution
-		// instead of failing every bash call until a slot frees up.
-		if (
-			this.#autoBackgroundEnabled &&
-			!pty &&
-			!bridgeTerminalAvailable &&
-			autoBgManager &&
-			!autoBgManager.atCapacity
-		) {
+		// instead of failing every bash call until a slot frees up. In blocking
+		// mode the preparation result is frozen: a reserved lease is consumed by
+		// this exact call, while a failed reservation stays foreground even if a
+		// slot becomes available before execution starts.
+		if (autoBgManager) {
 			const autoBackgroundWaitMs = resolveAutoBackgroundWaitMs(this.#autoBackgroundThresholdMs, timeoutMs);
 			const startBackgrounded = autoBackgroundWaitMs === 0;
 			const job = this.#startManagedBashJob({
@@ -1174,6 +1189,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				resolvedEnv,
 				onUpdate,
 				forwardUpdates: !startBackgrounded,
+				steeringYieldLease,
 			});
 			if (startBackgrounded) {
 				return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {

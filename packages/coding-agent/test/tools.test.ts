@@ -9,6 +9,7 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { DEFAULT_BASH_INTERCEPTOR_RULES, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
+import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
@@ -2354,6 +2355,137 @@ function b() {
 			expect(getTextOutput(result)).toContain("Command exited with code 1");
 		});
 
+		it("reserves steering-yield capacity only for statically eligible calls", async () => {
+			const manager = new AsyncJobManager({ onJobComplete: async () => {}, maxRunningJobs: 1 });
+			const autoBackgroundSettings = Settings.isolated({ "bash.autoBackground.enabled": true });
+			const tool = new BashTool(
+				createTestToolSession(testDir, autoBackgroundSettings, {
+					asyncJobManager: manager,
+				}),
+			);
+
+			const lease = tool.prepareSteeringYield({ command: "sleep 1", async: false, pty: false });
+			expect(lease).toBeDefined();
+			expect(manager.atCapacity).toBe(true);
+			expect(tool.prepareSteeringYield({ command: "sleep 1" })).toBeUndefined();
+			lease?.release();
+			expect(manager.atCapacity).toBe(false);
+			expect(tool.prepareSteeringYield({ command: "sleep 1", async: true })).toBeUndefined();
+			expect(tool.prepareSteeringYield({ command: "sleep 1", pty: true })).toBeUndefined();
+
+			const disabledTool = new BashTool(
+				createTestToolSession(testDir, Settings.isolated({ "bash.autoBackground.enabled": false }), {
+					asyncJobManager: manager,
+				}),
+			);
+			expect(disabledTool.prepareSteeringYield({ command: "sleep 1" })).toBeUndefined();
+
+			const unmanagedTool = new BashTool(createTestToolSession(testDir, autoBackgroundSettings));
+			expect(unmanagedTool.prepareSteeringYield({ command: "sleep 1" })).toBeUndefined();
+
+			const terminalBridge: ClientBridge = {
+				capabilities: { terminal: true },
+				createTerminal: async () => {
+					throw new Error("preparation must not create a terminal");
+				},
+			};
+			const bridgeTool = new BashTool(
+				createTestToolSession(testDir, autoBackgroundSettings, {
+					asyncJobManager: manager,
+					getClientBridge: () => terminalBridge,
+				}),
+			);
+			expect(bridgeTool.prepareSteeringYield({ command: "sleep 1" })).toBeUndefined();
+			await manager.dispose();
+		});
+
+		it("consumes the exact prepared reservation when execution starts", async () => {
+			const manager = new AsyncJobManager({ onJobComplete: async () => {}, maxRunningJobs: 1 });
+			const tool = new BashTool(
+				createTestToolSession(
+					testDir,
+					Settings.isolated({
+						"bash.autoBackground.enabled": true,
+						"bash.autoBackground.thresholdMs": 60_000,
+					}),
+					{ getSessionId: () => "test-session", asyncJobManager: manager },
+				),
+			);
+			const lease = tool.prepareSteeringYield({ command: "printf 'reserved\\n'" });
+			if (!lease) throw new Error("expected a steering-yield reservation");
+			const registerReserved = vi.spyOn(manager, "registerReserved");
+
+			const result = await tool.execute(
+				"test-call-reserved-steering-yield",
+				{ command: "printf 'reserved\\n'" },
+				undefined,
+				undefined,
+				{
+					...createTestToolContext([]),
+					toolCall: {
+						batchId: "batch-reserved",
+						index: 0,
+						total: 1,
+						toolCalls: [{ id: "test-call-reserved-steering-yield", name: "bash" }],
+						steeringYieldPreparationAttempted: true,
+						steeringYieldLease: lease,
+					},
+				},
+			);
+
+			expect(getTextOutput(result)).toContain("reserved");
+			expect(result.details?.async).toBeUndefined();
+			expect(registerReserved).toHaveBeenCalledTimes(1);
+			expect(registerReserved.mock.calls[0]?.[0]).toBe(lease);
+			await Promise.all(manager.getRunningJobs().map(job => job.promise));
+			expect(manager.atCapacity).toBe(false);
+			lease.release();
+			lease.release();
+			expect(manager.atCapacity).toBe(false);
+			await manager.dispose();
+		});
+
+		it("keeps a failed preparation in the foreground after capacity frees", async () => {
+			const manager = new AsyncJobManager({ onJobComplete: async () => {}, maxRunningJobs: 1 });
+			const tool = new BashTool(
+				createTestToolSession(testDir, Settings.isolated({ "bash.autoBackground.enabled": true }), {
+					getSessionId: () => "test-session",
+					asyncJobManager: manager,
+				}),
+			);
+
+			const capacityGate = Promise.withResolvers<string>();
+			const capacityJobId = manager.register("bash", "occupy background capacity", async () => capacityGate.promise);
+			expect(manager.atCapacity).toBe(true);
+			expect(tool.prepareSteeringYield({ command: "printf 'foreground\\n'" })).toBeUndefined();
+			capacityGate.resolve("done");
+			await manager.getJob(capacityJobId)?.promise;
+			expect(manager.atCapacity).toBe(false);
+			const register = vi.spyOn(manager, "register");
+
+			const result = await tool.execute(
+				"test-call-frozen-foreground",
+				{ command: "printf 'foreground\\n'" },
+				undefined,
+				undefined,
+				{
+					...createTestToolContext([]),
+					toolCall: {
+						batchId: "batch-frozen-foreground",
+						index: 0,
+						total: 1,
+						toolCalls: [{ id: "test-call-frozen-foreground", name: "bash" }],
+						steeringYieldPreparationAttempted: true,
+					},
+				},
+			);
+
+			expect(getTextOutput(result)).toContain("foreground");
+			expect(result.details?.async).toBeUndefined();
+			expect(register).not.toHaveBeenCalled();
+			await manager.dispose();
+		});
+
 		it("should keep short commands inline when auto-background is enabled", async () => {
 			const deliveries: string[] = [];
 			const asyncJobManager = new AsyncJobManager({
@@ -2445,7 +2577,12 @@ function b() {
 		});
 
 		it("backgrounds a running command when the steering signal fires mid-wait", async () => {
-			const asyncJobManager = new AsyncJobManager({});
+			const deliveries: Array<{ jobId: string; text: string }> = [];
+			const asyncJobManager = new AsyncJobManager({
+				onJobComplete: async (jobId, text) => {
+					deliveries.push({ jobId, text });
+				},
+			});
 			const autoBackgroundBashTool = wrapToolWithMetaNotice(
 				new BashTool(
 					createTestToolSession(
@@ -2477,6 +2614,7 @@ function b() {
 						index: 0,
 						total: 1,
 						toolCalls: [{ id: "test-call-steer-background", name: "bash" }],
+						steeringYieldPreparationAttempted: false,
 						steeringSignal: steering.signal,
 					},
 				},
@@ -2494,6 +2632,10 @@ function b() {
 			expect(job?.status).toBe("running");
 			await job?.promise;
 			expect(asyncJobManager.getJob(jobId)?.status).toBe("completed");
+			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
+			expect(deliveries).toHaveLength(1);
+			expect(deliveries[0]?.jobId).toBe(jobId);
+			expect(deliveries[0]?.text).toContain("done");
 			await asyncJobManager.dispose();
 		});
 

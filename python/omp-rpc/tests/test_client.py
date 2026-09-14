@@ -1205,6 +1205,12 @@ class RpcClientTests(unittest.TestCase):
             branch_messages = client.get_branch_messages()
             self.assertEqual(branch_messages[0].entry_id, "entry-9")
 
+    def test_set_interrupt_mode_supports_blocking(self) -> None:
+        with self.make_client() as client:
+            client.set_interrupt_mode("blocking")
+
+            self.assertEqual(client.get_state().interrupt_mode, "blocking")
+
     def test_message_and_control_commands(self) -> None:
         with self.make_client() as client:
             turn = client.prompt_and_wait("say hello", timeout=2.0)

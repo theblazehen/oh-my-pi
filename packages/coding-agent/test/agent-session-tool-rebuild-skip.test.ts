@@ -1196,7 +1196,7 @@ These tools became available:
 		// the delta is the only channel that can tell the branched transcript the
 		// device exists.
 		await session.refreshMCPTools([search]);
-		const branchable = session.getUserMessagesForBranching();
+		const branchable = await session.getUserMessagesForBranching();
 		expect(branchable.length).toBeGreaterThan(0);
 		await session.branch(branchable[0].entryId);
 

@@ -75,6 +75,7 @@ import type {
 	AgentTool,
 	AgentToolArgStream,
 	AgentToolCall,
+	AgentToolContext,
 	AgentToolResult,
 	AgentTurnEndContext,
 	AsideMessage,
@@ -83,7 +84,9 @@ import type {
 	SoftToolRequirement,
 	SteeringInterruptSource,
 	SteeringQueueState,
+	SteeringYieldLease,
 	StreamFn,
+	ToolCallContext,
 } from "./types";
 import { ASIDE_MESSAGE_COMMIT, ASIDE_MESSAGE_DISCARD, isSoftToolRequirement } from "./types";
 import { yieldIfDue } from "./utils/yield";
@@ -125,9 +128,9 @@ function hardToolChoiceBlocks(choice: ToolChoice | undefined, requiredTool: stri
 }
 
 /**
- * Cadence (ms) for polling queued steering while an `interruptible` tool is in
+ * Cadence (ms) for polling queued steering while a watched tool batch is in
  * flight, so a steer cuts the wait short instead of sitting idle until the
- * tool's own window elapses. A cheap synchronous queue check; latency-bounded
+ * batch's own window elapses. A cheap synchronous queue check; latency-bounded
  * at one tick.
  */
 /**
@@ -2394,7 +2397,6 @@ async function executeToolCalls(
 	const emittedToolResults: ToolResultMessage[] = [];
 	const toolCallInfos = toolCalls.map(call => ({ id: call.id, name: call.name }));
 	const batchId = `${assistantMessage.timestamp ?? Date.now()}_${toolCalls[0]?.id ?? "batch"}`;
-	const shouldInterruptImmediately = interruptMode !== "wait";
 	const steeringAbortController = new AbortController();
 	const ircAbortController = new AbortController();
 	// Cooperative channel: aborted when queued steering (or an interrupting
@@ -2420,6 +2422,20 @@ async function executeToolCalls(
 	const preparedDispatch =
 		preparedDispatchByMessage.get(assistantMessage) ??
 		(await prepareToolCallDispatch(assistantMessage, currentContext, config, signal));
+	const resolvePerCallSafetyFlag = (
+		metadata: AgentTool<any>["interruptible"],
+		args: Record<string, unknown>,
+	): boolean => {
+		if (typeof metadata !== "function") return metadata === true;
+		try {
+			// Resolve against the prepared (possibly hook-revised) arguments so the
+			// policy describes the call that will actually run.
+			return metadata(args) === true;
+		} catch {
+			// Safety metadata is opt-in; resolver failures never grant it.
+			return false;
+		}
+	};
 
 	const records = toolCalls.map(toolCall => {
 		const prepared = preparedDispatch.get(toolCall.id) ?? {
@@ -2427,25 +2443,34 @@ async function executeToolCalls(
 			args: toolCall.arguments as Record<string, unknown>,
 		};
 		const { tool, args } = prepared;
-		const interruptibleMode = tool?.interruptible;
-		let interruptible = false;
-		if (typeof interruptibleMode === "function") {
+		const interruptible = resolvePerCallSafetyFlag(tool?.interruptible, args);
+		const steeringYieldable = resolvePerCallSafetyFlag(tool?.steeringYieldable, args);
+		const steeringYieldPreparationAttempted =
+			interruptMode === "blocking" &&
+			tool?.prepareSteeringYield !== undefined &&
+			prepared.validationErrorMessage === undefined &&
+			prepared.blocked !== true &&
+			prepared.prepareError === undefined;
+		let steeringYieldLease: SteeringYieldLease | undefined;
+		if (steeringYieldPreparationAttempted) {
 			try {
-				// Resolved from the prepared (possibly hook-revised) args so an
-				// argument-dependent policy governs the call that actually runs.
-				interruptible = interruptibleMode(args);
+				const candidate = tool.prepareSteeringYield?.(args);
+				if (candidate !== undefined && typeof candidate.release === "function") {
+					steeringYieldLease = candidate;
+				}
 			} catch {
-				// Resolver failures default to preserving the tool's outcome.
-				interruptible = false;
+				// Reservation is opt-in eligibility. A failed preparation attempt
+				// must neither break execution nor make this batch interruptible.
 			}
-		} else {
-			interruptible = interruptibleMode === true;
 		}
 		return {
 			toolCall,
 			tool,
 			args,
 			interruptible,
+			steeringYieldable,
+			steeringYieldPreparationAttempted,
+			steeringYieldLease,
 			signal: interruptible ? interruptibleSignal : nonInterruptibleSignal,
 			started: false,
 			result: undefined as AgentToolResult<any> | undefined,
@@ -2459,11 +2484,16 @@ async function executeToolCalls(
 			prepareError: prepared.prepareError,
 		};
 	});
+	const batchCanYieldSafely = records.some(
+		record => record.interruptible || record.steeringYieldable || record.steeringYieldLease !== undefined,
+	);
+	const watchBatchForInterrupts =
+		interruptMode === "immediate" || (interruptMode === "blocking" && batchCanYieldSafely);
 
 	const checkIrcInterrupts = async (): Promise<void> => {
 		// IRC only fires once: a peer interrupt already recorded on interruptState
 		// must not re-abort, and (unlike steering) never re-consumes a queue.
-		if (!shouldInterruptImmediately || signal?.aborted || interruptState.triggered) return;
+		if (!watchBatchForInterrupts || signal?.aborted || interruptState.triggered) return;
 		if (hasIrcInterrupts && (await hasIrcInterrupts())) {
 			// Peer IRC hard-aborts interruptible waits only; foreground tools keep
 			// running (no partial side effects) but get the cooperative soft
@@ -2479,7 +2509,7 @@ async function executeToolCalls(
 		// `signal` (external/user abort) is checked separately from the internal
 		// abort controllers: once the run is externally aborted it is unwinding
 		// and the interrupt would be redundant.
-		if (!shouldInterruptImmediately || signal?.aborted) {
+		if (!watchBatchForInterrupts || signal?.aborted) {
 			return;
 		}
 		// Mid-batch steering detection must be non-consuming. If a direct
@@ -2557,173 +2587,143 @@ async function executeToolCalls(
 		stream.push({ type: "message_end", message: toolResultMessage });
 	};
 
-	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
-		// A pending interrupt preempts not-yet-started *interruptible* waits so
-		// the message injects promptly instead of sitting out a `hub wait`.
-		// Non-interruptible work is never skipped, whatever the source: the
-		// expensive part — generating the call — is already paid, the tool
-		// itself is cheap, and a skip only makes the model re-emit the same
-		// call after the steer lands (#10439). The same guarantee is what keeps
-		// a batched `todo`/`write` queued behind an aborted wait alive (#7493)
-		// and lets a subagent's already-emitted terminal `yield` commit when
-		// the parent steers mid-stream (#10645). The steer still injects at the
-		// batch boundary; the cooperative soft signal lets long-running tools
-		// step aside on their own.
-		if (interruptState.triggered && record.interruptible) {
-			// Skip both span emission and the collector orphan record here. The
-			// tail sweep below (after `Promise.allSettled`) is the single path
-			// that handles "no result message was produced" — it calls
-			// `recordSkippedTool` and `emitToolResult` once per record, so any
-			// work we did here would double-count.
-			record.skipped = true;
-			return;
+	const releaseSteeringYieldLease = (record: (typeof records)[number]): void => {
+		const lease = record.steeringYieldLease;
+		// Clear first so every loop-owned cleanup path is idempotent even when a
+		// third-party lease violates its own idempotency contract by throwing.
+		record.steeringYieldLease = undefined;
+		if (!lease) return;
+		try {
+			lease.release();
+		} catch {
+			// Cleanup must never replace the real tool result or error.
 		}
-		// Park before starting this tool while the process-wide pause gate is
-		// engaged. Tools already executing are unaffected (pausing never aborts);
-		// a batch interrupted mid-pause unwinds via the signal checks below.
-		if (agentPauseGate.paused) await agentPauseGate.waitUntilResumed(record.signal);
+	};
 
-		const { toolCall, tool } = record;
-		// Validation (and the beforeToolCall hook) ran in the prepare phase; a
-		// failure recorded there surfaces here at the record's scheduled slot so
-		// result emission keeps batch order.
-		if (record.validationErrorMessage !== undefined) {
-			emitToolResult(
-				record,
-				{
-					content: [{ type: "text" as const, text: record.validationErrorMessage }],
-					details: { isError: true, error: record.validationErrorMessage },
-				},
-				true,
-			);
-			return;
-		}
-		const effectiveArgs = record.args;
-		if (record.signal.aborted) {
-			record.skipped = true;
-			recordSkippedTool(telemetry, {
+	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
+		try {
+			if (interruptState.triggered && record.interruptible) {
+				// Steering may bypass a passive wait, never already-emitted useful work.
+				// Cooperative calls still execute with the soft signal already set
+				// so they can start their work and yield without losing it.
+				// Skip both span emission and the collector orphan record here. The
+				// tail sweep below (after `Promise.allSettled`) is the single path
+				// that handles "no result message was produced" — it calls
+				// `recordSkippedTool` and `emitToolResult` once per record, so any
+				// work we did here would double-count.
+				record.skipped = true;
+				return;
+			}
+			// Park before starting this tool while the process-wide pause gate is
+			// engaged. Tools already executing are unaffected (pausing never aborts);
+			// a batch interrupted mid-pause unwinds via the signal checks below.
+			if (agentPauseGate.paused) await agentPauseGate.waitUntilResumed(record.signal);
+
+			const { toolCall, tool } = record;
+			// Validation (and the beforeToolCall hook) ran in the prepare phase; a
+			// failure recorded there surfaces here at the record's scheduled slot so
+			// result emission keeps batch order.
+			if (record.validationErrorMessage !== undefined) {
+				emitToolResult(
+					record,
+					{
+						content: [{ type: "text" as const, text: record.validationErrorMessage }],
+						details: { isError: true, error: record.validationErrorMessage },
+					},
+					true,
+				);
+				return;
+			}
+			const effectiveArgs = record.args;
+			if (record.signal.aborted) {
+				record.skipped = true;
+				recordSkippedTool(telemetry, {
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					status: "aborted",
+				});
+				emitToolResult(record, createToolSignalAbortedResult(record.signal), true);
+				return;
+			}
+			record.started = true;
+			stream.push({
+				type: "tool_execution_start",
 				toolCallId: toolCall.id,
 				toolName: toolCall.name,
-				status: "aborted",
+				args: effectiveArgs,
+				intent: toolCall.intent,
 			});
-			emitToolResult(record, createToolSignalAbortedResult(record.signal), true);
-			return;
-		}
-		record.started = true;
-		stream.push({
-			type: "tool_execution_start",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			args: effectiveArgs,
-			intent: toolCall.intent,
-		});
 
-		const toolSpan = startExecuteToolSpan(telemetry, {
-			tool,
-			toolName: toolCall.name,
-			toolCallId: toolCall.id,
-			args: effectiveArgs,
-			parent: invokeAgentSpan,
-		});
-		if (toolSpan && toolCall.intent) {
-			toolSpan.setAttribute(PiGenAIAttr.ToolCallIntent, toolCall.intent);
-		}
-
-		let result: AgentToolResult<any> = { content: [], details: {} };
-		let isError = false;
-		let caughtError: unknown;
-		let completedToolExecution = false;
-		let executionStarted = false;
-
-		await runInActiveSpan(toolSpan, async () => {
-			try {
-				if (!tool) throw new Error(`Tool ${toolCall.name} not found`);
-				if (record.signal.aborted) {
-					result = createToolSignalAbortedResult(record.signal);
-					isError = true;
-					return;
-				}
-
-				if (record.prepareError !== undefined) throw record.prepareError;
-				if (record.blocked) {
-					throw new ToolCallBlockedError(record.blockReason);
-				}
-				const executionArgs = transformToolCallArguments
-					? transformToolCallArguments(effectiveArgs, toolCall.name)
-					: effectiveArgs;
-				record.args = executionArgs;
-
-				// The cooperative steering signal rides the loop-owned
-				// ToolCallContext (surfacing as `ctx.toolCall.steeringSignal`):
-				// AgentToolContext itself is app-built via declaration merging, so
-				// the loop cannot construct or extend one structurally.
-				const toolContext = getToolContext
-					? getToolContext({
-							batchId,
-							index,
-							total: toolCalls.length,
-							toolCalls: toolCallInfos,
-							steeringSignal: steeringSoftController.signal,
-							providerMetadata: toolCall.providerMetadata,
-						})
-					: undefined;
-				executionStarted = true;
-				const rawResult = await tool.execute(
-					toolCall.id,
-					executionArgs,
-					record.signal,
-					partialResult => {
-						stream.push({
-							type: "tool_execution_update",
-							toolCallId: toolCall.id,
-							toolName: toolCall.name,
-							args: executionArgs,
-							partialResult: coerceToolResult(partialResult).result,
-						});
-					},
-					toolContext,
-				);
-				completedToolExecution = true;
-				const coerced = coerceToolResult(rawResult);
-				result = coerced.result;
-				if (coerced.malformed || result.isError) isError = true;
-			} catch (e) {
-				caughtError = e;
-				result = {
-					content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }],
-					details: {},
-				};
-				isError = true;
+			const toolSpan = startExecuteToolSpan(telemetry, {
+				tool,
+				toolName: toolCall.name,
+				toolCallId: toolCall.id,
+				args: effectiveArgs,
+				parent: invokeAgentSpan,
+			});
+			if (toolSpan && toolCall.intent) {
+				toolSpan.setAttribute(PiGenAIAttr.ToolCallIntent, toolCall.intent);
 			}
 
-			if (afterToolCall && (!record.signal.aborted || completedToolExecution)) {
+			let result: AgentToolResult<any> = { content: [], details: {} };
+			let isError = false;
+			let caughtError: unknown;
+			let completedToolExecution = false;
+			let executionStarted = false;
+
+			await runInActiveSpan(toolSpan, async () => {
 				try {
-					const after = await afterToolCall(
-						{
-							assistantMessage,
-							toolCall,
-							args: record.args,
-							result,
-							isError,
-							context: currentContext,
-						},
-						record.signal,
-					);
-					if (after) {
-						// Re-normalize the post-hook result: `afterToolCall` is untyped user/extension
-						// code and may return malformed `content` (non-array / invalid blocks), which
-						// would otherwise be persisted verbatim and corrupt the session — the same
-						// hazard `coerceToolResult` guards on the execute path.
-						const coerced = coerceToolResult({
-							content: after.content ?? result.content,
-							details: after.details ?? result.details,
-							isError: after.isError ?? result.isError,
-							providerMetadata: after.providerMetadata ?? result.providerMetadata,
-							useless: after.useless ?? result.useless,
-						});
-						result = coerced.result;
-						isError = coerced.malformed || (after.isError ?? isError);
+					if (!tool) throw new Error(`Tool ${toolCall.name} not found`);
+					if (record.signal.aborted) {
+						result = createToolSignalAbortedResult(record.signal);
+						isError = true;
+						return;
 					}
+
+					if (record.prepareError !== undefined) throw record.prepareError;
+					if (record.blocked) {
+						throw new ToolCallBlockedError(record.blockReason);
+					}
+					const executionArgs = transformToolCallArguments
+						? transformToolCallArguments(effectiveArgs, toolCall.name)
+						: effectiveArgs;
+					record.args = executionArgs;
+
+					const loopToolCallContext: ToolCallContext = {
+						batchId,
+						index,
+						total: toolCalls.length,
+						toolCalls: toolCallInfos,
+						steeringYieldPreparationAttempted: record.steeringYieldPreparationAttempted,
+						steeringYieldLease: record.steeringYieldLease,
+						steeringSignal: steeringSoftController.signal,
+						providerMetadata: toolCall.providerMetadata,
+					};
+					const appToolContext = getToolContext?.(loopToolCallContext);
+					const toolContext: AgentToolContext =
+						appToolContext?.toolCall === loopToolCallContext
+							? appToolContext
+							: ({ ...appToolContext, toolCall: loopToolCallContext } as AgentToolContext);
+					executionStarted = true;
+					const rawResult = await tool.execute(
+						toolCall.id,
+						executionArgs,
+						record.signal,
+						partialResult => {
+							stream.push({
+								type: "tool_execution_update",
+								toolCallId: toolCall.id,
+								toolName: toolCall.name,
+								args: executionArgs,
+								partialResult: coerceToolResult(partialResult).result,
+							});
+						},
+						toolContext,
+					);
+					completedToolExecution = true;
+					const coerced = coerceToolResult(rawResult);
+					result = coerced.result;
+					if (coerced.malformed || result.isError) isError = true;
 				} catch (e) {
 					caughtError = e;
 					result = {
@@ -2732,50 +2732,89 @@ async function executeToolCalls(
 					};
 					isError = true;
 				}
+
+				if (afterToolCall && (!record.signal.aborted || completedToolExecution)) {
+					try {
+						const after = await afterToolCall(
+							{
+								assistantMessage,
+								toolCall,
+								args: record.args,
+								result,
+								isError,
+								context: currentContext,
+							},
+							record.signal,
+						);
+						if (after) {
+							// Re-normalize the post-hook result: `afterToolCall` is untyped user/extension
+							// code and may return malformed `content` (non-array / invalid blocks), which
+							// would otherwise be persisted verbatim and corrupt the session — the same
+							// hazard `coerceToolResult` guards on the execute path.
+							const coerced = coerceToolResult({
+								content: after.content ?? result.content,
+								details: after.details ?? result.details,
+								isError: after.isError ?? result.isError,
+								providerMetadata: after.providerMetadata ?? result.providerMetadata,
+								useless: after.useless ?? result.useless,
+							});
+							result = coerced.result;
+							isError = coerced.malformed || (after.isError ?? isError);
+						}
+					} catch (e) {
+						caughtError = e;
+						result = {
+							content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }],
+							details: {},
+						};
+						isError = true;
+					}
+				}
+			});
+
+			const interrupted = interruptState.triggered;
+			const perToolAborted = record.signal.aborted;
+			const abortedDuringExecution = perToolAborted && isError && !completedToolExecution;
+			if (interrupted && abortedDuringExecution) {
+				// Execution may have performed partial work before throwing on abort;
+				// preserve that distinction in the placeholder metadata.
+				record.skipped = true;
+				emitToolResult(record, createSkippedToolResult(interruptState.source, executionStarted), true);
+			} else {
+				// No interrupt on this signal, or the tool finished before the interrupt landed
+				// (`completedToolExecution`) — even if the signal aborted around completion. Keep
+				// its real result: a completed tool already ran its side effects, so the model must
+				// see what actually happened (a genuine non-zero exit / error result) rather than a
+				// false "skipped" that discards work the tool performed (#4752). A peer-IRC interrupt
+				// on the batch leaves non-interruptible tools' signals untouched — their genuine
+				// errors survive here too.
+				emitToolResult(record, result, isError);
 			}
-		});
 
-		const interrupted = interruptState.triggered;
-		const perToolAborted = record.signal.aborted;
-		const abortedDuringExecution = perToolAborted && isError && !completedToolExecution;
-		if (interrupted && abortedDuringExecution) {
-			// This tool's own signal fired AND it failed to produce a result. The
-			// execution may already have performed partial work before throwing on
-			// abort, so preserve that distinction in the placeholder metadata.
-			record.skipped = true;
-			emitToolResult(record, createSkippedToolResult(interruptState.source, executionStarted), true);
-		} else {
-			// No interrupt on this signal, or the tool finished before the interrupt landed
-			// (`completedToolExecution`) — even if the signal aborted around completion. Keep
-			// its real result: a completed tool already ran its side effects, so the model must
-			// see what actually happened (a genuine non-zero exit / error result) rather than a
-			// false "skipped" that discards work the tool performed (#4752). A peer-IRC interrupt
-			// on the batch leaves non-interruptible tools' signals untouched — their genuine
-			// errors survive here too.
-			emitToolResult(record, result, isError);
+			const firstTextBlock = result.content?.[0];
+			const errorMessageForSpan =
+				caughtError === undefined && isError && firstTextBlock?.type === "text" ? firstTextBlock.text : undefined;
+			const status = abortedDuringExecution
+				? "aborted"
+				: caughtError instanceof ToolCallBlockedError
+					? "blocked"
+					: isError
+						? "error"
+						: "ok";
+			finishExecuteToolSpan(telemetry, toolSpan, {
+				result,
+				isError,
+				status,
+				errorMessage: errorMessageForSpan,
+				errorObject: caughtError,
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+			});
+
+			if (watchBatchForInterrupts) await checkSteering();
+		} finally {
+			releaseSteeringYieldLease(record);
 		}
-
-		const firstTextBlock = result.content?.[0];
-		const errorMessageForSpan =
-			caughtError === undefined && isError && firstTextBlock?.type === "text" ? firstTextBlock.text : undefined;
-		const status = abortedDuringExecution
-			? "aborted"
-			: caughtError instanceof ToolCallBlockedError
-				? "blocked"
-				: isError
-					? "error"
-					: "ok";
-		finishExecuteToolSpan(telemetry, toolSpan, {
-			result,
-			isError,
-			status,
-			errorMessage: errorMessageForSpan,
-			errorObject: caughtError,
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-		});
-
-		await checkSteering();
 	};
 
 	let lastExclusive: Promise<void> = Promise.resolve();
@@ -2784,14 +2823,17 @@ async function executeToolCalls(
 
 	// While tool calls are in flight, queued steering or interrupting IRC would
 	// otherwise wait out the tools' own window. Poll only non-consuming queues:
-	// detection hard-aborts interruptible waits (running or not yet started)
-	// and soft-signals cooperative tools (auto-background bash), so the boundary
-	// dequeue below injects the message promptly. Gated on immediate-interrupt
-	// mode; checkSteering is idempotent (no-op once triggered).
-	const watchSteeringWhileRunning =
-		shouldInterruptImmediately && (hasSteeringMessages !== undefined || hasIrcInterrupts !== undefined);
+	// detection hard-aborts interruptible waits, soft-signals cooperative tools
+	// (auto-background bash), and skips only not-yet-started passive waits,
+	// so the boundary dequeue below injects the message once
+	// preserved work settles. In `immediate` mode every batch
+	// is watched; in `blocking` mode the batch must contain a hard-interruptible,
+	// metadata-declared cooperatively-yieldable, or successfully reserved call. `wait`
+	// mode never watches. checkSteering is idempotent (no-op once triggered).
+	const watchInterruptsWhileRunning =
+		watchBatchForInterrupts && (hasSteeringMessages !== undefined || hasIrcInterrupts !== undefined);
 	const eventDrivenSteeringWatch =
-		watchSteeringWhileRunning && config.waitForSteeringMessages !== undefined && hasSteeringMessages !== undefined;
+		watchInterruptsWhileRunning && config.waitForSteeringMessages !== undefined && hasSteeringMessages !== undefined;
 	const steeringWatchAbortController = new AbortController();
 	const steeringWatchSignal = signal
 		? AbortSignal.any([signal, steeringWatchAbortController.signal])
@@ -2832,7 +2874,7 @@ async function executeToolCalls(
 	// callback. Keep its established timer fallback when that queue is present;
 	// system steering uses the event-driven path above and does not poll.
 	const steeringWatchTimer =
-		watchSteeringWhileRunning && (!eventDrivenSteeringWatch || hasIrcInterrupts !== undefined)
+		watchInterruptsWhileRunning && (!eventDrivenSteeringWatch || hasIrcInterrupts !== undefined)
 			? setInterval(
 					() => void (eventDrivenSteeringWatch ? checkIrcInterrupts() : checkSteering()),
 					STEERING_INTERRUPT_POLL_MS,
@@ -2871,6 +2913,7 @@ async function executeToolCalls(
 		steeringWatchAbortController.abort();
 		await steeringWatchPromise?.catch(() => undefined);
 		clearInterval(steeringWatchTimer);
+		for (const record of records) releaseSteeringYieldLease(record);
 	}
 	// Yield after batch tool execution to let GC and I/O catch up,
 	// especially when tool results are large (e.g. bash output).

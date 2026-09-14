@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { createAutoresearchExtension } from "@oh-my-pi/pi-coding-agent/autoresearch";
-import { closeAllAutoresearchStorages } from "@oh-my-pi/pi-coding-agent/autoresearch/storage";
+import { closeAllAutoresearchStorages, openAutoresearchStorage } from "@oh-my-pi/pi-coding-agent/autoresearch/storage";
 import type {
+	AgentEndEvent,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	ExtensionAPI,
@@ -9,7 +10,7 @@ import type {
 	ExtensionHandler,
 	SessionStartEvent,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
-import type { VcsGitRepo } from "@oh-my-pi/pi-natives";
+import type { VcsRepo } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -19,12 +20,47 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 
 interface CapturedHandlers {
 	session_start?: ExtensionHandler<SessionStartEvent>;
+	agent_end?: ExtensionHandler<AgentEndEvent>;
 	before_agent_start?: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>;
 }
 
-function buildHarness(): { handlers: CapturedHandlers; activeTools: string[] } {
+interface SentMessage {
+	message: unknown;
+	options: unknown;
+}
+
+function repositoryFixture(cwd: string): VcsRepo {
+	const unexpected = (): never => {
+		throw new Error("Unexpected repository operation in autoresearch handler fixture");
+	};
+	return {
+		root: () => cwd,
+		label: async () => "autoresearch/test",
+		kind: unexpected,
+		primaryRoot: unexpected,
+		prefixOf: unexpected,
+		watchTarget: unexpected,
+		supports: unexpected,
+		asGit: unexpected,
+		asJj: unexpected,
+		headId: unexpected,
+		statusSummary: unexpected,
+		statusPorcelain: unexpected,
+		diffText: unexpected,
+		changedFiles: unexpected,
+		numstat: unexpected,
+		uncommittedDiff: unexpected,
+		logSubjects: unexpected,
+		logOnelines: unexpected,
+		commitDetails: unexpected,
+		lsFiles: unexpected,
+	};
+}
+
+function buildHarness(): { handlers: CapturedHandlers; activeTools: string[]; sentMessages: SentMessage[] } {
 	const handlers: CapturedHandlers = {};
 	const activeTools: string[] = [];
+	const sentMessages: SentMessage[] = [];
 	const api = {
 		appendEntry(): void {},
 		exec: async () => ({ code: 0, stderr: "", stdout: "" }),
@@ -39,20 +75,22 @@ function buildHarness(): { handlers: CapturedHandlers; activeTools: string[] } {
 			activeTools.splice(0, activeTools.length, ...names);
 		},
 		sendUserMessage(): void {},
-		sendMessage(): void {},
+		sendMessage(message: unknown, options: unknown): void {
+			sentMessages.push({ message, options });
+		},
 	} as unknown as ExtensionAPI;
 	createAutoresearchExtension(api);
-	return { handlers, activeTools };
+	return { handlers, activeTools, sentMessages };
 }
 
-function makeCtx(cwd: string): ExtensionContext {
+function makeCtx(cwd: string, pendingMessages: string[] = []): ExtensionContext {
 	return {
 		cwd,
 		hasUI: false,
-		hasPendingMessages: () => false,
+		hasPendingMessages: () => pendingMessages.length > 0,
 		sessionManager: {
 			getSessionId: () => "session-bas-test",
-			getBranch: () => [
+			getBranchAsync: async () => [
 				{
 					type: "custom",
 					customType: "autoresearch-control",
@@ -74,25 +112,18 @@ describe("autoresearch before_agent_start handler", () => {
 		dbDir = TempDir.createSync("@pi-autoresearch-bas-test-");
 		process.env.OMP_AUTORESEARCH_DB_DIR = dbDir.path();
 		cwdDir = TempDir.createSync("@pi-autoresearch-bas-cwd-");
-		vi.spyOn(vcs, "git").mockReturnValue({
-			currentBranch: async () => "autoresearch/test",
-		} as unknown as VcsGitRepo);
-		vi.spyOn(vcs, "gitInfo").mockReturnValue({
-			commonDir: `${cwdDir.path()}/.git`,
-			gitDir: `${cwdDir.path()}/.git`,
-			gitEntryPath: `${cwdDir.path()}/.git`,
-			headPath: `${cwdDir.path()}/.git/HEAD`,
-			isReftable: false,
-			repoRoot: cwdDir.path(),
-		});
+		vi.spyOn(vcs, "repo").mockReturnValue(repositoryFixture(cwdDir.path()));
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		delete process.env.OMP_AUTORESEARCH_DB_DIR;
 		closeAllAutoresearchStorages();
-		cwdDir.removeSync();
-		dbDir.removeSync();
-		vi.restoreAllMocks();
+		try {
+			await cwdDir.remove();
+			await dbDir.remove();
+		} finally {
+			vi.restoreAllMocks();
+		}
 	});
 
 	it("renders an autoresearch block when event.systemPrompt is undefined (issue #3665)", async () => {
@@ -141,5 +172,89 @@ describe("autoresearch before_agent_start handler", () => {
 		expect(result).toBeDefined();
 		const rendered = (result.systemPrompt as string[])[0];
 		expect(rendered.startsWith("alpha block\n\nbeta block")).toBe(true);
+	});
+});
+
+describe("autoresearch agent_end handler", () => {
+	let dbDir: TempDir;
+	let cwdDir: TempDir;
+
+	beforeEach(() => {
+		dbDir = TempDir.createSync("@pi-autoresearch-agent-end-test-");
+		process.env.OMP_AUTORESEARCH_DB_DIR = dbDir.path();
+		cwdDir = TempDir.createSync("@pi-autoresearch-agent-end-cwd-");
+		vi.spyOn(vcs, "repo").mockReturnValue(repositoryFixture(cwdDir.path()));
+	});
+
+	afterEach(async () => {
+		delete process.env.OMP_AUTORESEARCH_DB_DIR;
+		closeAllAutoresearchStorages();
+		try {
+			await cwdDir.remove();
+			await dbDir.remove();
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("queues one hidden continuation alongside unrelated pending messages", async () => {
+		const storage = await openAutoresearchStorage(cwdDir.path());
+		const session = storage.openSession({
+			name: "speed",
+			goal: "speed up the thing",
+			primaryMetric: "runtime_ms",
+			metricUnit: "ms",
+			direction: "lower",
+			preferredCommand: "bun run bench",
+			branch: "autoresearch/test",
+			baselineCommit: "abc1234",
+			maxIterations: null,
+			scopePaths: [],
+			offLimits: [],
+			constraints: [],
+			secondaryMetrics: [],
+		});
+		const run = storage.insertRun({
+			sessionId: session.id,
+			segment: 0,
+			command: "bun run bench",
+			logPath: "/tmp/run.log",
+			preRunDirtyPaths: [],
+			startedAt: 1,
+		});
+		storage.markRunCompleted({
+			runId: run.id,
+			completedAt: 2,
+			durationMs: 1,
+			exitCode: 0,
+			timedOut: false,
+			parsedPrimary: 100,
+			parsedMetrics: { runtime_ms: 100 },
+			parsedAsi: null,
+		});
+
+		const { handlers, sentMessages } = buildHarness();
+		if (!handlers.session_start || !handlers.agent_end) {
+			throw new Error("Autoresearch extension should register both session_start and agent_end");
+		}
+		const pendingMessages = ["unrelated queued user work"];
+		const ctx = makeCtx(cwdDir.path(), pendingMessages);
+		await handlers.session_start({ type: "session_start" } as SessionStartEvent, ctx);
+
+		const event = { type: "agent_end", messages: [] } as AgentEndEvent;
+		await handlers.agent_end(event, ctx);
+		await handlers.agent_end(event, ctx);
+
+		expect(sentMessages).toEqual([
+			{
+				message: expect.objectContaining({
+					customType: "autoresearch-resume",
+					display: false,
+					attribution: "agent",
+				}),
+				options: { deliverAs: "nextTurn", triggerTurn: true },
+			},
+		]);
+		expect(pendingMessages).toEqual(["unrelated queued user work"]);
 	});
 });

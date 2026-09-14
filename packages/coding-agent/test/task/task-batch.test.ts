@@ -781,6 +781,7 @@ describe("task.batch spawning", () => {
 		});
 		const sourceFile = manager.getSessionFile();
 		if (!sourceFile) throw new Error("expected session file");
+		const readBranch = vi.spyOn(manager, "getBranchAsync");
 		const seen: Array<{
 			sourceFile: string | null;
 			sourceLeafId: string | null;
@@ -825,7 +826,8 @@ describe("task.batch spawning", () => {
 			}),
 		);
 		const result = await tool.execute("tc-captured", { agent: "task", task: "Do it.", source: "fork" } as TaskParams);
-		// The fork context was captured synchronously at scheduling time and
+		expect(readBranch).toHaveBeenCalledTimes(1);
+		// The full fork branch was captured before scheduling and
 		// handed to the executor as a deep-cloned snapshot.
 		await executorReached.promise;
 		expect(seen).toHaveLength(1);

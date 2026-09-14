@@ -442,10 +442,10 @@ function getTextContentParts(content: unknown): string[] {
 	return parts;
 }
 
-function findRecentPrRefs(ctx: HookCommandContext, limit: number): ReviewPrRef[] {
+async function findRecentPrRefs(ctx: HookCommandContext, limit: number): Promise<ReviewPrRef[]> {
 	const refs: ReviewPrRef[] = [];
 	const seen = new Set<string>();
-	const entries = ctx.sessionManager.getBranch();
+	const entries = await ctx.sessionManager.getBranchAsync();
 
 	for (let idx = entries.length - 1; idx >= 0 && refs.length < limit; idx--) {
 		const entry = entries[idx];
@@ -490,7 +490,7 @@ export class ReviewCommand implements CustomCommand {
 		}
 
 		const choices: Array<{ label: string; value: ReviewMenuChoice }> = [
-			...findRecentPrRefs(ctx, REVIEW_CONTEXT_PR_LIMIT).map(ref => ({
+			...(await findRecentPrRefs(ctx, REVIEW_CONTEXT_PR_LIMIT)).map(ref => ({
 				label: `Review PR ${ref.repo}#${ref.number} from conversation`,
 				value: { kind: "detected-pr" as const, ref },
 			})),

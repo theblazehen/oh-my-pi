@@ -1,0 +1,476 @@
+#+TITLE: WhatsApp session bridge
+#+TODO: OPEN ACTIVE REVIEW PARKED | RESOLVED
+
+* ACTIVE Link OMP sessions into WhatsApp
+:PROPERTIES:
+:ID: tree-whatsapp-session-bridge
+:TREE_ROOT: t
+:TREE_VERSION: 1
+:SOURCE: user
+:END:
+The user is exploring what it would take to link a live OMP session into a
+WhatsApp surface: "Think lorewire - but maybe direct connect, though??" The
+initial shape is a WhatsApp Community containing multiple groups, with the
+possibility of addressing a session like a subagent and borrowing from
+cross-process IRC. They then sharpened the requirement: "smth that used the omp
+rpc as a manager" and, because the manager is external, it must "follow and get
+responses and such live without agent need poll." The immediate goal is to
+choose the right event-driven architecture and understand its difficulty. The
+discussion converged on a central supervisor owning isolated per-session RPC
+workers, with TUI and WhatsApp as attachable frontends and a simple always-wake
+peer conversation layer.
+
+** RESOLVED WhatsApp Community as session topology
+:PROPERTIES:
+:ID: whatsapp-community-topology
+:SOURCE: user
+:END:
+The user proposed allocating a WhatsApp Community with multiple groups. The
+bot account is invited to one configured Community, and every linked subgroup
+should then be discovered by the manager and become eligible for mapping to an
+OMP session. The user settled the cardinality: "each group should be one
+session." Community parentage is therefore discovery/admission, the subgroup
+JID is the stable frontend identity, and each mapped subgroup points to exactly
+one durable OMP session.
+
+** ACTIVE Lorewire-like brokered bridge
+:PROPERTIES:
+:ID: option-lorewire-broker
+:SOURCE: user
+:END:
+Use Lorewire as the comparison point: sessions register presence and routing in
+a shared broker, while WhatsApp becomes another transport-facing edge. The user
+has not rejected it, but the later no-polling requirement makes its current OMP
+extension's two-second receive polling less attractive as the primary live
+transport. It remains a possible discovery or compatibility layer.
+
+** REVIEW Direct WhatsApp connection
+:PROPERTIES:
+:ID: option-direct-whatsapp
+:SOURCE: user
+:END:
+The user explicitly raised "maybe direct connect" as an alternative. Current
+evidence favors one durable WhatsApp edge owning credentials and webhook state;
+"direct" would mean an OMP manager talking directly to that edge, not every OMP
+session opening its own WhatsApp linked-device connection. The user has not yet
+accepted or rejected this refinement.
+
+** ACTIVE Address sessions like subagents
+:PROPERTIES:
+:ID: session-addressability
+:SOURCE: user
+:END:
+The desired interaction may include addressing a live cross-process session as
+if it were a subagent. This raises identity, discovery, request/reply
+correlation, authorization, and delivery-state questions beyond ordinary group
+chat.
+
+** ACTIVE Cross-process IRC reuse
+:PROPERTIES:
+:ID: cross-process-irc-reuse
+:SOURCE: user
+:END:
+The user points to cross-process IRC as a likely reusable mechanism. We need to
+distinguish the in-process parent/subagent hub from a cross-process transport
+and decide whether WhatsApp should terminate directly into that routing layer
+or go through Lorewire.
+
+** REVIEW External OMP RPC manager
+:PROPERTIES:
+:ID: external-rpc-manager
+:SOURCE: user
+:INFORMED_BY: [[id:session-addressability]] [[id:cross-process-irc-reuse]]
+:END:
+The user initially proposed an external process that owns OMP through its RPC
+mode, then identified the decisive limitation: "The rpc probably wont work well
+if im attached via tui on a session though?" Their actual handoff is an existing
+TUI session used while coding on the PC, followed live from WhatsApp while away.
+RPC remains useful for manager-born headless sessions but cannot be the primary
+attachment mechanism for this workflow because it owns a separate stdio child.
+
+** ACTIVE Push delivery and live response following
+:PROPERTIES:
+:ID: live-push-delivery
+:SOURCE: user
+:DEPENDS_ON: [[id:external-rpc-manager]]
+:END:
+The user requires that the external integration "follow and get responses and
+such live without agent need poll." The transport therefore needs pushed
+WhatsApp inbound events and pushed OMP session events. Poll-based agent tools
+are not acceptable as the primary delivery mechanism; periodic heartbeats may
+still be used only for liveness.
+
+** OPEN Claw operating model
+:PROPERTIES:
+:ID: claw-model
+:SOURCE: user
+:END:
+The user asked us to consider "how claws work." The exact relevant properties
+need grounding: likely a persistent messaging-connected agent with a durable
+identity and one owned channel connection, rather than one messaging login per
+short-lived session.
+
+** RESOLVED Manager-owned group sessions without attachable TUI
+:PROPERTIES:
+:ID: manager-owned-group-sessions
+:SOURCE: agent
+:INFORMED_BY: [[id:whatsapp-community-topology]] [[id:external-rpc-manager]] [[id:live-push-delivery]]
+:END:
+Initially recommended as one durable manager owning the WhatsApp edge and one
+RPC child per group. It does not satisfy the clarified primary use case: "if im
+busy coding on my pc, then i wanna switch to mobile for a bit while im away from
+pc." It remains legal for explicitly headless sessions but is resolved as the
+wrong foundation for seamless handoff from an already-live TUI.
+
+** OPEN Manager-provided cross-session fabric
+:PROPERTIES:
+:ID: manager-cross-session-fabric
+:SOURCE: agent
+:INFORMED_BY: [[id:session-addressability]] [[id:cross-process-irc-reuse]] [[id:external-rpc-manager]]
+:END:
+For manager-owned sessions, cross-process addressability can be supplied as a
+host custom tool backed by the manager's registry. It needs separate
+fire-and-forget and correlated request/reply operations so an agent can either
+notify a peer or await a result without confusing the peer's WhatsApp-facing
+turn. This obtains subagent-like addressing without first changing the
+in-process hub. The user has not yet reacted to this option.
+
+** ACTIVE Attach arbitrary interactive sessions
+:PROPERTIES:
+:ID: attach-interactive-sessions
+:SOURCE: agent
+:INFORMED_BY: [[id:option-direct-whatsapp]] [[id:external-rpc-manager]]
+:END:
+The existing RPC client owns a child process over stdio and cannot attach to an
+already-running TUI session. The user confirmed this broader attachment mode is
+the point: continue a PC coding session from WhatsApp while away. They refined
+ownership to a hybrid: while a TUI owns the session, mobile traffic goes through
+that live host; when no TUI is attached, the WhatsApp manager temporarily hosts
+the exact session itself. This requires explicit ownership transfer rather than
+two processes opening the same JSONL. The existing collaboration host already
+demonstrates event replication and guest control, but not migratable ownership.
+
+** OPEN Reliability and conversation semantics
+:PROPERTIES:
+:ID: bridge-reliability-semantics
+:SOURCE: agent
+:DEPENDS_ON: [[id:local-live-session-broker]]
+:END:
+The main difficulty is not WhatsApp send/receive but durable orchestration:
+deduplicating best-effort webhooks, reconciling missed messages, serializing or
+steering concurrent turns, correlating final responses to inbound WhatsApp
+message IDs, surviving process restarts, and defining whether ordinary group
+conversation reaches the agent or only mentions and replies do. Session events
+lack one universal external-command correlation ID, so the manager and live
+adapter must own this state machine. The user has not yet reacted to these
+semantics.
+
+** ACTIVE Local live-session broker
+:PROPERTIES:
+:ID: local-live-session-broker
+:SOURCE: synthesis
+:INFORMED_BY: [[id:attach-interactive-sessions]] [[id:cross-process-irc-reuse]] [[id:live-push-delivery]]
+:END:
+The clarified design calls for a localhost broker plus an in-process OMP session
+adapter loaded by every top-level TUI. Each adapter registers stable session
+identity and metadata, pushes live session events, and receives prompt, steer,
+follow-up, abort, UI-response, and peer-message commands. The socket connection
+supplies presence without receive polling. Exactly one host owns a session at a
+time: normally the attached TUI, otherwise a manager-owned headless host after a
+fenced handoff. This can reuse collaboration replication semantics while
+replacing manually shared relay rooms with automatic local discovery.
+
+** ACTIVE Replace Lorewire with the same broker plane
+:PROPERTIES:
+:ID: replace-lorewire-broker-plane
+:SOURCE: user
+:DEPENDS_ON: [[id:local-live-session-broker]]
+:END:
+The user observed that the same cross-process coordination layer "could also
+replace lorewire and slot into the same place" even though hub/IRC is not needed
+for the first WhatsApp version. The broker should therefore separate a generic
+session registry/event/command protocol from transport adapters. WhatsApp is
+one frontend; cross-process peer messaging and an optional remote transport can
+later use the same registered identities without coupling WhatsApp to hub
+semantics. The user then added that, from the agent perspective, they want
+"speak to other agents and humans like i speak to subagents" to be a supported
+interaction. This makes a common participant/message model a real product goal,
+not merely a future transport seam. They subsequently narrowed the replacement
+scope: not all Lorewire behavior, only effectively "can my frontend and backend
+agents chat to each other." Local direct messaging and subscriptions are the
+target; federation, global identity, and full Lorewire rooms/roles are not.
+
+** ACTIVE Localhost webhook trust boundary
+:PROPERTIES:
+:ID: localhost-webhook-trust
+:SOURCE: user
+:END:
+The user rejected unnecessary webhook signing: "no need to sign the webhook its literally localhost."
+The wacli webhook and manager share the local machine, so the design should bind
+to loopback and omit application-level signing rather than add security
+ceremony outside the stated threat model.
+
+** ACTIVE Unified human and agent participants
+:PROPERTIES:
+:ID: unified-human-agent-participants
+:SOURCE: user
+:INFORMED_BY: [[id:session-addressability]] [[id:replace-lorewire-broker-plane]]
+:END:
+The user explicitly likes the agent-facing capability "speak to other agents
+and humans like i speak to subagents." The broker should model local subagents,
+remote OMP sessions, individual humans, and rooms as typed addressable
+participants behind the same list/send/ask/reply experience. Transport and
+provenance remain explicit: a WhatsApp human or room must not masquerade as an
+agent, and human latency means request/reply should usually yield an async
+handle rather than block an agent turn indefinitely. The user reaffirmed this
+direction while narrowing the immediate cross-process case to frontend and
+backend agents chatting.
+
+** RESOLVED Migratable single session ownership
+:PROPERTIES:
+:ID: migratable-session-ownership
+:SOURCE: user
+:INFORMED_BY: [[id:attach-interactive-sessions]] [[id:local-live-session-broker]]
+:END:
+The user proposed: "if tui is attached: it goes through there. If tui is gone,
+then the whatsapp manager temporarily takes it." This is the desired continuity
+model. It is sane only with one fenced owner and a drain/flush/release/acquire
+handoff. Socket disappearance alone cannot grant ownership because a broker
+restart or partition can disconnect a still-running writer. The current file
+writer does not visibly provide a cross-process advisory lock, so ownership
+must become an explicit core invariant before automatic takeover is safe. The
+user then raised a cleaner alternative: make every TUI and WhatsApp surface an
+attachment to one central RPC-oriented session supervisor. The final
+recommendation chooses that alternative, resolving migratable ownership out of
+the design because no frontend ever owns the session worker.
+
+** ACTIVE Subscribe to message sources
+:PROPERTIES:
+:ID: message-source-subscriptions
+:SOURCE: user
+:INFORMED_BY: [[id:unified-human-agent-participants]] [[id:replace-lorewire-broker-plane]]
+:END:
+The user wants agents to be able to say the equivalent of "subscribe to
+messages from here." The broker should support durable subscriptions to typed
+sources such as another session or a WhatsApp-backed room. They rejected the
+agent-proposed observe/mention distinction for the frontend/backend use case:
+this is direct operational conversation, such as frontend asking backend "hey
+how do i do this," and delivery should always wake the recipient and support a
+correlated reply. Loop prevention remains necessary, but passive event feeds
+are not the intended primitive.
+
+** RESOLVED Passive observe and mention subscription modes
+:PROPERTIES:
+:ID: passive-subscription-modes
+:SOURCE: agent
+:END:
+The agent proposed observe, mention, and wake modes using deployment/API-change
+event examples. The user rejected that framing: "Okay nah this is more like so
+frontend can ask backend 'hey how do i do this' which requires a wake and reply
+etc. always wake." The current design therefore treats delivered peer messages
+as conversations that wake, not passive telemetry subscriptions.
+
+** ACTIVE Central session supervisor with attached frontends
+:PROPERTIES:
+:ID: central-session-supervisor
+:SOURCE: user
+:INFORMED_BY: [[id:external-rpc-manager]] [[id:migratable-session-ownership]] [[id:unified-human-agent-participants]]
+:CHOSEN_FROM: [[id:migratable-session-ownership]] [[id:manager-owned-group-sessions]]
+:END:
+The user asked whether every session should instead be an attachment to one
+central RPC hub. Current RPC is not attachable: RpcClient spawns and owns one
+`omp --mode rpc` child over stdin/stdout, while that process owns one
+AgentSession and exits when stdin closes. The architectural version of the
+idea is a supervisor that owns one isolated RPC worker per session and exposes
+a separate multiplexed attachment protocol to TUI, WhatsApp, and other
+frontends. This eliminates TUI/manager ownership transfer and naturally
+centralizes peer routing, but requires turning the current TUI into a remote
+session client with adequate extension-UI parity. This is the agent's final
+recommendation: one supervisor, one isolated RPC worker per hot session, parked
+workers revived on frontend attachment or peer/human messages, and no raw RPC
+multi-attach.
+
+** ACTIVE Direct peer conversations always wake
+:PROPERTIES:
+:ID: direct-peer-wake-reply
+:SOURCE: user
+:INFORMED_BY: [[id:unified-human-agent-participants]] [[id:message-source-subscriptions]]
+:END:
+Frontend/backend communication is request/reply, not event observation. A
+direct send or subscribed source message wakes the receiving agent; an ask
+creates a correlated reply path so the sender can await it like a subagent or
+continue and receive the result asynchronously. Replies are routed only to the
+request thread rather than blindly rebroadcast. The user rejected deterministic
+request-graph or cycle machinery: agents should resolve conversational
+dependencies by chatting. The broker therefore needs only message/reply IDs,
+delivery, wake-up, and optional waiting—not a dependency scheduler.
+
+** RESOLVED Deterministic peer dependency graph
+:PROPERTIES:
+:ID: deterministic-peer-graph
+:SOURCE: agent
+:END:
+The agent raised cycle detection and deterministic request-graph handling for
+nested agent questions. The user rejected that complexity: "dw about
+deterministinc graph questions and such - the agents will figure it out from
+chatting rq." Peer coordination remains ordinary always-waking conversation
+with reply threading and optional waits.
+
+** ACTIVE Final recommended architecture
+:PROPERTIES:
+:ID: final-recommended-architecture
+:SOURCE: synthesis
+:DERIVED_FROM: [[id:central-session-supervisor]] [[id:whatsapp-community-topology]] [[id:direct-peer-wake-reply]] [[id:unified-human-agent-participants]]
+:END:
+Run one local OMP supervisor with one isolated RPC worker per active durable
+session. TUI, WhatsApp groups, and future frontends attach to the supervisor;
+workers remain authoritative and can be parked/revived independently of
+frontend lifetime. Each eligible Community subgroup maps one-to-one to a
+session. The supervisor supplies a common direct-message tool to workers so
+agents and humans can send, ask, reply, and subscribe; every delivered message
+wakes its recipient. Use current RPC internally for worker control, add a
+separate multiplexed snapshot/event attachment protocol for frontends, and do
+not implement full Lorewire federation or migratable TUI ownership.
+
+** ACTIVE Risk of breaking the daily driver
+:PROPERTIES:
+:ID: supervisor-migration-risk
+:SOURCE: user
+:DERIVED_FROM: [[id:final-recommended-architecture]] [[id:weakness-collab-coupling]] [[id:weakness-whatsapp-fidelity]]
+:END:
+The user asked "chances that we break it?" A big-bang replacement of direct TUI
+ownership is high-risk because InteractiveModeContext, extension UI, transcript
+rendering, session switching, tool lifecycle, and process cleanup currently
+share one process. Temporary development breakage is expected. The recommended
+rollout is an opt-in supervisor path that leaves the direct TUI daily driver
+available until PTY, reconnect, extension-dialog, subagent, and worker-crash
+parity is proven; this changes the risk from losing the daily driver to finding
+and fixing isolated supervisor-mode defects before cutover.
+
+** REVIEW Weaknesses in the brokered handoff plan
+:PROPERTIES:
+:ID: plan-weaknesses
+:SOURCE: user
+:END:
+The user asked "whats the weaknesses in that plan?" The main risks are runtime
+lifetime, deployment topology, ambiguous mapping identity, collab/core
+coupling, turn correlation, frontend mismatch, and scope creep from treating
+local coordination as a complete Lorewire replacement.
+
+*** OPEN TUI lifetime and machine availability
+:PROPERTIES:
+:ID: weakness-host-lifetime
+:SOURCE: agent
+:INFORMED_BY: [[id:attach-interactive-sessions]] [[id:local-live-session-broker]]
+:END:
+The TUI-owned session is reachable only while that process and machine remain
+alive, awake, and connected. Walking away works; closing the terminal, sleeping
+the PC, rebooting, or losing connectivity does not. Running the WhatsApp edge
+on another server immediately turns the supposedly local session socket into a
+cross-machine transport problem. The user has not yet reacted to this weakness.
+
+*** RESOLVED Ambiguous mapping identity across session switches
+:PROPERTIES:
+:ID: weakness-mapping-identity
+:SOURCE: agent
+:INFORMED_BY: [[id:whatsapp-community-topology]] [[id:attach-interactive-sessions]]
+:END:
+A group could have mapped to an exact conversation, live terminal slot, or
+project alias. The user resolved this with "each group should be one session."
+The stable mapping follows the exact session across host migration; switching a
+TUI to another session does not silently retarget the WhatsApp group.
+
+*** OPEN Collab extraction is not a small adapter
+:PROPERTIES:
+:ID: weakness-collab-coupling
+:SOURCE: agent
+:INFORMED_BY: [[id:local-live-session-broker]]
+:END:
+The current collaboration host is tightly coupled to InteractiveModeContext,
+status-line/UI state, the global agent registry, and a single mutable
+SessionManager append callback. An ordinary extension can observe many agent
+events but does not obviously own the entire replication and control surface.
+Creating a reusable bridge likely requires core refactoring and
+multi-subscriber session hooks, not merely a thin extension. The user has not
+yet reacted to this weakness.
+
+*** OPEN Turn correlation and multi-frontend races
+:PROPERTIES:
+:ID: weakness-turn-correlation
+:SOURCE: agent
+:INFORMED_BY: [[id:bridge-reliability-semantics]] [[id:local-live-session-broker]]
+:END:
+Agent events are not universally tagged with the external command that caused
+them, and an agent-end event may be followed by automatic continuation. Local
+and mobile inputs can race, UI requests can be answered twice, and reconnects
+can replay commands. Reliable results require command IDs, session epochs,
+turn ownership/correlation, deduplication, and one scheduling policy. The user
+has not yet reacted to this weakness.
+
+*** OPEN WhatsApp is a lossy session frontend
+:PROPERTIES:
+:ID: weakness-whatsapp-fidelity
+:SOURCE: agent
+:INFORMED_BY: [[id:live-push-delivery]]
+:END:
+WhatsApp cannot represent the full TUI: rich tool renderers, arbitrary extension
+dialogs, OAuth/browser flows, large diffs, streaming deltas, attachments, and
+interactive controls need reduction or fallback. Sending raw tool output also
+moves paths, code, or secrets into a durable third-party chat. The first version
+should expose remote prompts, compact status, selected UI requests, and final
+answers rather than promise terminal parity. The user has not yet reacted to
+this weakness.
+
+*** OPEN Community discovery is eventual and membership-limited
+:PROPERTIES:
+:ID: weakness-community-discovery
+:SOURCE: agent
+:INFORMED_BY: [[id:whatsapp-community-topology]]
+:END:
+Community association does not guarantee that the linked account receives every
+subgroup's messages; it must actually be joined where WhatsApp requires it.
+Hierarchy metadata is refreshed into wacli's local store, so automatic
+eligibility still needs control-plane reconciliation. Names are mutable and
+cannot be routing identity; mappings must use group JIDs. The user has not yet
+reacted to this weakness.
+
+*** OPEN Unified peers have unequal semantics
+:PROPERTIES:
+:ID: weakness-peer-semantic-mismatch
+:SOURCE: agent
+:INFORMED_BY: [[id:unified-human-agent-participants]]
+:END:
+Humans, rooms, local subagents, and remote agents can share an addressing UX but
+not identical runtime guarantees. Humans may answer hours later or never;
+rooms have many authors; agent messages can recurse into ping-pong loops; and
+presence means different things per transport. A common envelope must preserve
+participant kind, sender provenance, delivery state, reply threading, timeout,
+and hop/loop limits rather than pretending every destination is a synchronous
+subagent. The user has not yet reacted to this weakness.
+
+*** RESOLVED Lorewire replacement can swallow the project
+:PROPERTIES:
+:ID: weakness-lorewire-scope
+:SOURCE: agent
+:INFORMED_BY: [[id:replace-lorewire-broker-plane]]
+:END:
+A local persistent socket covers presence and live injection on one host, but a
+complete Lorewire replacement would require federation, global identity,
+rooms/roles, and offline delivery. The user explicitly narrowed the goal to
+"can my frontend and backend agents chat to each other." The current scope is
+therefore local/direct peer messaging plus subscriptions; transport seams may
+remain, but full Lorewire replacement is resolved out of scope.
+
+*** OPEN Takeover needs fencing and runtime reconstruction
+:PROPERTIES:
+:ID: weakness-takeover-fencing
+:SOURCE: agent
+:INFORMED_BY: [[id:migratable-session-ownership]]
+:END:
+The manager cannot infer safe ownership from a dropped socket alone. It must
+acquire an OS-backed lease with a monotonically increasing epoch after the prior
+host flushes and releases it; stale hosts must be unable to append or accept
+commands. A cold manager host also reconstructs persisted conversation rather
+than every ephemeral runtime detail, and cannot safely resume an interrupted
+tool call mid-side-effect. Clean idle handoff is straightforward; crash takeover
+needs recovery rules. The user has not yet reacted to this weakness.

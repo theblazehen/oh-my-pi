@@ -18,8 +18,8 @@ function createLoopContext(options: {
 				}
 			: undefined;
 	let loopPrompt: string | undefined = "original loop prompt";
-	const setLoopPrompt = vi.fn((prompt: string) => {
-		loopPrompt = prompt;
+	const finishLoopCommandSubmission = vi.fn((prompt: string, error?: unknown) => {
+		if (error === undefined) loopPrompt = prompt;
 	});
 	const prompt = vi.fn(async () => true);
 	const pauseLoop = vi.fn(() => {
@@ -59,7 +59,7 @@ function createLoopContext(options: {
 		set loopPrompt(value: string | undefined) {
 			loopPrompt = value;
 		},
-		setLoopPrompt,
+		finishLoopCommandSubmission,
 		pauseLoop,
 		flushPendingBashComponents: vi.fn(),
 		startPendingSubmission: vi.fn((input: { text: string }) => ({ ...input, cancelled: false, started: false })),
@@ -81,7 +81,7 @@ function createLoopContext(options: {
 	return {
 		ctx,
 		editor,
-		setLoopPrompt,
+		finishLoopCommandSubmission,
 		pauseLoop,
 		prompt,
 		getLoopPrompt: () => loopPrompt,
@@ -93,7 +93,7 @@ function createLoopContext(options: {
 
 describe("loop mode interjections", () => {
 	it("keeps the original loop prompt when steering mid-turn", async () => {
-		const { ctx, setLoopPrompt, prompt, getLoopPrompt } = createLoopContext({ isStreaming: true });
+		const { ctx, finishLoopCommandSubmission, prompt, getLoopPrompt } = createLoopContext({ isStreaming: true });
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 
@@ -101,25 +101,25 @@ describe("loop mode interjections", () => {
 
 		// One-off steer reaches the session but must not replace the loop body.
 		expect(prompt).toHaveBeenCalledTimes(1);
-		expect(setLoopPrompt).not.toHaveBeenCalled();
+		expect(finishLoopCommandSubmission).not.toHaveBeenCalled();
 		expect(getLoopPrompt()).toBe("original loop prompt");
 	});
 
-	it("adopts an idle submission as the new loop prompt", async () => {
+	it("keeps idle submissions distinct from the recurring prompt", async () => {
 		const onInputCallback = vi.fn();
-		const { ctx, setLoopPrompt } = createLoopContext({ isStreaming: false, onInputCallback });
+		const { ctx, finishLoopCommandSubmission } = createLoopContext({ isStreaming: false, onInputCallback });
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 
 		await ctx.editor.onSubmit?.("new loop body");
 
-		expect(setLoopPrompt).toHaveBeenCalledWith("new loop body");
+		expect(finishLoopCommandSubmission).not.toHaveBeenCalled();
 		expect(onInputCallback).toHaveBeenCalledTimes(1);
 	});
 
 	it("records an inline /loop prompt even while streaming", async () => {
-		const { ctx, setLoopPrompt, prompt, getLoopPrompt } = createLoopContext({ isStreaming: true });
-		// Mirror handleLoopCommand: enabling loop mode hands the inline prompt
+		const { ctx, finishLoopCommandSubmission, prompt, getLoopPrompt } = createLoopContext({ isStreaming: true });
+		// Mirror the command-owned prompt returned by handleLoopCommand:
 		// back to the dispatcher for normal submission.
 		(ctx as unknown as Record<string, unknown>).handleLoopCommand = vi.fn(async () => "inline loop body");
 		const controller = new InputController(ctx);
@@ -127,17 +127,17 @@ describe("loop mode interjections", () => {
 
 		await ctx.editor.onSubmit?.("/loop 3 inline loop body");
 
-		expect(setLoopPrompt).toHaveBeenCalledWith("inline loop body");
+		expect(finishLoopCommandSubmission).toHaveBeenCalledWith("inline loop body", undefined);
 		expect(getLoopPrompt()).toBe("inline loop body");
 		expect(prompt).toHaveBeenCalledTimes(1);
 	});
 
 	it("records an inline /loop prompt queued during compaction", async () => {
-		const { ctx, setLoopPrompt, getLoopPrompt, queueCompactionMessage } = createLoopContext({
+		const { ctx, finishLoopCommandSubmission, getLoopPrompt, queueCompactionMessage } = createLoopContext({
 			isStreaming: false,
 			isCompacting: true,
 		});
-		// Mirror handleLoopCommand: enabling loop mode hands the inline prompt
+		// Mirror the command-owned prompt returned by handleLoopCommand:
 		// back to the dispatcher for normal submission.
 		(ctx as unknown as Record<string, unknown>).handleLoopCommand = vi.fn(async () => "compact loop body");
 		const controller = new InputController(ctx);
@@ -145,33 +145,35 @@ describe("loop mode interjections", () => {
 
 		await ctx.editor.onSubmit?.("/loop 3 compact loop body");
 
-		expect(setLoopPrompt).toHaveBeenCalledWith("compact loop body");
+		expect(finishLoopCommandSubmission).toHaveBeenCalledWith("compact loop body");
 		expect(getLoopPrompt()).toBe("compact loop body");
 		expect(queueCompactionMessage).toHaveBeenCalledTimes(1);
 	});
 
-	it("does not arm the loop when the inline body is a local command", async () => {
-		const { ctx, setLoopPrompt, getLoopPrompt, handleBashCommand } = createLoopContext({ isStreaming: false });
-		// Mirror handleLoopCommand: enabling loop mode hands the inline body
-		// back to the dispatcher, where the bash branch consumes it.
+	it("submits explicit loop shell syntax as model text", async () => {
+		const { ctx, finishLoopCommandSubmission, getLoopPrompt, handleBashCommand } = createLoopContext({
+			isStreaming: false,
+		});
+		// Mirror the command-owned body returned by handleLoopCommand:
+		// back to the dispatcher as literal model text.
 		(ctx as unknown as Record<string, unknown>).handleLoopCommand = vi.fn(async () => "!echo hi");
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 
 		await ctx.editor.onSubmit?.("/loop 3 !echo hi");
 
-		expect(handleBashCommand).toHaveBeenCalledWith("echo hi", false);
-		expect(setLoopPrompt).not.toHaveBeenCalled();
-		expect(getLoopPrompt()).toBe("original loop prompt");
+		expect(handleBashCommand).not.toHaveBeenCalled();
+		expect(finishLoopCommandSubmission).toHaveBeenCalledWith("!echo hi", undefined);
+		expect(getLoopPrompt()).toBe("!echo hi");
 	});
 
-	it("does not arm the loop when the compacted body is a local command", async () => {
-		const { ctx, setLoopPrompt, getLoopPrompt, queueCompactionMessage } = createLoopContext({
+	it("retains explicit loop text queued during compaction", async () => {
+		const { ctx, finishLoopCommandSubmission, getLoopPrompt, queueCompactionMessage } = createLoopContext({
 			isStreaming: false,
 			isCompacting: true,
 			extensionCommandNames: ["ext-cmd"],
 		});
-		// Mirror handleLoopCommand: enabling loop mode hands the inline body
+		// Mirror the command-owned body returned by handleLoopCommand:
 		// back to the dispatcher, where it queues for compaction.
 		(ctx as unknown as Record<string, unknown>).handleLoopCommand = vi.fn(async () => "/ext-cmd args");
 		const controller = new InputController(ctx);
@@ -180,13 +182,15 @@ describe("loop mode interjections", () => {
 		await ctx.editor.onSubmit?.("/loop 3 /ext-cmd args");
 
 		expect(queueCompactionMessage).toHaveBeenCalledTimes(1);
-		expect(setLoopPrompt).not.toHaveBeenCalled();
-		expect(getLoopPrompt()).toBe("original loop prompt");
+		expect(finishLoopCommandSubmission).toHaveBeenCalledWith("/ext-cmd args");
+		expect(getLoopPrompt()).toBe("/ext-cmd args");
 	});
 
 	it("leaves the loop untouched when a streamed body is consumed locally", async () => {
-		const { ctx, setLoopPrompt, pauseLoop, prompt, getLoopPrompt } = createLoopContext({ isStreaming: true });
-		// Mirror handleLoopCommand: enabling loop mode hands the inline body
+		const { ctx, finishLoopCommandSubmission, pauseLoop, prompt, getLoopPrompt } = createLoopContext({
+			isStreaming: true,
+		});
+		// Mirror the command-owned body returned by handleLoopCommand:
 		// back to the dispatcher for normal submission.
 		(ctx as unknown as Record<string, unknown>).handleLoopCommand = vi.fn(async () => "/void-cmd");
 		// Mirror AgentSession.prompt reporting local consumption (void custom
@@ -198,13 +202,15 @@ describe("loop mode interjections", () => {
 		await ctx.editor.onSubmit?.("/loop 3 /void-cmd");
 
 		expect(prompt).toHaveBeenCalledTimes(1);
-		expect(setLoopPrompt).not.toHaveBeenCalled();
+		expect(finishLoopCommandSubmission).toHaveBeenCalledWith("/void-cmd", expect.any(Error));
 		expect(pauseLoop).not.toHaveBeenCalled();
 		expect(getLoopPrompt()).toBe("original loop prompt");
 	});
 
-	it("parks the loop when a direct submission is consumed locally", async () => {
-		const { ctx, setLoopPrompt, pauseLoop, prompt, getLoopPrompt } = createLoopContext({ isStreaming: false });
+	it("preserves the loop when a one-off submission is consumed locally", async () => {
+		const { ctx, finishLoopCommandSubmission, pauseLoop, prompt, getLoopPrompt } = createLoopContext({
+			isStreaming: false,
+		});
 		prompt.mockResolvedValueOnce(false);
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
@@ -212,27 +218,27 @@ describe("loop mode interjections", () => {
 		await ctx.editor.onSubmit?.("/void-cmd");
 
 		expect(prompt).toHaveBeenCalledTimes(1);
-		expect(setLoopPrompt).toHaveBeenCalledWith("/void-cmd");
-		expect(pauseLoop).toHaveBeenCalledTimes(1);
-		expect(getLoopPrompt()).toBeUndefined();
+		expect(finishLoopCommandSubmission).not.toHaveBeenCalled();
+		expect(pauseLoop).not.toHaveBeenCalled();
+		expect(getLoopPrompt()).toBe("original loop prompt");
 	});
 
-	it("arms a direct submission after dispatch succeeds", async () => {
-		const { ctx, setLoopPrompt, getLoopPrompt } = createLoopContext({ isStreaming: false });
+	it("preserves the loop after a successful one-off submission", async () => {
+		const { ctx, finishLoopCommandSubmission, getLoopPrompt } = createLoopContext({ isStreaming: false });
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 
 		await ctx.editor.onSubmit?.("direct body");
 
-		expect(setLoopPrompt).toHaveBeenCalledWith("direct body");
-		expect(getLoopPrompt()).toBe("direct body");
+		expect(finishLoopCommandSubmission).not.toHaveBeenCalled();
+		expect(getLoopPrompt()).toBe("original loop prompt");
 	});
 
 	it("keeps the prior body when a streamed inline body is rejected", async () => {
-		const { ctx, setLoopPrompt, pauseLoop, prompt, getLoopPrompt, showError } = createLoopContext({
+		const { ctx, finishLoopCommandSubmission, pauseLoop, prompt, getLoopPrompt, showError } = createLoopContext({
 			isStreaming: true,
 		});
-		// Mirror handleLoopCommand: enabling loop mode hands the inline body
+		// Mirror the command-owned body returned by handleLoopCommand:
 		// back to the dispatcher for normal submission.
 		(ctx as unknown as Record<string, unknown>).handleLoopCommand = vi.fn(async () => "new body");
 		// Mirror attachment normalization failing inside prompt dispatch.
@@ -242,14 +248,14 @@ describe("loop mode interjections", () => {
 
 		await ctx.editor.onSubmit?.("/loop 3 new body");
 
-		expect(setLoopPrompt).not.toHaveBeenCalled();
+		expect(finishLoopCommandSubmission).toHaveBeenCalledWith("new body", expect.any(Error));
 		expect(pauseLoop).not.toHaveBeenCalled();
 		expect(getLoopPrompt()).toBe("original loop prompt");
 		expect(showError).toHaveBeenCalledWith("attachment too large");
 	});
 
-	it("parks the loop when a direct submission is rejected", async () => {
-		const { ctx, setLoopPrompt, pauseLoop, prompt, getLoopPrompt, showError } = createLoopContext({
+	it("preserves the loop when a one-off submission is rejected", async () => {
+		const { ctx, finishLoopCommandSubmission, pauseLoop, prompt, getLoopPrompt, showError } = createLoopContext({
 			isStreaming: false,
 		});
 		prompt.mockRejectedValueOnce(new Error("attachment too large"));
@@ -258,9 +264,9 @@ describe("loop mode interjections", () => {
 
 		await ctx.editor.onSubmit?.("direct body");
 
-		expect(setLoopPrompt).toHaveBeenCalledWith("direct body");
-		expect(pauseLoop).toHaveBeenCalledTimes(1);
-		expect(getLoopPrompt()).toBeUndefined();
+		expect(finishLoopCommandSubmission).not.toHaveBeenCalled();
+		expect(pauseLoop).not.toHaveBeenCalled();
+		expect(getLoopPrompt()).toBe("original loop prompt");
 		expect(showError).toHaveBeenCalledWith("attachment too large");
 	});
 });

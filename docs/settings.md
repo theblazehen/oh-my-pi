@@ -714,7 +714,7 @@ For a custom status line, set `statusLine.preset: custom` and configure `statusL
 | ---------------------- | ------- | --------------- | ------------------------------------------------------------------------------------------------------- |
 | `steeringMode`         | enum    | `one-at-a-time` | `all`, `one-at-a-time`. How queued steering messages are delivered.                                     |
 | `followUpMode`         | enum    | `one-at-a-time` | `all`, `one-at-a-time`.                                                                                 |
-| `interruptMode`        | enum    | `immediate`     | `immediate`, `wait`.                                                                                    |
+| `interruptMode` | enum | `immediate` | `immediate` watches every tool batch; `blocking` interrupts only passive waits or tools that explicitly support cooperative/background yielding, not arbitrary tools; `wait` defers steering until turn completion. |
 | `doubleEscapeAction`   | enum    | `rewind`          | `rewind`, `none`.                                                                               |
 | `autoResume`           | boolean | `false`         | Auto-resume the most recent session in the cwd.                                                         |
 | `plan.enabled`         | boolean | `true`          | Enable plan mode.                                                                                       |

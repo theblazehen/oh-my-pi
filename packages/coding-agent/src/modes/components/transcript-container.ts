@@ -133,8 +133,17 @@ export function trimBlankEdges(rows: readonly string[]): readonly string[] {
 	return start === 0 && end === rows.length ? rows : rows.slice(start, end);
 }
 
+/** Random-access complete contributions, independent of native-history retirement. */
+export interface TranscriptBlockSource extends Component {
+	getTranscriptBlockCount(): number;
+	getTranscriptBlockIdentity(index: number): Component | undefined;
+	renderTranscriptBlock(index: number, width: number): readonly string[];
+	/** Defaults to this source; composites may return undefined at unspaced boundaries. */
+	getTranscriptBlockSeparatorGroup?(index: number): Component | undefined;
+}
+
 /** Owns transcript order, live capacity, and ordered immutable retirement. */
-export class TranscriptContainer extends Container {
+export class TranscriptContainer extends Container implements TranscriptBlockSource {
 	#entries: TranscriptEntry[] = [];
 	#frontier = 0;
 	#nextBatchId = 1;
@@ -262,6 +271,27 @@ export class TranscriptContainer extends Container {
 			return;
 		}
 		this.#startReplay();
+	}
+	/** Current number of individually pageable transcript child blocks. */
+	getTranscriptBlockCount(): number {
+		return this.children.length;
+	}
+
+	/** Stable identity for one pageable child block, or undefined outside the current range. */
+	getTranscriptBlockIdentity(index: number): Component | undefined {
+		return Number.isInteger(index) ? this.children[index] : undefined;
+	}
+
+	/**
+	 * Render one complete child contribution without invoking or mutating the
+	 * container's full-compose machinery. The viewport joins adjacent non-empty
+	 * contributions from this source with one blank row.
+	 */
+	renderTranscriptBlock(index: number, width: number): readonly string[] {
+		const child = this.getTranscriptBlockIdentity(index);
+		if (!child) return EMPTY_ROWS;
+		this.#setAllocation(child, Number.MAX_SAFE_INTEGER, this.#lastFrame);
+		return trimBlankEdges(child.render(Math.max(1, width)));
 	}
 	/**
 	 * Drop a not-yet-offered replay so a shutdown flush emits only un-retired

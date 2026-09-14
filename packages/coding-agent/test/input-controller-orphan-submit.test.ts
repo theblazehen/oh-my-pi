@@ -8,7 +8,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import type { InteractiveModeContext, SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -37,6 +37,7 @@ type FakeEditor = {
 	getText(): string;
 	setCollapsedText(text: string): void;
 	composerChips(): unknown[];
+	getExpandedText(): string;
 	addToHistory(text: string): void;
 	clearDraft(historyText?: string): void;
 	setActionKeys(action: string, keys: string[]): void;
@@ -53,6 +54,19 @@ function createContext(sessionOverride?: InteractiveModeContext["session"]) {
 	const showError = vi.fn();
 	const addToHistory = vi.fn();
 	const flushPendingBashComponents = vi.fn();
+	const handleBashCommand = vi.fn(async () => {});
+	const handlePythonCommand = vi.fn(async () => {});
+	const promptCustomMessage = vi.fn(async () => {});
+	const finishLoopCommandSubmission = vi.fn();
+	const startPendingSubmission = vi.fn(
+		(input: {
+			text: string;
+			images?: ImageContent[];
+			imageLinks?: (string | undefined)[];
+			streamingBehavior?: "steer" | "followUp";
+			loopCommandPrompt?: string;
+		}): SubmittedUserInput => ({ ...input, cancelled: false, started: false }),
+	);
 
 	const editor: FakeEditor = {
 		pendingImages: [] as ImageContent[],
@@ -61,6 +75,9 @@ function createContext(sessionOverride?: InteractiveModeContext["session"]) {
 			editorText = text;
 		},
 		getText() {
+			return editorText;
+		},
+		getExpandedText() {
 			return editorText;
 		},
 		setCollapsedText(text: string) {
@@ -92,6 +109,7 @@ function createContext(sessionOverride?: InteractiveModeContext["session"]) {
 			settings: Settings.isolated({}),
 			steer,
 			prompt,
+			promptCustomMessage,
 			maybeStartTitleGeneration: vi.fn(),
 			queuedMessageCount: 0,
 			customCommands: [],
@@ -135,19 +153,252 @@ function createContext(sessionOverride?: InteractiveModeContext["session"]) {
 		onInputCallback: undefined,
 		updatePendingMessagesDisplay,
 		flushPendingBashComponents,
+		startPendingSubmission,
+		finishLoopCommandSubmission,
+		handleBashCommand,
+		handlePythonCommand,
 		showError,
 		isBashMode: false,
 		isPythonMode: false,
+		loopModeEnabled: false,
+		loopModePaused: false,
+		loopPrompt: undefined,
+		loopLimit: undefined,
 	} as unknown as InteractiveModeContext;
+	const setStreaming = (streaming: boolean) => {
+		Object.defineProperty(session, "isStreaming", { configurable: true, value: streaming });
+	};
 
 	return {
 		ctx,
 		editor,
-		spies: { steer, prompt, updatePendingMessagesDisplay, requestRender, showError, addToHistory },
+		setStreaming,
+		spies: {
+			steer,
+			prompt,
+			promptCustomMessage,
+			startPendingSubmission,
+			finishLoopCommandSubmission,
+			handleBashCommand,
+			handlePythonCommand,
+			updatePendingMessagesDisplay,
+			requestRender,
+			showError,
+			addToHistory,
+		},
 	};
 }
 
+function installLoopCommandLifecycle(ctx: InteractiveModeContext) {
+	let pending:
+		| {
+				prompt: string;
+				enabled: boolean;
+				paused: boolean;
+				loopPrompt: string | undefined;
+				limit: InteractiveModeContext["loopLimit"];
+		  }
+		| undefined;
+	const handleLoopCommand = vi.fn(async (args = "") => {
+		const prompt = args.replace(/^update\s+/i, "").trim();
+		pending = {
+			prompt,
+			enabled: ctx.loopModeEnabled,
+			paused: ctx.loopModePaused,
+			loopPrompt: ctx.loopPrompt,
+			limit: ctx.loopLimit ? { ...ctx.loopLimit } : undefined,
+		};
+		ctx.loopModeEnabled = true;
+		ctx.loopModePaused = false;
+		ctx.loopPrompt = prompt;
+		ctx.loopLimit = undefined;
+		return prompt;
+	});
+	const finishLoopCommandSubmission = vi.fn((prompt: string, error?: unknown) => {
+		if (!pending || pending.prompt !== prompt) return;
+		if (error !== undefined) {
+			ctx.loopModeEnabled = pending.enabled;
+			ctx.loopModePaused = pending.paused;
+			ctx.loopPrompt = pending.loopPrompt;
+			ctx.loopLimit = pending.limit ? { ...pending.limit } : undefined;
+		}
+		pending = undefined;
+	});
+	ctx.handleLoopCommand = handleLoopCommand;
+	ctx.finishLoopCommandSubmission = finishLoopCommandSubmission;
+	return { handleLoopCommand, finishLoopCommandSubmission };
+}
+
 describe("InputController orphaned submit", () => {
+	it.each([
+		{ label: "bash", prompt: "!printf literal", diverted: "bash" },
+		{ label: "python", prompt: "$ print('literal')", diverted: "python" },
+	] as const)("submits a command-owned $label loop prompt literally", async ({ prompt, diverted }) => {
+		const { ctx, editor, spies } = createContext();
+		installLoopCommandLifecycle(ctx);
+		const delivered = vi.fn((_input: SubmittedUserInput) => {});
+		ctx.onInputCallback = delivered;
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.(`/loop ${prompt}`);
+
+		expect(spies.startPendingSubmission).toHaveBeenCalledWith(
+			expect.objectContaining({ text: prompt, loopCommandPrompt: prompt }),
+		);
+		expect(delivered).toHaveBeenCalledWith(expect.objectContaining({ text: prompt, loopCommandPrompt: prompt }));
+		if (diverted === "bash") {
+			expect(spies.handleBashCommand).not.toHaveBeenCalled();
+		} else {
+			expect(spies.handlePythonCommand).not.toHaveBeenCalled();
+		}
+	});
+
+	it("submits a known-skill loop prompt literally instead of invoking the skill", async () => {
+		const tempDir = TempDir.createSync("@pi-loop-literal-skill-");
+		try {
+			const skillPath = path.join(tempDir.path(), "test-skill.md");
+			await Bun.write(skillPath, "---\nname: test-skill\n---\nDo the thing.\n");
+			const { ctx, editor, spies } = createContext();
+			ctx.skillCommands.set("skill:test-skill", {
+				name: "test-skill",
+				description: "",
+				filePath: skillPath,
+				baseDir: tempDir.path(),
+				source: "test",
+			});
+			installLoopCommandLifecycle(ctx);
+			const delivered = vi.fn((_input: SubmittedUserInput) => {});
+			ctx.onInputCallback = delivered;
+			const controller = new InputController(ctx);
+			controller.setupEditorSubmitHandler();
+			const prompt = "/skill:test-skill literal argument";
+
+			await editor.onSubmit?.(`/loop ${prompt}`);
+
+			expect(delivered).toHaveBeenCalledWith(expect.objectContaining({ text: prompt, loopCommandPrompt: prompt }));
+			expect(spies.promptCustomMessage).not.toHaveBeenCalled();
+		} finally {
+			tempDir.removeSync();
+		}
+	});
+
+	it("routes idle Ctrl+Enter loop replacement through the installed input waiter", async () => {
+		const { ctx, editor, spies } = createContext();
+		installLoopCommandLifecycle(ctx);
+		ctx.loopModeEnabled = true;
+		ctx.loopPrompt = "original prompt";
+		const delivered = vi.fn((_input: SubmittedUserInput) => {});
+		ctx.onInputCallback = delivered;
+		const controller = new InputController(ctx);
+		editor.setText("/loop replacement prompt");
+
+		await controller.handleFollowUp();
+
+		expect(spies.prompt).not.toHaveBeenCalled();
+		expect(spies.startPendingSubmission).toHaveBeenCalledWith({
+			text: "replacement prompt",
+			images: undefined,
+			imageLinks: undefined,
+			streamingBehavior: "followUp",
+			loopCommandPrompt: "replacement prompt",
+		});
+		expect(delivered).toHaveBeenCalledWith(
+			expect.objectContaining({
+				text: "replacement prompt",
+				streamingBehavior: "followUp",
+				loopCommandPrompt: "replacement prompt",
+			}),
+		);
+		expect(ctx.loopPrompt).toBe("replacement prompt");
+	});
+
+	it.each([
+		{ label: "streaming Enter", streaming: true, followUp: false, enabled: true, paused: false },
+		{ label: "orphaned idle Enter", streaming: false, followUp: false, enabled: true, paused: true },
+		{ label: "idle Ctrl+Enter without a waiter", streaming: false, followUp: true, enabled: true, paused: false },
+		{ label: "first loop start", streaming: false, followUp: false, enabled: false, paused: false },
+	] as const)(
+		"restores prior loop state when $label delivery rejects",
+		async ({ streaming, followUp, enabled, paused }) => {
+			const { ctx, editor, setStreaming, spies } = createContext();
+			setStreaming(streaming);
+			ctx.loopModeEnabled = enabled;
+			ctx.loopModePaused = paused;
+			ctx.loopPrompt = enabled ? "original prompt" : undefined;
+			ctx.loopLimit = enabled ? { kind: "iterations", initial: 4, remaining: 3 } : undefined;
+			const lifecycle = installLoopCommandLifecycle(ctx);
+			const rejection = new Error("queue rejected");
+			spies.prompt.mockRejectedValueOnce(rejection);
+			const controller = new InputController(ctx);
+
+			if (followUp) {
+				editor.setText("/loop replacement prompt");
+				await controller.handleFollowUp();
+			} else {
+				controller.setupEditorSubmitHandler();
+				await editor.onSubmit?.("/loop replacement prompt");
+			}
+
+			expect(lifecycle.finishLoopCommandSubmission).toHaveBeenCalledTimes(1);
+			expect(lifecycle.finishLoopCommandSubmission).toHaveBeenCalledWith("replacement prompt", rejection);
+			expect(ctx.loopModeEnabled).toBe(enabled);
+			expect(ctx.loopModePaused).toBe(paused);
+			expect(ctx.loopPrompt).toBe(enabled ? "original prompt" : undefined);
+			expect(ctx.loopLimit).toEqual(enabled ? { kind: "iterations", initial: 4, remaining: 3 } : undefined);
+		},
+	);
+
+	it("keeps ordinary idle Enter one-off while a paused loop retains its prompt", async () => {
+		const { ctx, editor, spies } = createContext();
+		const delivered = vi.fn((_input: SubmittedUserInput) => {});
+		ctx.onInputCallback = delivered;
+		ctx.loopModeEnabled = true;
+		ctx.loopModePaused = true;
+		ctx.loopPrompt = "original recurring prompt";
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("one-off follow-up");
+
+		expect(spies.startPendingSubmission).toHaveBeenCalledWith({
+			text: "one-off follow-up",
+			images: undefined,
+			imageLinks: undefined,
+			streamingBehavior: "steer",
+		});
+		expect(delivered).toHaveBeenCalledWith(
+			expect.objectContaining({ text: "one-off follow-up", streamingBehavior: "steer" }),
+		);
+		expect(spies.prompt).not.toHaveBeenCalled();
+		expect(ctx.loopPrompt).toBe("original recurring prompt");
+		expect(ctx.loopModePaused).toBe(true);
+	});
+
+	it.each([
+		{ state: "orphan-idle/running", streaming: false, paused: false },
+		{ state: "orphan-idle/paused", streaming: false, paused: true },
+		{ state: "streaming/running", streaming: true, paused: false },
+		{ state: "streaming/paused", streaming: true, paused: true },
+	])("keeps ordinary Enter one-off while the loop is $state", async ({ streaming, paused }) => {
+		const { ctx, editor, setStreaming, spies } = createContext();
+		setStreaming(streaming);
+		ctx.loopModeEnabled = true;
+		ctx.loopModePaused = paused;
+		ctx.loopPrompt = "original recurring prompt";
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("one-off follow-up");
+
+		expect(spies.prompt).toHaveBeenCalledWith("one-off follow-up", {
+			streamingBehavior: "steer",
+			images: undefined,
+		});
+		expect(ctx.loopPrompt).toBe("original recurring prompt");
+		expect(ctx.loopModePaused).toBe(paused);
+	});
+
 	it("starts an idle submit with no input waiter instead of queueing it forever", async () => {
 		const { ctx, editor, spies } = createContext();
 		const controller = new InputController(ctx);

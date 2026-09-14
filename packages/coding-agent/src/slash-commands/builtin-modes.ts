@@ -289,21 +289,21 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "loop",
 		icon: "loop",
 		description:
-			"Toggle loop mode. While enabled, the next prompt you send re-submits after every yield. Esc cancels the current iteration; /loop again to disable.",
-		inlineHint: "[count|duration] [prompt]",
+			"Start or replace a recurring prompt. Esc pauses; /loop resume continues it, while bare /loop, /loop stop, or /loop off disables it.",
+		inlineHint: "[count|duration] <prompt> | update <prompt> | resume | stop | off",
 		allowArgs: true,
 		getTuiAutocompleteDescription: runtime => {
-			if (!runtime.ctx.loopModeEnabled) return "Loop: off";
-			if (runtime.ctx.loopModePaused) return "Loop: paused";
-			if (runtime.ctx.loopLimit) return `Loop: on (${describeLoopLimitRuntime(runtime.ctx.loopLimit)})`;
-			if (runtime.ctx.loopPrompt) return "Loop: on (repeating prompt)";
-			return "Loop: on (waiting for next prompt)";
+			if (!runtime.ctx.loopModeEnabled) return "Loop: off — provide a prompt to start";
+			if (runtime.ctx.loopModePaused) return "Loop: paused (/loop resume)";
+			if (runtime.ctx.loopLimit)
+				return `Loop: on (${describeLoopLimitRuntime(runtime.ctx.loopLimit)}; /loop <prompt> replaces it)`;
+			return "Loop: on (/loop <prompt> replaces it)";
 		},
 		handleTui: async (command, runtime) => {
 			const prompt = await runtime.ctx.handleLoopCommand(command.args);
 			runtime.ctx.editor.setText("");
-			// Surface any inline prompt so the dispatcher returns it and the normal
-			// submit flow runs the first loop iteration (recording it as the loop prompt).
+			// Surface the command-owned prompt so the normal submit flow immediately
+			// runs the first or replacement loop iteration.
 			if (prompt) return { prompt };
 		},
 	},

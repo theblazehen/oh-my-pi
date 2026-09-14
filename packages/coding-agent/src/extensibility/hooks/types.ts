@@ -551,7 +551,7 @@ export interface HookAPI {
 	 * // On reload, reconstruct state from entries
 	 * pi.on("session", async (event, ctx) => {
 	 *   if (event.reason === "start") {
-	 *     const entries = event.sessionManager.getEntries();
+	 *     const entries = await event.sessionManager.getAllEntries();
 	 *     const myEntries = entries.filter(e => e.type === "custom" && e.customType === "permissions");
 	 *     // Reconstruct state from myEntries...
 	 *   }

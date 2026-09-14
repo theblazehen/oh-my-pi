@@ -198,11 +198,11 @@ export type CustomToolResult<TDetails = any> = AgentToolResult<TDetails>;
  *     return { content: [{ type: "text", text: "Done" }] };
  *   },
  *
- *   onSession(event, ctx) {
+ *   async onSession(event, ctx) {
  *     if (event.reason === "shutdown") {
  *       // Cleanup
  *     }
- *     // Reconstruct state from ctx.sessionManager.getEntries()
+ *     // Reconstruct persisted state from await ctx.sessionManager.getAllEntries()
  *   }
  * });
  * ```

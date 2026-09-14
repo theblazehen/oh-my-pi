@@ -127,6 +127,35 @@ function buildImageJsonl(): string {
 	return `${entries.join("\n")}\n`;
 }
 
+function buildPagedJsonl(): string {
+	const lines = [
+		JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id: "adv", timestamp: TS, cwd: "/tmp" }),
+	];
+	for (let page = 0; page < 24; page++) {
+		for (let row = 0; row < 12; row++) {
+			const marker = page === 0 && row === 0 ? "HEADPAGEMARK" : `PAGE_${page}_${row}`;
+			lines.push(messageLine(`page-${page}-${row}`, marker));
+		}
+		// Non-message records make the physical transcript much larger than the
+		// viewer's resident window without producing an impractically large layout.
+		lines.push(JSON.stringify({ type: "paging_fixture", page, payload: "x".repeat(256 * 1024) }));
+	}
+	lines.push(messageLine("page-tail", "TAILPAGEMARK"));
+	return `${lines.join("\n")}\n`;
+}
+
+function buildAppendBurstJsonl(): string {
+	const lines: string[] = [];
+	for (let row = 0; row < 4096; row++) {
+		// Keep a sparse visible anchor in every disk page so paging can preserve
+		// the viewport while thousands of ordinary non-message rows stay cold.
+		if (row % 128 === 0) lines.push(messageLine(`burst-page-${row}`, `BURST_PAGE_${row}`));
+		lines.push(JSON.stringify({ type: "paging_fixture", row, payload: "x".repeat(1024) }));
+	}
+	lines.push(messageLine("burst-tail", "BURSTTAILMARK"));
+	return `${lines.join("\n")}\n`;
+}
+
 function messageLine(id: string, content: string): string {
 	return JSON.stringify({
 		type: "message",
@@ -137,7 +166,7 @@ function messageLine(id: string, content: string): string {
 	});
 }
 
-function makeViewer(file: string, remote?: AgentHubRemote, ui?: TUI) {
+function makeViewer(file: string, remote?: AgentHubRemote, ui?: TUI, requestRender: () => void = () => {}) {
 	const agents = new AgentRegistry();
 	agents.register({
 		id: "Main/advisor",
@@ -156,7 +185,7 @@ function makeViewer(file: string, remote?: AgentHubRemote, ui?: TUI) {
 		remote,
 		expandKeys: ["ctrl+o"],
 		hubKeys: ["ctrl+s"],
-		requestRender: () => {},
+		requestRender,
 		onClose: () => {},
 		onHubClose: () => {},
 	});
@@ -312,6 +341,54 @@ describe("AgentTranscriptViewer", () => {
 		});
 	});
 
+	it("opens a bounded tail window, prepends older pages, and pages back down to the tail", async () => {
+		// Disk reads and Bun.sleep must progress together; suite fake timers do not advance here.
+		vi.useRealTimers();
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-paged-"));
+		const file = path.join(dir, "__advisor.jsonl");
+		fs.writeFileSync(file, buildPagedJsonl());
+		const viewer = makeViewer(file);
+		const body = () =>
+			viewer
+				.render(80)
+				.map(line => Bun.stripANSI(line))
+				.join("\n");
+		try {
+			// Cold open starts at the physical tail. Moving to the top of that
+			// initial window must not reveal the file's true first message.
+			expect(body()).toContain("TAILPAGEMARK");
+			viewer.handleInput("g");
+			expect(body()).not.toContain("HEADPAGEMARK");
+
+			// Repeated user-visible upward navigation prepends cold pages until the
+			// beginning becomes reachable.
+			const headDeadline = Date.now() + 5000;
+			while (!body().includes("HEADPAGEMARK") && Date.now() < headDeadline) {
+				viewer.handleInput("g");
+				// Poll within a bounded deadline for the async range read initiated by
+				// each scroll command.
+				await Bun.sleep(10);
+			}
+			expect(body()).toContain("HEADPAGEMARK");
+
+			// The original tail is no longer resident after traversing a transcript
+			// larger than the bounded window. Downward navigation must page it back in.
+			viewer.handleInput("G");
+			expect(body()).not.toContain("TAILPAGEMARK");
+			const tailDeadline = Date.now() + 5000;
+			while (!body().includes("TAILPAGEMARK") && Date.now() < tailDeadline) {
+				viewer.handleInput("G");
+				await Bun.sleep(10);
+			}
+			expect(body()).toContain("TAILPAGEMARK");
+			expect(body()).not.toContain("HEADPAGEMARK");
+		} finally {
+			viewer.dispose();
+			removeSyncWithRetries(dir);
+		}
+		// Two independently bounded 5s disk traversals plus fixture setup/cleanup.
+	}, 15_000);
+
 	it("renders tool-result images through the shared Kitty placeholder budget", () => {
 		Settings.instance.override("terminal.showImages", true);
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-image-"));
@@ -392,7 +469,65 @@ describe("AgentTranscriptViewer", () => {
 		}
 	});
 
-	it("anchors the tail cursor to bytes actually read so a stat/read growth race never duplicates rows", async () => {
+	it("bounds multi-megabyte append refresh while a parked reader pages to the new tail", async () => {
+		// Exercise actual disk paging and the viewer's refresh interval on the same clock.
+		vi.useRealTimers();
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-burst-"));
+		const file = path.join(dir, "__advisor.jsonl");
+		fs.writeFileSync(file, buildPagedJsonl());
+		const parkedViewer = makeViewer(file);
+		const followingViewer = makeViewer(file);
+		const body = (viewer: AgentTranscriptViewer) =>
+			viewer
+				.render(80)
+				.map(line => Bun.stripANSI(line))
+				.join("\n");
+		try {
+			expect(body(followingViewer)).toContain("TAILPAGEMARK");
+
+			const historicalHeadDeadline = Date.now() + 5000;
+			while (!body(parkedViewer).includes("HEADPAGEMARK") && Date.now() < historicalHeadDeadline) {
+				parkedViewer.handleInput("g");
+				await Bun.sleep(10);
+			}
+			const parkedBefore = body(parkedViewer);
+			expect(parkedBefore).toContain("HEADPAGEMARK");
+
+			const burst = buildAppendBurstJsonl();
+			expect(Buffer.byteLength(burst)).toBeGreaterThan(4 * 1024 * 1024);
+			fs.appendFileSync(file, burst);
+			const readSyncSpy = vi.spyOn(fs, "readSync");
+			// Exercise the viewer's real 250 ms refresh interval; fake timers race
+			// the async page reads driven by the parked viewer below.
+			const followTailDeadline = Date.now() + 5000;
+			while (!body(followingViewer).includes("BURSTTAILMARK") && Date.now() < followTailDeadline) {
+				await Bun.sleep(10);
+			}
+
+			// Both viewers probe only page-sized ranges despite a multi-page delta.
+			// The follower adopts the sampled tail; the parked viewport stays exact.
+			expect(readSyncSpy.mock.calls.length).toBeGreaterThan(0);
+			for (const [, buffer] of readSyncSpy.mock.calls) {
+				expect(buffer.byteLength).toBeLessThanOrEqual(512 * 1024);
+			}
+			expect(body(followingViewer)).toContain("BURSTTAILMARK");
+			expect(body(parkedViewer)).toBe(parkedBefore);
+
+			const burstTailDeadline = Date.now() + 5000;
+			while (!body(parkedViewer).includes("BURSTTAILMARK") && Date.now() < burstTailDeadline) {
+				parkedViewer.handleInput("G");
+				await Bun.sleep(10);
+			}
+			expect(body(parkedViewer)).toContain("BURSTTAILMARK");
+		} finally {
+			parkedViewer.dispose();
+			followingViewer.dispose();
+			vi.restoreAllMocks();
+			removeSyncWithRetries(dir);
+		}
+	});
+
+	it("renders a row appended between stat and the range read exactly once", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-"));
 		const file = path.join(dir, "__advisor.jsonl");
 		const baseline = `${[
@@ -400,31 +535,29 @@ describe("AgentTranscriptViewer", () => {
 			messageLine("base", "BASEMARK"),
 		].join("\n")}\n`;
 		fs.writeFileSync(file, baseline);
-		// Stale stat plus a readFileSync that appends a fresh entry in between
-		// reproduces the race the reviewer called out: the rebuild sees the
-		// appended bytes, the tail cursor must record `data.byteLength` (not the
-		// pre-race `stat.size`) so the next poll doesn't replay them.
-		const baselineStat = fs.statSync(file);
-		const realStatSync = fs.statSync.bind(fs);
-		const realReadFileSync = fs.readFileSync.bind(fs);
+		// The range reader opens only after refresh has sampled the file size.
+		// Append immediately before that descriptor is returned, so the row lands
+		// after stat but before any bytes are consumed by readSync.
+		const realOpenSync = fs.openSync.bind(fs);
+		const realAppendFileSync = fs.appendFileSync.bind(fs);
 		let raceArmed = true;
-		const statSpy = vi.spyOn(fs, "statSync").mockImplementation(((p: fs.PathLike, opts?: fs.StatOptions) => {
-			if (raceArmed && String(p) === file && !opts) return baselineStat as fs.Stats;
-			return realStatSync(p as string, opts as fs.StatSyncOptions);
-		}) as typeof fs.statSync);
-		const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((p: fs.PathOrFileDescriptor, opts?: unknown) => {
-			if (raceArmed && String(p) === file) {
-				fs.appendFileSync(file, `${messageLine("race", "RACEMARK")}\n`);
+		const openSpy = vi.spyOn(fs, "openSync").mockImplementation(((
+			p: fs.PathLike,
+			flags: fs.OpenMode,
+			mode?: fs.Mode,
+		) => {
+			if (raceArmed && String(p) === file && flags === "r") {
+				realAppendFileSync(file, `${messageLine("race", "RACEMARK")}\n`);
 				raceArmed = false;
 			}
-			return realReadFileSync(p as fs.PathOrFileDescriptor, opts as Parameters<typeof fs.readFileSync>[1]);
-		}) as typeof fs.readFileSync);
+			return realOpenSync(p, flags, mode);
+		}) as typeof fs.openSync);
 
+		vi.useFakeTimers();
 		const viewer = makeViewer(file);
 		try {
 			viewer.render(80);
-			statSpy.mockRestore();
-			readSpy.mockRestore();
+			expect(raceArmed).toBe(false);
 
 			fs.appendFileSync(file, `${messageLine("tail", "TAILMARK")}\n`);
 
@@ -436,10 +569,12 @@ describe("AgentTranscriptViewer", () => {
 			vi.advanceTimersByTime(250);
 			expect(body()).toContain("BASEMARK");
 			expect(body()).toContain("TAILMARK");
-			// The race-window entry must be rendered exactly once, not duplicated
-			// by the poll fast-path re-reading bytes already in the rebuild.
+			// The poll must consume the race-window entry from the sampled byte
+			// cursor once, neither skipping it nor replaying it.
 			expect(body().match(/RACEMARK/g)?.length ?? 0).toBe(1);
 		} finally {
+			openSpy.mockRestore();
+			vi.useRealTimers();
 			viewer.dispose();
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

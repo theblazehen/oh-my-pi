@@ -15,7 +15,7 @@ import type { SessionEntry } from "../session/session-entries";
 import { type HindsightMessage, hasSubstantiveContent } from "./content";
 
 export interface ReadonlySessionManagerLike {
-	getEntries(): SessionEntry[];
+	getAllEntries(): Promise<SessionEntry[]>;
 }
 
 /**
@@ -32,10 +32,10 @@ export interface ReadonlySessionManagerLike {
  *   toolCall blocks are intentionally dropped: the user never saw them, so
  *   retaining them would prime recall on internal monologue.
  */
-export function extractMessages(sessionManager: ReadonlySessionManagerLike): HindsightMessage[] {
+export async function extractMessages(sessionManager: ReadonlySessionManagerLike): Promise<HindsightMessage[]> {
 	const messages: HindsightMessage[] = [];
 
-	for (const entry of sessionManager.getEntries()) {
+	for (const entry of await sessionManager.getAllEntries()) {
 		if (entry.type !== "message") continue;
 		const msg = entry.message;
 		const role = msg.role;

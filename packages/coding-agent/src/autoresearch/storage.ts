@@ -281,7 +281,7 @@ export class AutoresearchStorage {
 	}
 
 	close(): void {
-		this.#db.close();
+		this.#db.close(true);
 	}
 
 	getActiveSession(): SessionRow | null {

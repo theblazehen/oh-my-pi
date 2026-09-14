@@ -228,10 +228,6 @@ export async function runRenderCommand(args: RenderCommandArgs): Promise<number>
 		const paintMs = performance.now() - paintStart;
 		const paintBytes = terminal.bytes - bytesBeforePaint;
 
-		const entries = sessionManager.getEntries();
-		let messageCount = 0;
-		for (const entry of entries) if (entry.type === "message") messageCount++;
-
 		const repaints: { ms: number; bytes: number }[] = [];
 		for (let i = 0; i < (args.repaint ?? 0); i++) {
 			const start = performance.now();
@@ -250,6 +246,9 @@ export async function runRenderCommand(args: RenderCommandArgs): Promise<number>
 
 		if (args.timing || args.repaint) {
 			const rows = mode.chatContainer.render(width).length;
+			const entries = await sessionManager.getAllEntries();
+			let messageCount = 0;
+			for (const entry of entries) if (entry.type === "message") messageCount++;
 			const report = [
 				`session  ${sourcePath}`,
 				`         ${formatBytes(sourceSize)}, ${entries.length} entries, ${messageCount} messages, ${rows} transcript rows @ ${width}x${height}`,

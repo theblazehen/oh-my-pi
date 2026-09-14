@@ -1,3 +1,4 @@
+import type { SteeringYieldLease } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { StructuredSubagentOutput } from "../task/types";
@@ -203,6 +204,19 @@ export interface AsyncJobRegisterOptions {
 	queued?: boolean;
 }
 
+interface AsyncJobCapacityWaiter {
+	promise: Promise<void>;
+	resolve: () => void;
+}
+
+type AsyncJobRun = (ctx: {
+	jobId: string;
+	signal: AbortSignal;
+	reportProgress: (text: string, details?: AsyncJobDetails) => Promise<void>;
+	/** Wait for and atomically claim a running-job slot before executing. */
+	markRunning: () => Promise<void>;
+}) => Promise<string | AsyncJobRunResult>;
+
 /**
  * Filter applied to job query/cancel APIs. With `ownerId`, results are
  * restricted to jobs registered by that agent (registry id from
@@ -239,6 +253,8 @@ export class AsyncJobManager {
 	readonly #evictionTimers = new Map<string, NodeJS.Timeout>();
 	readonly #pollEscalation = new Map<string | undefined, PollEscalationState>();
 	readonly #deliverySinks = new Map<string, AsyncJobDeliverySink>();
+	readonly #reservations = new Set<SteeringYieldLease>();
+	readonly #capacityWaiters = new Set<AsyncJobCapacityWaiter>();
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
 	readonly #maxRunningJobs: number;
 	readonly #retentionMs: number;
@@ -275,36 +291,103 @@ export class AsyncJobManager {
 	/** True when the running-job count has reached the configured cap. */
 	get atCapacity(): boolean {
 		if (this.#disposed) return true;
-		// Mirror register(): queued jobs hold no execution slot.
-		let activeCount = 0;
-		for (const job of this.#jobs.values()) {
-			if (job.status === "running" && !job.queued) activeCount++;
-		}
-		return activeCount >= this.#maxRunningJobs;
+		return this.#occupiedSlotCount() >= this.#maxRunningJobs;
 	}
 
-	register(
+	/**
+	 * Atomically reserve one running-job slot for a later
+	 * {@link registerReserved} call. Releasing the returned lease is
+	 * idempotent.
+	 */
+	tryReserveSlot(): SteeringYieldLease | undefined {
+		if (this.#disposed || this.#occupiedSlotCount() >= this.#maxRunningJobs) return undefined;
+
+		const lease: SteeringYieldLease = {
+			release: () => {
+				if (this.#reservations.delete(lease)) this.#wakeCapacityWaiters();
+			},
+		};
+		this.#reservations.add(lease);
+		return lease;
+	}
+
+	register(type: AsyncJobType, label: string, run: AsyncJobRun, options?: AsyncJobRegisterOptions): string {
+		return this.#register(type, label, run, options, false);
+	}
+
+	/**
+	 * Consume an exact live reservation and register its job without a second
+	 * capacity check. A lease belongs only to the manager that created it and
+	 * can be consumed at most once.
+	 */
+	registerReserved(
+		lease: SteeringYieldLease,
 		type: AsyncJobType,
 		label: string,
-		run: (ctx: {
-			jobId: string;
-			signal: AbortSignal;
-			reportProgress: (text: string, details?: AsyncJobDetails) => Promise<void>;
-			/** Clear the queued flag once the job actually starts executing. */
-			markRunning: () => void;
-		}) => Promise<string | AsyncJobRunResult>,
+		run: AsyncJobRun,
 		options?: AsyncJobRegisterOptions,
 	): string {
 		if (this.#disposed) {
 			throw new Error("Async job manager is disposed");
 		}
-		// Queued jobs hold no execution slot yet — only count jobs that are
-		// actually running so a large parked batch cannot starve registration.
-		let activeCount = 0;
-		for (const existing of this.#jobs.values()) {
-			if (existing.status === "running" && !existing.queued) activeCount++;
+		if (options?.queued === true) {
+			throw new Error("A reserved async job cannot be registered as queued");
 		}
-		if (activeCount >= this.#maxRunningJobs) {
+		if (!this.#reservations.delete(lease)) {
+			throw new Error("Invalid or already consumed async job slot reservation");
+		}
+		return this.#register(type, label, run, options, true);
+	}
+
+	#occupiedSlotCount(): number {
+		// Queued jobs hold no execution slot until markRunning().
+		let activeCount = 0;
+		for (const job of this.#jobs.values()) {
+			if (job.status === "running" && !job.queued) activeCount++;
+		}
+		return activeCount + this.#reservations.size;
+	}
+
+	#wakeCapacityWaiters(): void {
+		if (this.#capacityWaiters.size === 0) return;
+		const waiters = Array.from(this.#capacityWaiters);
+		this.#capacityWaiters.clear();
+		for (const waiter of waiters) waiter.resolve();
+	}
+
+	async #markRunning(job: AsyncJob): Promise<void> {
+		for (;;) {
+			if (this.#disposed) throw new Error("Async job manager is disposed");
+			if (job.status !== "running" || job.abortController.signal.aborted) {
+				throw new Error("Async job cancelled before execution");
+			}
+			if (!job.queued) return;
+			if (this.#occupiedSlotCount() < this.#maxRunningJobs) {
+				job.queued = false;
+				return;
+			}
+
+			const waiter = Promise.withResolvers<void>();
+			this.#capacityWaiters.add(waiter);
+			try {
+				await waiter.promise;
+			} finally {
+				this.#capacityWaiters.delete(waiter);
+			}
+		}
+	}
+
+	#register(
+		type: AsyncJobType,
+		label: string,
+		run: AsyncJobRun,
+		options: AsyncJobRegisterOptions | undefined,
+		reserved: boolean,
+	): string {
+		if (this.#disposed) {
+			throw new Error("Async job manager is disposed");
+		}
+		if (!reserved && options?.queued !== true && this.#occupiedSlotCount() >= this.#maxRunningJobs) {
 			throw new Error(
 				`Background job limit reached (${this.#maxRunningJobs}). Wait for running jobs to finish or cancel one.`,
 			);
@@ -347,9 +430,7 @@ export class AsyncJobManager {
 					jobId: id,
 					signal: abortController.signal,
 					reportProgress,
-					markRunning: () => {
-						job.queued = false;
-					},
+					markRunning: () => this.#markRunning(job),
 				});
 				const text = typeof outcome === "string" ? outcome : outcome.text;
 				const structured = typeof outcome === "string" ? undefined : outcome.structured;
@@ -360,6 +441,7 @@ export class AsyncJobManager {
 					return;
 				}
 				job.status = "completed";
+				this.#wakeCapacityWaiters();
 				job.resultText = text;
 				this.#enqueueDelivery(id, text);
 				this.#scheduleEviction(id);
@@ -372,6 +454,7 @@ export class AsyncJobManager {
 				}
 				const errorText = error instanceof Error ? error.message : String(error);
 				job.status = "failed";
+				this.#wakeCapacityWaiters();
 				job.errorText = errorText;
 				this.#enqueueDelivery(id, errorText);
 				this.#scheduleEviction(id);
@@ -394,6 +477,7 @@ export class AsyncJobManager {
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
 		job.abortController.abort();
+		this.#wakeCapacityWaiters();
 		this.#scheduleEviction(id);
 		return true;
 	}
@@ -557,11 +641,14 @@ export class AsyncJobManager {
 	}
 
 	#cancelJobs(filter?: AsyncJobFilter, reason?: unknown): void {
+		let cancelled = false;
 		for (const job of this.getRunningJobs(filter)) {
 			job.status = "cancelled";
 			job.abortController.abort(reason);
 			this.#scheduleEviction(job.id);
+			cancelled = true;
 		}
+		if (cancelled) this.#wakeCapacityWaiters();
 	}
 
 	/**
@@ -724,6 +811,8 @@ export class AsyncJobManager {
 
 	async dispose(options?: { timeoutMs?: number }): Promise<boolean> {
 		this.#disposed = true;
+		this.#reservations.clear();
+		this.#wakeCapacityWaiters();
 		this.#clearEvictionTimers();
 		this.#cancelJobs(undefined, ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
 		const timeoutMs = Math.max(options?.timeoutMs ?? 3_000, 0);

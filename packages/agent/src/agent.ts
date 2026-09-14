@@ -53,6 +53,7 @@ import type {
 	StreamFn,
 	ToolCallContext,
 	ToolChoiceDirective,
+	ToolInterruptMode,
 } from "./types";
 import { isSoftToolRequirement } from "./types";
 import { EventLoopKeepalive } from "./utils/yield";
@@ -129,10 +130,11 @@ export interface AgentOptions {
 
 	/**
 	 * When to interrupt tool execution for steering messages.
-	 * - "immediate": check after each tool call (default)
+	 * - "immediate": watch every tool batch (default)
+	 * - "blocking": watch only batches that can yield safely
 	 * - "wait": defer steering until the current turn completes
 	 */
-	interruptMode?: "immediate" | "wait";
+	interruptMode?: ToolInterruptMode;
 
 	/**
 	 * API format for Kimi Code provider: "openai" or "anthropic" (default: "anthropic")
@@ -377,7 +379,7 @@ export class Agent {
 
 	#steeringMode: "all" | "one-at-a-time";
 	#followUpMode: "all" | "one-at-a-time";
-	#interruptMode: "immediate" | "wait";
+	#interruptMode: ToolInterruptMode;
 	#sessionId?: string;
 	#deadline?: number;
 	#promptCacheKey?: string;
@@ -952,11 +954,11 @@ export class Agent {
 		return this.#followUpMode;
 	}
 
-	setInterruptMode(mode: "immediate" | "wait") {
+	setInterruptMode(mode: ToolInterruptMode) {
 		this.#interruptMode = mode;
 	}
 
-	getInterruptMode(): "immediate" | "wait" {
+	getInterruptMode(): ToolInterruptMode {
 		return this.#interruptMode;
 	}
 

@@ -201,17 +201,13 @@ import {
 	consumeLoopLimitIteration,
 	createLoopLimitRuntime,
 	describeLoopLimit,
-	describeLoopLimitRuntime,
-	isLoopDurationExpired,
+	hasLoopLimitCapacity,
 	type LoopLimitRuntime,
 	parseLoopLimitArgs,
 } from "./loop-limit";
 import { OAuthManualInputManager } from "./oauth-manual-input";
 import { getRunningSubagentBadgeAgentIds, getRunningSubagentBadgeRegistry } from "./running-subagent-badge";
-import {
-	type SessionObserverChangeKind,
-	SessionObserverRegistry,
-} from "./session-observer-registry";
+import { type SessionObserverChangeKind, SessionObserverRegistry } from "./session-observer-registry";
 import { createSessionTeardown, type SessionTeardown } from "./session-teardown";
 import { runProviderSetupWizard } from "./setup-wizard/lazy";
 import { sanitizeStatusText } from "./shared";
@@ -244,6 +240,8 @@ import { UiHelpers } from "./utils/ui-helpers";
 
 const STILL_CLOSING_DELAY_MS = 3_000;
 const DEFAULT_WORKING_MESSAGE = "Working…";
+const LOOP_COMMAND_USAGE =
+	"Usage: /loop [count|duration] <prompt> | /loop update [count|duration] <prompt> | /loop resume | /loop stop | /loop off";
 
 interface WorkingMessageAccent {
 	main: string;
@@ -262,6 +260,22 @@ interface WorkingMessageAccentCacheKey {
 	sessionName: string | undefined;
 	accentSurfaceLuminance: number | undefined;
 	sessionAccentEnabled: boolean;
+}
+
+interface LoopStateSnapshot {
+	enabled: boolean;
+	paused: boolean;
+	prompt: string | undefined;
+	limit: LoopLimitRuntime | undefined;
+}
+
+interface PendingLoopCommandSubmission {
+	prompt: string;
+	previous: LoopStateSnapshot;
+}
+
+function cloneLoopLimit(limit: LoopLimitRuntime | undefined): LoopLimitRuntime | undefined {
+	return limit ? { ...limit } : undefined;
 }
 
 function renderWorkingMessage(message: string, accent?: WorkingMessageAccent): string {
@@ -381,11 +395,12 @@ function readPersistedToolNames(value: unknown): string[] | undefined {
 }
 
 export function shouldEnterPlanModeOnStartup(
-	sessionManager: Pick<SessionManager, "buildSessionContext" | "getEntries">,
+	sessionManager: Pick<SessionManager, "buildSessionContext">,
 	sessionSettings: Pick<Settings, "get">,
 ): boolean {
-	const hasConversationContext = sessionManager.buildSessionContext().messages.length > 0;
-	const hasExplicitMode = sessionManager.getEntries().some(entry => entry.type === "mode_change");
+	const context = sessionManager.buildSessionContext();
+	const hasConversationContext = context.messages.length > 0;
+	const hasExplicitMode = context.mode !== undefined;
 	return (
 		!hasConversationContext &&
 		!hasExplicitMode &&
@@ -547,6 +562,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	loopPrompt: string | undefined = undefined;
 	loopLimit: LoopLimitRuntime | undefined = undefined;
 	#loopAutoSubmitTimer: NodeJS.Timeout | undefined;
+	#loopActionInFlight: Promise<void> | undefined;
+	#loopCommandVersion = 0;
+	#pendingLoopCommandSubmission: PendingLoopCommandSubmission | undefined;
 	#todoAutoClearTimer: NodeJS.Timeout | undefined;
 	#modelCycleClearTimer: NodeJS.Timeout | undefined;
 	#nextAppearanceRequestToken = 1;
@@ -1668,7 +1686,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#scheduleLoopAutoSubmit(): void {
 		this.#cancelLoopAutoSubmit();
-		if (!this.loopModeEnabled || !this.loopPrompt) return;
+		if (!this.loopModeEnabled || this.loopModePaused || !this.loopPrompt) return;
 		const prompt = this.loopPrompt;
 		const loopAction = settings.get("loop.mode");
 		this.#deferLoopAutoSubmit(() => {
@@ -1680,7 +1698,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Brief delay so the user has a chance to press Esc between iterations.
 		this.#loopAutoSubmitTimer = setTimeout(() => {
 			this.#loopAutoSubmitTimer = undefined;
-			if (!this.loopModeEnabled || !this.onInputCallback) return;
+			if (!this.loopModeEnabled || this.loopModePaused || !this.onInputCallback) return;
 			callback();
 		}, 800);
 	}
@@ -1690,6 +1708,27 @@ export class InteractiveMode implements InteractiveModeContext {
 			clearTimeout(this.#loopAutoSubmitTimer);
 			this.#loopAutoSubmitTimer = undefined;
 		}
+	}
+
+	#snapshotLoopState(): LoopStateSnapshot {
+		return {
+			enabled: this.loopModeEnabled,
+			paused: this.loopModePaused,
+			prompt: this.loopPrompt,
+			limit: cloneLoopLimit(this.loopLimit),
+		};
+	}
+
+	#restoreLoopState(snapshot: LoopStateSnapshot): void {
+		this.loopModeEnabled = snapshot.enabled;
+		this.loopModePaused = snapshot.paused;
+		this.loopPrompt = snapshot.prompt;
+		this.loopLimit = cloneLoopLimit(snapshot.limit);
+	}
+
+	#disableLoopForExhaustedLimit(): void {
+		const message = this.loopLimit?.kind === "duration" ? "Loop time limit reached." : "Loop limit reached.";
+		this.disableLoopMode(`${message} Loop mode disabled.`);
 	}
 
 	#scheduleGoalContinuation(): void {
@@ -1760,20 +1799,21 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#submitLoopPromptWhenReady(prompt: string): void {
-		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
-		if (isLoopDurationExpired(this.loopLimit)) {
-			this.disableLoopMode("Loop time limit reached. Loop mode disabled.");
-			return;
-		}
+		if (this.loopModePaused || !this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
 		if (this.#isAutoSubmitBlocked()) {
 			this.#deferLoopAutoSubmit(() => this.#submitLoopPromptWhenReady(prompt));
 			return;
 		}
+		if (!consumeLoopLimitIteration(this.loopLimit)) {
+			this.#disableLoopForExhaustedLimit();
+			return;
+		}
+		this.#syncLoopModeStatus();
 		this.onInputCallback(this.startPendingSubmission({ text: prompt }));
 	}
 
 	async #runLoopIteration(action: "prompt" | "compact" | "reset", prompt: string): Promise<void> {
-		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
+		if (this.loopModePaused || !this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
 		if (this.#isAutoSubmitBlocked()) {
 			this.#deferLoopAutoSubmit(() => {
 				void this.#runLoopIteration(action, prompt);
@@ -1786,32 +1826,43 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
-		if (!consumeLoopLimitIteration(this.loopLimit)) {
-			this.disableLoopMode("Loop limit reached. Loop mode disabled.");
+		// Compact/reset work is useful only when another prompt is budgeted, but
+		// the iteration is not consumed until that prompt is actually submitted.
+		if (!hasLoopLimitCapacity(this.loopLimit)) {
+			this.#disableLoopForExhaustedLimit();
 			return;
 		}
-		this.#syncLoopModeStatus();
 
+		let actionInFlight: Promise<void> | undefined;
 		if (action === "compact") {
-			await this.handleCompactCommand();
+			actionInFlight = this.handleCompactCommand().then(() => undefined);
 		} else if (action === "reset") {
-			await this.handleClearCommand();
+			actionInFlight = this.handleClearCommand();
 		}
+		if (actionInFlight) {
+			this.#loopActionInFlight = actionInFlight;
+			try {
+				await actionInFlight;
+			} finally {
+				if (this.#loopActionInFlight === actionInFlight) {
+					this.#loopActionInFlight = undefined;
+				}
+			}
+		}
+		if (this.loopModePaused || !this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
 		this.#submitLoopPromptWhenReady(prompt);
 	}
 
 	#syncLoopModeStatus(): void {
-		const state: "waiting" | "running" | "paused" = this.loopModePaused
-			? "paused"
-			: this.loopPrompt
-				? "running"
-				: "waiting";
+		const state: "running" | "paused" = this.loopModePaused ? "paused" : "running";
 		this.statusLine.setLoopModeStatus(this.loopModeEnabled ? { state, limit: this.loopLimit } : undefined);
 		this.ui.requestRender();
 	}
 
 	disableLoopMode(message = "Loop mode disabled."): void {
 		const wasEnabled = this.loopModeEnabled;
+		this.#loopCommandVersion++;
+		this.#pendingLoopCommandSubmission = undefined;
 		this.loopModeEnabled = false;
 		this.loopModePaused = false;
 		this.loopPrompt = undefined;
@@ -1823,50 +1874,106 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 	}
 
-	setLoopPrompt(prompt: string): void {
-		if (!this.loopModeEnabled) return;
-		this.loopPrompt = prompt;
-		this.loopModePaused = false;
-		this.#syncLoopModeStatus();
-	}
-
 	/**
-	 * Pause the loop without exiting it: drops the captured prompt and any
-	 * pending auto-resubmit. Loop mode stays enabled — the next prompt the
-	 * user submits becomes the new loop prompt and resumes iteration.
+	 * Pause loop scheduling without discarding the recurring prompt or limit.
+	 * Only an explicit `/loop resume` or prompt-replacing `/loop …` command can
+	 * resume it.
 	 */
 	pauseLoop(): void {
-		this.loopPrompt = undefined;
+		this.#loopCommandVersion++;
+		this.#pendingLoopCommandSubmission = undefined;
+		if (!this.loopModeEnabled || !this.loopPrompt) return;
 		this.loopModePaused = true;
 		this.#cancelLoopAutoSubmit();
 		this.#syncLoopModeStatus();
 	}
 
+	/** Commit or roll back the latest matching prompt returned by `/loop`. */
+	finishLoopCommandSubmission(prompt: string, error?: unknown): void {
+		const pending = this.#pendingLoopCommandSubmission;
+		if (!pending || pending.prompt !== prompt) return;
+		this.#pendingLoopCommandSubmission = undefined;
+		if (error === undefined) return;
+
+		this.#loopCommandVersion++;
+		this.#cancelLoopAutoSubmit();
+		this.#restoreLoopState(pending.previous);
+		this.#syncLoopModeStatus();
+		if (this.loopModeEnabled && !this.loopModePaused && this.loopPrompt) {
+			this.#scheduleLoopAutoSubmit();
+		}
+	}
+
 	async handleLoopCommand(args = ""): Promise<string | undefined> {
-		if (this.loopModeEnabled) {
+		const command = args.trim();
+		if (!command) {
+			if (this.loopModeEnabled) {
+				this.disableLoopMode();
+			} else {
+				this.showError(LOOP_COMMAND_USAGE);
+			}
+			return undefined;
+		}
+
+		const normalized = command.toLowerCase();
+		if (normalized === "stop" || normalized === "off") {
 			this.disableLoopMode();
 			return undefined;
 		}
-		const parsed = parseLoopLimitArgs(args);
+
+		if (normalized === "resume") {
+			if (!this.loopModeEnabled || !this.loopPrompt) {
+				this.showError("No loop prompt to resume. Start one with /loop <prompt>.");
+				return undefined;
+			}
+			this.loopModePaused = false;
+			this.#syncLoopModeStatus();
+			this.#scheduleLoopAutoSubmit();
+			this.showStatus("Loop resumed.");
+			return undefined;
+		}
+
+		const updateMatch = /^update(?:\s+([\s\S]*))?$/i.exec(command);
+		if (updateMatch && !updateMatch[1]?.trim()) {
+			this.showError(LOOP_COMMAND_USAGE);
+			return undefined;
+		}
+		const loopArgs = updateMatch ? updateMatch[1]!.trim() : command;
+		const parsed = parseLoopLimitArgs(loopArgs);
 		if (typeof parsed === "string") {
 			this.showError(parsed);
 			return undefined;
 		}
+		if (!parsed.prompt) {
+			this.showError(LOOP_COMMAND_USAGE);
+			return undefined;
+		}
+
+		const previous = this.#snapshotLoopState();
+		const commandVersion = ++this.#loopCommandVersion;
+		const wasEnabled = this.loopModeEnabled;
+		this.#pendingLoopCommandSubmission = undefined;
+		this.#cancelLoopAutoSubmit();
+		const actionInFlight = this.#loopActionInFlight;
+		if (actionInFlight) {
+			if (this.loopModeEnabled && this.loopPrompt) {
+				this.loopModePaused = true;
+				this.#syncLoopModeStatus();
+			}
+			await actionInFlight.catch(() => undefined);
+			if (commandVersion !== this.#loopCommandVersion) return undefined;
+		}
+
+		this.#pendingLoopCommandSubmission = { prompt: parsed.prompt, previous };
 		this.loopModeEnabled = true;
 		this.loopModePaused = false;
-		this.loopPrompt = undefined;
+		this.loopPrompt = parsed.prompt;
 		this.loopLimit = createLoopLimitRuntime(parsed.limit);
 		this.#syncLoopModeStatus();
-		const limitSuffix = parsed.limit ? ` Limited to ${describeLoopLimit(parsed.limit)}.` : "";
-		const remainingSuffix = this.loopLimit ? ` ${describeLoopLimitRuntime(this.loopLimit)}.` : "";
-		const tail = parsed.prompt ? "Repeating it after each turn." : "Your next prompt will repeat after each turn.";
-		this.showStatus(
-			`Loop mode enabled.${limitSuffix}${remainingSuffix} ${tail} Esc cancels the current iteration; /loop again to disable.`,
-		);
-		// Hand any inline prompt back to the dispatcher so the normal submit flow
-		// runs the first iteration — it records the text as the loop prompt and
-		// auto-resubmits it after each yield, identical to typing the prompt right
-		// after enabling loop mode.
+		const limitSuffix = parsed.limit ? ` Limited to ${describeLoopLimit(parsed.limit)}.` : " Unbounded.";
+		this.showStatus(`Loop ${wasEnabled ? "restarted" : "started"}.${limitSuffix} Esc pauses; bare /loop stops.`);
+		// Hand the captured prompt back to the dispatcher so the first iteration
+		// follows the normal submission path. Only explicit loop commands assign it.
 		return parsed.prompt;
 	}
 
@@ -1973,6 +2080,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			customType?: string;
 			display?: boolean;
 			streamingBehavior?: "steer" | "followUp";
+			loopCommandPrompt?: string;
 		},
 		options?: { preserveDraft?: boolean },
 	): SubmittedUserInput {
@@ -1983,6 +2091,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			customType: input.customType,
 			display: input.display,
 			streamingBehavior: input.streamingBehavior,
+			loopCommandPrompt: input.loopCommandPrompt,
 			cancelled: false,
 			started: false,
 		};
@@ -5733,15 +5842,15 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	showUserMessageSelector(): void {
-		this.#selectorController.showUserMessageSelector();
+		void this.#selectorController.showUserMessageSelector();
 	}
 
 	showCopySelector(): void {
-		this.#selectorController.showCopySelector();
+		void this.#selectorController.showCopySelector();
 	}
 
 	showTreeSelector(): void {
-		this.#selectorController.showTreeSelector();
+		void this.#selectorController.showTreeSelector();
 	}
 
 	showSessionSelector(source?: ForeignSessionSource): void {

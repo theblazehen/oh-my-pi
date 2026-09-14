@@ -174,7 +174,10 @@ export function nextActionableTask(phases: readonly TodoPhase[]): TodoItem | und
 
 export const USER_TODO_EDIT_CUSTOM_TYPE = "user_todo_edit";
 
-export function getLatestTodoPhasesFromEntries(entries: SessionEntry[]): TodoPhase[] {
+export function getLatestTodoPhasesFromEntries(
+	entries: readonly SessionEntry[],
+	fallback: TodoPhase[] = [],
+): TodoPhase[] {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		if (entry.type === "custom" && entry.customType === USER_TODO_EDIT_CUSTOM_TYPE) {
@@ -194,7 +197,7 @@ export function getLatestTodoPhasesFromEntries(entries: SessionEntry[]): TodoPha
 		return clonePhases(details.phases as TodoPhase[]);
 	}
 
-	return [];
+	return clonePhases(fallback);
 }
 
 /** Minimum overlap (after normalization) required for a substring match.

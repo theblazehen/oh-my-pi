@@ -305,16 +305,23 @@ export function buildModelScopeNotification(
 export async function submitInteractiveInput(
 	mode: Pick<
 		InteractiveMode,
-		"markPendingSubmissionStarted" | "finishPendingSubmission" | "showError" | "checkShutdownRequested"
-	> &
-		Partial<Pick<InteractiveMode, "loopPrompt" | "pauseLoop">>,
+		| "markPendingSubmissionStarted"
+		| "finishPendingSubmission"
+		| "finishLoopCommandSubmission"
+		| "showError"
+		| "checkShutdownRequested"
+	>,
 	session: Pick<AgentSession, "prompt" | "promptCustomMessage" | "isStreaming">,
 	input: SubmittedUserInput,
 ): Promise<void> {
 	if (input.cancelled) {
+		if (input.loopCommandPrompt) {
+			mode.finishLoopCommandSubmission(input.loopCommandPrompt, "Submission cancelled");
+		}
 		return;
 	}
 
+	let submissionError: unknown;
 	try {
 		using _keepalive = new EventLoopKeepalive();
 		// Honor the submission's queue intent, defaulting to followUp. Reading
@@ -333,6 +340,7 @@ export async function submitInteractiveInput(
 		// Continue shortcuts submit an already-started synthetic developer prompt with
 		// no optimistic user message.
 		if (!input.started && !mode.markPendingSubmissionStarted(input)) {
+			submissionError = "Submission cancelled";
 			return;
 		}
 		if (input.customType) {
@@ -356,23 +364,22 @@ export async function submitInteractiveInput(
 				userInitiated: input.userInitiated,
 			});
 		} else {
-			let forwarded = false;
-			try {
-				forwarded = await session.prompt(input.text, { images: input.images, streamingBehavior });
-			} catch (error: unknown) {
-				mode.showError(error instanceof Error ? error.message : "Unknown error occurred");
-			}
-			// Dispatch consumed the body locally (void custom command) or rejected
-			// instead of starting a turn: when it is the armed loop body, park the
-			// loop rather than resubmitting a failed or local-only body after
-			// every yield. A failed body degrades to idle like any other
-			// submission failure instead of error-looping.
-			if (!forwarded && mode.loopPrompt === input.text) mode.pauseLoop?.();
+			const forwarded = await session.prompt(
+				input.text,
+				input.loopCommandPrompt
+					? { images: input.images, streamingBehavior, expandPromptTemplates: false }
+					: { images: input.images, streamingBehavior },
+			);
+			if (forwarded === false && input.loopCommandPrompt) submissionError = "Submission was handled locally";
 		}
 	} catch (error: unknown) {
+		submissionError = error;
 		const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 		mode.showError(errorMessage);
 	} finally {
+		if (input.loopCommandPrompt) {
+			mode.finishLoopCommandSubmission(input.loopCommandPrompt, submissionError);
+		}
 		mode.finishPendingSubmission(input);
 		await mode.checkShutdownRequested();
 	}
@@ -1037,7 +1044,7 @@ export async function createSessionManager(
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
 		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
-		if (manager.getEntries().length > 0) {
+		if (manager.getTotalEntryCount() > 0) {
 			parsed.continue = true;
 		}
 		return manager;
@@ -1670,6 +1677,7 @@ export async function runRootCommand(
 							allowDelete: false,
 							allowGlobalScope: false,
 							historySearch: false,
+							preview: false,
 						},
 					);
 				} finally {
@@ -1805,7 +1813,7 @@ export async function runRootCommand(
 		}
 
 		if (sessionManager && (parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource)) {
-			const pendingToolWarning = describePendingToolCalls(sessionManager.getBranch());
+			const pendingToolWarning = describePendingToolCalls(await sessionManager.getBranchAsync());
 			if (pendingToolWarning) {
 				logger.warn("Resumed session has pending tool calls", {
 					sessionId: sessionManager.getSessionId(),

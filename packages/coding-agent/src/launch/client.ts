@@ -139,6 +139,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	readonly #token: string;
 	readonly #seenCompletionIds = new Set<string>();
 	readonly #idleGraceMs: number | undefined;
+	readonly #onBrokerSpawn: ((child: Bun.Subprocess) => void) | undefined;
 	readonly #pending = new Map<string, PendingRequest>();
 	readonly #completionSinks = new Map<string, (notification: DaemonCompletionNotification) => Promise<void> | void>();
 	readonly #completionUnsubscribes = new Set<string>();
@@ -152,12 +153,19 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	#closed = false;
 	#completionReconnectTimer: NodeJS.Timeout | undefined;
 
-	constructor(projectDir: string, runtimeDir: string, token: string, options: DaemonBrokerClientOptions) {
+	constructor(
+		projectDir: string,
+		runtimeDir: string,
+		token: string,
+		options: DaemonBrokerClientOptions,
+		onBrokerSpawn?: (child: Bun.Subprocess) => void,
+	) {
 		this.projectDir = projectDir;
 		this.#runtimeDir = runtimeDir;
 		this.#endpoint = daemonBrokerEndpoint(projectDir, runtimeDir);
 		this.#token = token;
 		this.#idleGraceMs = options.idleGraceMs;
+		this.#onBrokerSpawn = onBrokerSpawn;
 	}
 
 	async request(operation: DaemonOperation, signal?: AbortSignal): Promise<DaemonRpcResult> {
@@ -320,6 +328,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 			stderr: "ignore",
 			...BROKER_SPAWN_OPTIONS,
 		});
+		this.#onBrokerSpawn?.(child);
 		child.unref();
 	}
 
@@ -513,14 +522,43 @@ export async function smokeTestDaemonBroker(): Promise<void> {
 	const smokeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-daemon-smoke-"));
 	const projectDir = path.join(smokeRoot, "project");
 	const runtimeDir = path.join(smokeRoot, "run");
-	await fs.mkdir(projectDir, { recursive: true });
-	const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+	let client: SocketDaemonClient | undefined;
+	let broker: Bun.Subprocess | undefined;
 	try {
+		await fs.mkdir(projectDir, { recursive: true });
+		client = new SocketDaemonClient(
+			await canonicalProjectDir(projectDir),
+			runtimeDir,
+			await readOrCreateToken(runtimeDir),
+			{ idleGraceMs: 5_000 },
+			child => {
+				broker = child;
+			},
+		);
 		const ping = await client.request({ op: "ping" });
 		if (ping.op !== "ping" || ping.projectDir !== client.projectDir) throw new Error("daemon broker ping mismatch");
 		await client.request({ op: "shutdown" });
+		if (!broker) throw new Error("Daemon smoke did not spawn its private broker");
+		// The RPC acknowledges the request, not process exit. Wait for the owned
+		// worker to release all file descriptors before removing its NFS directory.
+		let timer: NodeJS.Timeout | undefined;
+		try {
+			const exitCode = await Promise.race([
+				broker.exited,
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(() => reject(new Error("Daemon broker shutdown timed out")), CONNECT_TIMEOUT_MS);
+				}),
+			]);
+			if (exitCode !== 0) throw new Error(`Daemon broker exited with code ${exitCode}`);
+		} finally {
+			clearTimeout(timer);
+		}
 	} finally {
-		client.close();
+		client?.close();
+		if (broker) {
+			if (broker.exitCode === null && broker.signalCode == null) broker.kill("SIGKILL");
+			await broker.exited;
+		}
 		await fs.rm(smokeRoot, { recursive: true, force: true });
 	}
 }

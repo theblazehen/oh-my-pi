@@ -35,6 +35,20 @@ describe("/loop slash command", () => {
 		expect(result).toBe("fix the failing tests");
 		expect(setText).toHaveBeenCalledWith("");
 	});
+
+	test("forwards the explicit update form and propagates its replacement prompt", async () => {
+		const handleLoopCommand = vi.fn(async (_args?: string) => "new recurring prompt");
+		const setText = vi.fn();
+		const runtime = {
+			ctx: { handleLoopCommand, editor: { setText } },
+		} as unknown as BuiltinSlashCommandRuntime;
+
+		const result = await executeBuiltinSlashCommand("/loop update new recurring prompt", runtime);
+
+		expect(handleLoopCommand).toHaveBeenCalledWith("update new recurring prompt");
+		expect(result).toBe("new recurring prompt");
+		expect(setText).toHaveBeenCalledWith("");
+	});
 });
 
 describe("loop limit parsing", () => {

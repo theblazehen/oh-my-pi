@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved focused fullscreen editor cursors, terminal graphics, and nested mouse-tracking transitions through the current terminal frame renderer.
+- Fixed inline images staying pinned while scrolling in Kitty-capable Herdr panes by honoring the advertised graphics capability for Unicode placeholders.
+
 ## [18.1.14] - 2026-09-07
 
 ### Fixed
@@ -337,6 +342,9 @@
 
 - Fixed animated Loader paints saturating a CPU core on slow WSL/ConPTY terminals by applying cost-aware cadence backpressure while preserving 30fps on cheap frames ([#7290](https://github.com/can1357/oh-my-pi/issues/7290)).
 - Fixed interactive terminals suppressing all output and input when the host project sets `NODE_ENV=test` or `BUN_ENV=test` ([#7261](https://github.com/can1357/oh-my-pi/issues/7261)).
+### Fixed
+
+- Fixed slash commands typed at the start of a recalled history entry jumping to the end of the prompt.
 
 ## [17.2.2] - 2026-07-31
 

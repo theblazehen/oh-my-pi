@@ -358,7 +358,7 @@ export class WorkPool {
 			"task",
 			batch.id,
 			async ({ signal, reportProgress, markRunning }) => {
-				markRunning();
+				await markRunning();
 				const onProgress = (progress: AgentProgress): void => {
 					if (progress.contextTokens !== undefined) agent.contextTokens = progress.contextTokens;
 					if (progress.contextWindow !== undefined) agent.contextWindow = progress.contextWindow;

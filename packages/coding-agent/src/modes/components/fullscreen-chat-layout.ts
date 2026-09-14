@@ -11,6 +11,7 @@ import {
 	sliceWithWidth,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
+import type { TranscriptBlockSource } from "./transcript-container";
 
 export interface FullscreenChatLayoutOptions {
 	/** Aggregate containing the welcome/transcript and transient upper HUD rows. */
@@ -30,24 +31,93 @@ export interface FullscreenChatLayoutOptions {
 	requestRender?: () => void;
 	/** Number of transcript rows moved by one wheel report. */
 	wheelScrollRows?: number;
-	/** Maximum number of rendered transcript physical rows retained by the viewport. */
+	/** Resident row budget; a single complete block may exceed it. */
 	maxTranscriptRows?: number;
 	/** Receives plain text when an application-owned drag selection is released. */
 	copyText?: (text: string) => void;
 }
 
+interface FullscreenTranscriptBlockRender {
+	identity: Component;
+	lines: readonly string[];
+	/** Adjacent non-empty blocks with the same group receive one blank separator. */
+	separatorGroup?: Component;
+}
+
+interface LocatedFullscreenTranscriptBlock {
+	identity: Component;
+	source?: TranscriptBlockSource;
+	localOrdinal: number;
+}
+
+function isTranscriptBlockSource(component: Component): component is TranscriptBlockSource {
+	const source = component as Partial<TranscriptBlockSource>;
+	return (
+		typeof source.getTranscriptBlockCount === "function" &&
+		typeof source.getTranscriptBlockIdentity === "function" &&
+		typeof source.renderTranscriptBlock === "function"
+	);
+}
+
 /**
- * Aggregate for transcript producers that mutate a persistent rendered-row
- * array in place. Unlike Container, this always rebuilds its concatenation so
- * streaming rows cannot be hidden behind child-array reference equality.
+ * Borrowed composition of upstream transcript sources and ordinary chrome.
+ * Resolves identities from their owner on demand; never registers blocks or
+ * changes their lifecycle. Both this composition and a bare transcript use the
+ * same complete-block source contract in the fullscreen viewport.
  */
-export class FullscreenTranscriptAggregate implements Component {
+export class FullscreenTranscriptAggregate implements TranscriptBlockSource {
 	constructor(readonly children: readonly Component[]) {}
+
+	getTranscriptBlockCount(): number {
+		let count = 0;
+		for (const child of this.children) {
+			count += isTranscriptBlockSource(child) ? child.getTranscriptBlockCount() : 1;
+		}
+		return count;
+	}
+
+	getTranscriptBlockIdentity(ordinal: number): Component | undefined {
+		return this.#locateBlock(ordinal)?.identity;
+	}
+
+	renderTranscriptBlock(ordinal: number, width: number): readonly string[] {
+		const located = this.#locateBlock(ordinal);
+		if (!located) return [];
+		return located.source
+			? located.source.renderTranscriptBlock(located.localOrdinal, width)
+			: located.identity.render(width);
+	}
+
+	getTranscriptBlockSeparatorGroup(ordinal: number): Component | undefined {
+		const located = this.#locateBlock(ordinal);
+		return located?.source?.getTranscriptBlockSeparatorGroup
+			? located.source.getTranscriptBlockSeparatorGroup(located.localOrdinal)
+			: located?.source;
+	}
 
 	render(width: number): readonly string[] {
 		const lines: string[] = [];
 		for (const child of this.children) lines.push(...child.render(width));
 		return lines;
+	}
+
+	#locateBlock(ordinal: number): LocatedFullscreenTranscriptBlock | undefined {
+		if (!Number.isInteger(ordinal) || ordinal < 0) return undefined;
+		let remaining = ordinal;
+		for (const child of this.children) {
+			if (isTranscriptBlockSource(child)) {
+				const count = child.getTranscriptBlockCount();
+				if (remaining < count) {
+					const identity = child.getTranscriptBlockIdentity(remaining);
+					return identity ? { identity, source: child, localOrdinal: remaining } : undefined;
+				}
+				remaining -= count;
+				continue;
+			}
+			if (remaining === 0) return { identity: child, localOrdinal: 0 };
+			remaining--;
+		}
+		return undefined;
 	}
 }
 
@@ -68,12 +138,29 @@ interface RenderedComponents {
 	counts: number[];
 }
 
+interface ResidentTranscriptBlock extends FullscreenTranscriptBlockRender {
+	ordinal: number;
+	/** First resident row, including this block's separator when present. */
+	startRow: number;
+	separatorRows: 0 | 1;
+	/** Separator plus complete contribution; zero for an empty contribution. */
+	rowCount: number;
+}
+
+interface ResidentRowAnchor {
+	identity: Component;
+	rowInContribution: number;
+	separator: boolean;
+}
+
+type PendingPagedJump = "start" | "end";
+
 /**
  * Fullscreen chat viewport. All children are borrowed: this component lays them
  * out, but never disposes or reparents them.
  */
 export class FullscreenChatLayout implements Component, Focusable, OverlayFocusOwner {
-	#transcript: Component;
+	#transcriptPager: TranscriptBlockSource;
 	#editor: Component;
 	#editorHost: Component;
 	#editorHostFollowsEditor: boolean;
@@ -90,15 +177,23 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 	#focused = false;
 	#useTerminalCursor = false;
 	#transcriptLines: readonly string[] = [];
-	#previousDroppedRows = 0;
 	#transcriptHeight = 0;
+	#residentBlocks: ResidentTranscriptBlock[] = [];
+	#residentStartOrdinal = 0;
+	#residentEndOrdinal = 0;
+	#residentWidth = -1;
+	#residentEvictionEdge: "head" | "tail" = "head";
+	#pagedInitialized = false;
+	#pendingPagedJump: PendingPagedJump | undefined;
 	#pinnedHitRanges: readonly PinnedHitRange[] = [];
 	#selectionAnchor: SelectionPoint | undefined;
 	#selectionFocus: SelectionPoint | undefined;
 	#selectionDragged = false;
 
 	constructor(options: FullscreenChatLayoutOptions) {
-		this.#transcript = options.transcript;
+		this.#transcriptPager = isTranscriptBlockSource(options.transcript)
+			? options.transcript
+			: new FullscreenTranscriptAggregate([options.transcript]);
 		this.#editor = options.editor;
 		this.#editorHost = options.editorHost ?? options.editor;
 		this.#editorHostFollowsEditor = options.editorHost === undefined;
@@ -154,7 +249,7 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 		if (
 			routeSgrMouseInput(data, event => {
 				if (event.wheel !== null) {
-					this.#scrollView.scroll(event.wheel * this.#wheelScrollRows);
+					this.#scrollTranscript(event.wheel * this.#wheelScrollRows);
 					this.#syncFollowBottom();
 					this.#requestRender();
 					return true;
@@ -183,20 +278,9 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 		const pinned = [...beforeEditor.lines, ...editor, ...afterEditor.lines];
 		const transcriptHeight = Math.max(0, terminalRows - pinned.length);
 
-		const renderedTranscript = [...this.#transcript.render(width)];
-		const droppedRows = Math.max(0, renderedTranscript.length - this.#maxTranscriptRows);
-		const transcriptLines = renderedTranscript.slice(droppedRows);
-		const previousOffset = this.#scrollView.getScrollOffset();
-		const newlyDroppedRows = Math.max(0, droppedRows - this.#previousDroppedRows);
-		this.#scrollView.setLines(transcriptLines);
 		this.#scrollView.setHeight(transcriptHeight);
-		if (!this.#followBottom && newlyDroppedRows > 0) {
-			this.#scrollView.setScrollOffset(previousOffset - newlyDroppedRows);
-		}
-		if (this.#followBottom) this.#scrollView.scrollToBottom();
-		this.#transcriptLines = transcriptLines;
-		this.#previousDroppedRows = droppedRows;
 		this.#transcriptHeight = transcriptHeight;
+		this.#renderPagedTranscript(width);
 		this.#pinnedHitRanges = this.#buildPinnedHitRanges(terminalRows, beforeEditor, editor.length, afterEditor);
 
 		if (terminalRows === 0) return [];
@@ -206,6 +290,344 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 		const frame = [...transcriptFrame, ...pinned];
 		while (frame.length < terminalRows) frame.unshift("");
 		return frame;
+	}
+
+	#renderPagedTranscript(width: number): void {
+		const pager = this.#transcriptPager;
+		const count = pager.getTranscriptBlockCount();
+		let rendered = false;
+
+		if (this.#pendingPagedJump === "start") {
+			this.#replaceResidentFromStart(pager, count, width);
+			this.#followBottom = false;
+			this.#scrollView.scrollToTop();
+			this.#pendingPagedJump = undefined;
+			rendered = true;
+		} else if (this.#pendingPagedJump === "end") {
+			this.#replaceResidentFromTail(pager, count, width);
+			this.#followBottom = true;
+			this.#pendingPagedJump = undefined;
+			rendered = true;
+		} else if (!this.#pagedInitialized) {
+			this.#replaceResidentFromTail(pager, count, width);
+			rendered = true;
+		} else if (
+			this.#followBottom &&
+			(this.#residentEndOrdinal !== count || !this.#residentIdentitiesMatch(pager, count))
+		) {
+			this.#replaceResidentFromTail(pager, count, width);
+			rendered = true;
+		} else if (!this.#residentIdentitiesMatch(pager, count)) {
+			this.#reconcileResidentIdentities(pager, count, width);
+			rendered = true;
+		}
+
+		if (!rendered) {
+			this.#refreshResidentBlocks(pager, width);
+		}
+		this.#residentWidth = width;
+		this.#pagedInitialized = true;
+		this.#trimResidentBlocks(this.#residentEvictionEdge);
+		if (this.#followBottom) this.#scrollView.scrollToBottom();
+	}
+
+	#replaceResidentFromTail(pager: TranscriptBlockSource, count: number, width: number): void {
+		this.#residentEvictionEdge = "head";
+		const targetRows = this.#pageTargetRows();
+		const blockLimit = this.#pageTargetBlocks();
+		const reversed: ResidentTranscriptBlock[] = [];
+		let rows = 0;
+		let ordinal = count;
+		let lowerGroup: Component | undefined;
+		while (ordinal > 0 && rows < targetRows && reversed.length < blockLimit) {
+			ordinal--;
+			const block = this.#renderResidentBlock(pager, ordinal, width);
+			if (!block) continue;
+			if (block.lines.length > 0) {
+				rows +=
+					block.lines.length + (block.separatorGroup !== undefined && block.separatorGroup === lowerGroup ? 1 : 0);
+				lowerGroup = block.separatorGroup;
+			}
+			reversed.push(block);
+		}
+		reversed.reverse();
+		this.#commitResidentBlocks(reversed, ordinal, count, false);
+	}
+
+	#replaceResidentFromStart(pager: TranscriptBlockSource, count: number, width: number): void {
+		this.#residentEvictionEdge = "tail";
+		const targetRows = this.#pageTargetRows();
+		const blockLimit = this.#pageTargetBlocks();
+		const blocks: ResidentTranscriptBlock[] = [];
+		let rows = 0;
+		let ordinal = 0;
+		let previousGroup: Component | undefined;
+		while (ordinal < count && rows < targetRows && blocks.length < blockLimit) {
+			const block = this.#renderResidentBlock(pager, ordinal, width);
+			ordinal++;
+			if (!block) continue;
+			if (block.lines.length > 0) {
+				rows +=
+					block.lines.length +
+					(block.separatorGroup !== undefined && block.separatorGroup === previousGroup ? 1 : 0);
+				previousGroup = block.separatorGroup;
+			}
+			blocks.push(block);
+		}
+		this.#commitResidentBlocks(blocks, 0, ordinal, false);
+	}
+
+	#refreshResidentBlocks(pager: TranscriptBlockSource, width: number): void {
+		const blocks: ResidentTranscriptBlock[] = [];
+		for (let ordinal = this.#residentStartOrdinal; ordinal < this.#residentEndOrdinal; ordinal++) {
+			const block = this.#renderResidentBlock(pager, ordinal, width);
+			if (block) blocks.push(block);
+		}
+		this.#commitResidentBlocks(blocks, this.#residentStartOrdinal, this.#residentEndOrdinal, !this.#followBottom);
+	}
+
+	#reconcileResidentIdentities(pager: TranscriptBlockSource, count: number, width: number): void {
+		const visibleAnchor = this.#captureResidentRowAnchor(this.#scrollView.getScrollOffset());
+		let anchorOrdinal: number | undefined;
+		if (visibleAnchor) {
+			for (let ordinal = 0; ordinal < count; ordinal++) {
+				if (pager.getTranscriptBlockIdentity(ordinal) === visibleAnchor.identity) {
+					anchorOrdinal = ordinal;
+					break;
+				}
+			}
+		}
+		const oldBlockCount = Math.max(1, this.#residentEndOrdinal - this.#residentStartOrdinal);
+		const oldAnchorIndex = visibleAnchor
+			? Math.max(
+					0,
+					this.#residentBlocks.findIndex(block => block.identity === visibleAnchor.identity),
+				)
+			: 0;
+		let start =
+			anchorOrdinal === undefined
+				? Math.min(this.#residentStartOrdinal, Math.max(0, count - oldBlockCount))
+				: Math.max(0, anchorOrdinal - oldAnchorIndex);
+		const end = Math.min(count, start + oldBlockCount);
+		start = Math.max(0, end - oldBlockCount);
+		const blocks: ResidentTranscriptBlock[] = [];
+		for (let ordinal = start; ordinal < end; ordinal++) {
+			const block = this.#renderResidentBlock(pager, ordinal, width);
+			if (block) blocks.push(block);
+		}
+		this.#commitResidentBlocks(blocks, start, end, true);
+	}
+
+	#residentIdentitiesMatch(pager: TranscriptBlockSource, count: number): boolean {
+		if (this.#residentStartOrdinal < 0 || this.#residentEndOrdinal > count) return false;
+		if (this.#residentBlocks.length !== this.#residentEndOrdinal - this.#residentStartOrdinal) return false;
+		for (const block of this.#residentBlocks) {
+			if (pager.getTranscriptBlockIdentity(block.ordinal) !== block.identity) return false;
+		}
+		return true;
+	}
+
+	#renderResidentBlock(
+		pager: TranscriptBlockSource,
+		ordinal: number,
+		width: number,
+	): ResidentTranscriptBlock | undefined {
+		const identity = pager.getTranscriptBlockIdentity(ordinal);
+		if (!identity) return undefined;
+		return {
+			identity,
+			lines: pager.renderTranscriptBlock(ordinal, width),
+			separatorGroup: pager.getTranscriptBlockSeparatorGroup
+				? pager.getTranscriptBlockSeparatorGroup(ordinal)
+				: pager,
+			ordinal,
+			startRow: 0,
+			separatorRows: 0,
+			rowCount: 0,
+		};
+	}
+
+	#commitResidentBlocks(
+		blocks: ResidentTranscriptBlock[],
+		startOrdinal: number,
+		endOrdinal: number,
+		preserveViewport: boolean,
+	): void {
+		const topAnchor = preserveViewport
+			? this.#captureResidentRowAnchor(this.#scrollView.getScrollOffset())
+			: undefined;
+		const selectionAnchor = this.#selectionAnchor
+			? this.#captureResidentRowAnchor(this.#selectionAnchor.row)
+			: undefined;
+		const selectionFocus = this.#selectionFocus
+			? this.#captureResidentRowAnchor(this.#selectionFocus.row)
+			: undefined;
+		const lines: string[] = [];
+		let previousGroup: Component | undefined;
+		for (const block of blocks) {
+			block.startRow = lines.length;
+			block.separatorRows = 0;
+			if (block.lines.length === 0) {
+				block.rowCount = 0;
+				continue;
+			}
+			if (block.separatorGroup !== undefined && block.separatorGroup === previousGroup) {
+				lines.push("");
+				block.separatorRows = 1;
+			}
+			for (const line of block.lines) lines.push(line);
+			block.rowCount = lines.length - block.startRow;
+			previousGroup = block.separatorGroup;
+		}
+		this.#residentBlocks = blocks;
+		this.#residentStartOrdinal = startOrdinal;
+		this.#residentEndOrdinal = endOrdinal;
+		this.#transcriptLines = lines;
+		this.#scrollView.setLines(lines);
+		if (topAnchor) {
+			const restored = this.#restoreResidentRowAnchor(topAnchor);
+			if (restored !== undefined) this.#scrollView.setScrollOffset(restored);
+		}
+		if (this.#selectionAnchor && selectionAnchor) {
+			const restored = this.#restoreResidentRowAnchor(selectionAnchor);
+			if (restored === undefined) this.#clearSelection();
+			else this.#selectionAnchor = { ...this.#selectionAnchor, row: restored };
+		}
+		if (this.#selectionFocus && selectionFocus) {
+			const restored = this.#restoreResidentRowAnchor(selectionFocus);
+			if (restored === undefined) this.#clearSelection();
+			else this.#selectionFocus = { ...this.#selectionFocus, row: restored };
+		}
+	}
+
+	#captureResidentRowAnchor(row: number): ResidentRowAnchor | undefined {
+		for (const block of this.#residentBlocks) {
+			if (block.rowCount > 0 && row >= block.startRow && row < block.startRow + block.rowCount) {
+				return {
+					identity: block.identity,
+					rowInContribution: Math.max(0, row - block.startRow - block.separatorRows),
+					separator: row < block.startRow + block.separatorRows,
+				};
+			}
+		}
+		return undefined;
+	}
+
+	#restoreResidentRowAnchor(anchor: ResidentRowAnchor): number | undefined {
+		const block = this.#residentBlocks.find(candidate => candidate.identity === anchor.identity);
+		if (!block || block.rowCount === 0) return undefined;
+		if (anchor.separator) return block.startRow;
+		return (
+			block.startRow + block.separatorRows + Math.min(anchor.rowInContribution, Math.max(0, block.lines.length - 1))
+		);
+	}
+
+	#clearSelection(): void {
+		this.#selectionAnchor = undefined;
+		this.#selectionFocus = undefined;
+		this.#selectionDragged = false;
+	}
+
+	#loadResidentPage(direction: -1 | 1): void {
+		const pager = this.#transcriptPager;
+		if (!this.#pagedInitialized || this.#residentWidth < 0) return;
+		const count = pager.getTranscriptBlockCount();
+		const targetRows = this.#pageTargetRows();
+		const blockLimit = this.#pageTargetBlocks();
+		if (direction < 0) {
+			this.#residentEvictionEdge = "tail";
+			if (this.#residentStartOrdinal <= 0) return;
+			const reversed: ResidentTranscriptBlock[] = [];
+			let rows = 0;
+			let ordinal = this.#residentStartOrdinal;
+			let lowerGroup = this.#residentBlocks.find(block => block.lines.length > 0)?.separatorGroup;
+			while (ordinal > 0 && rows < targetRows && reversed.length < blockLimit) {
+				ordinal--;
+				const block = this.#renderResidentBlock(pager, ordinal, this.#residentWidth);
+				if (!block) continue;
+				if (block.lines.length > 0) {
+					rows +=
+						block.lines.length +
+						(block.separatorGroup !== undefined && block.separatorGroup === lowerGroup ? 1 : 0);
+					lowerGroup = block.separatorGroup;
+				}
+				reversed.push(block);
+			}
+			reversed.reverse();
+			this.#commitResidentBlocks([...reversed, ...this.#residentBlocks], ordinal, this.#residentEndOrdinal, true);
+			this.#trimResidentBlocks("tail");
+			return;
+		}
+		if (this.#residentEndOrdinal >= count) return;
+		this.#residentEvictionEdge = "head";
+		const appended: ResidentTranscriptBlock[] = [];
+		let rows = 0;
+		let ordinal = this.#residentEndOrdinal;
+		let previousGroup: Component | undefined;
+		for (let i = this.#residentBlocks.length - 1; i >= 0; i--) {
+			const candidate = this.#residentBlocks[i]!;
+			if (candidate.lines.length > 0) {
+				previousGroup = candidate.separatorGroup;
+				break;
+			}
+		}
+		while (ordinal < count && rows < targetRows && appended.length < blockLimit) {
+			const block = this.#renderResidentBlock(pager, ordinal, this.#residentWidth);
+			ordinal++;
+			if (!block) continue;
+			if (block.lines.length > 0) {
+				rows +=
+					block.lines.length +
+					(block.separatorGroup !== undefined && block.separatorGroup === previousGroup ? 1 : 0);
+				previousGroup = block.separatorGroup;
+			}
+			appended.push(block);
+		}
+		this.#commitResidentBlocks([...this.#residentBlocks, ...appended], this.#residentStartOrdinal, ordinal, true);
+		this.#trimResidentBlocks("head");
+	}
+
+	#trimResidentBlocks(preferredEdge: "head" | "tail"): void {
+		const rowLimit = Math.min(this.#maxTranscriptRows, Math.max(64, this.#transcriptHeight * 8));
+		const blockLimit = Math.max(128, this.#transcriptHeight * 16);
+		while (
+			(this.#transcriptLines.length > rowLimit || this.#residentBlocks.length > blockLimit) &&
+			this.#residentBlocks.length > 1
+		) {
+			const offset = this.#scrollView.getScrollOffset();
+			const visibleEnd = offset + this.#transcriptHeight;
+			const head = this.#residentBlocks[0]!;
+			const tail = this.#residentBlocks.at(-1)!;
+			const canDropHead = head.rowCount === 0 || head.startRow + head.rowCount <= offset;
+			const canDropTail = tail.rowCount === 0 || tail.startRow >= visibleEnd;
+			if (preferredEdge === "head" && canDropHead) {
+				this.#commitResidentBlocks(
+					this.#residentBlocks.slice(1),
+					this.#residentStartOrdinal + 1,
+					this.#residentEndOrdinal,
+					true,
+				);
+				continue;
+			}
+			if (preferredEdge === "tail" && canDropTail) {
+				this.#commitResidentBlocks(
+					this.#residentBlocks.slice(0, -1),
+					this.#residentStartOrdinal,
+					this.#residentEndOrdinal - 1,
+					true,
+				);
+				continue;
+			}
+			break;
+		}
+	}
+
+	#pageTargetRows(): number {
+		return Math.min(this.#maxTranscriptRows, Math.max(16, this.#transcriptHeight * 2));
+	}
+
+	#pageTargetBlocks(): number {
+		return Math.max(32, this.#transcriptHeight * 4);
 	}
 
 	#renderAll(components: readonly Component[], width: number): RenderedComponents {
@@ -230,9 +652,13 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 			return true;
 		}
 		if (event.motion && event.buttonId === 0 && this.#selectionAnchor) {
-			if (this.#transcriptHeight > 0 && event.row <= 0) this.#scrollView.scroll(-1);
-			else if (this.#transcriptHeight > 0 && event.row >= this.#transcriptHeight - 1) this.#scrollView.scroll(1);
+			if (this.#transcriptHeight > 0 && event.row <= 0) this.#scrollTranscript(-1);
+			else if (this.#transcriptHeight > 0 && event.row >= this.#transcriptHeight - 1) this.#scrollTranscript(1);
 			this.#syncFollowBottom();
+			if (!this.#selectionAnchor) {
+				this.#requestRender();
+				return true;
+			}
 			const movedPoint = this.#transcriptPoint(event);
 			if (movedPoint) {
 				this.#selectionFocus = movedPoint;
@@ -343,17 +769,21 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 
 	#handleScrollKey(data: string): boolean {
 		if (matchesKey(data, "shift+up")) {
-			this.#scrollView.scroll(-5);
+			this.#scrollTranscript(-5);
 		} else if (matchesKey(data, "shift+down")) {
-			this.#scrollView.scroll(5);
+			this.#scrollTranscript(5);
 		} else if (matchesKey(data, "shift+pageUp")) {
-			this.#scrollView.page(-1);
+			this.#scrollTranscript(-Math.max(1, this.#transcriptHeight - 1));
 		} else if (matchesKey(data, "shift+pageDown")) {
-			this.#scrollView.page(1);
+			this.#scrollTranscript(Math.max(1, this.#transcriptHeight - 1));
 		} else if (matchesKey(data, "ctrl+home")) {
-			this.#scrollView.scrollToTop();
+			this.#pendingPagedJump = "start";
+			this.#followBottom = false;
+			return true;
 		} else if (matchesKey(data, "ctrl+end")) {
-			this.#scrollView.scrollToBottom();
+			this.#pendingPagedJump = "end";
+			this.#followBottom = true;
+			return true;
 		} else {
 			return false;
 		}
@@ -361,8 +791,26 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 		return true;
 	}
 
+	#scrollTranscript(delta: number): void {
+		if (this.#pagedInitialized && delta !== 0) {
+			const threshold = Math.max(this.#transcriptHeight, Math.abs(delta));
+			if (delta < 0 && this.#residentStartOrdinal > 0 && this.#scrollView.getScrollOffset() <= threshold) {
+				this.#loadResidentPage(-1);
+			} else if (
+				delta > 0 &&
+				this.#residentEndOrdinal < this.#transcriptPager.getTranscriptBlockCount() &&
+				this.#scrollView.getMaxScrollOffset() - this.#scrollView.getScrollOffset() <= threshold
+			) {
+				this.#loadResidentPage(1);
+			}
+		}
+		this.#scrollView.scroll(delta);
+	}
+
 	#syncFollowBottom(): void {
-		this.#followBottom = this.#scrollView.getScrollOffset() >= this.#scrollView.getMaxScrollOffset();
+		this.#followBottom =
+			this.#residentEndOrdinal >= this.#transcriptPager.getTranscriptBlockCount() &&
+			this.#scrollView.getScrollOffset() >= this.#scrollView.getMaxScrollOffset();
 	}
 
 	#editorFocusable(): (Component & Focusable) | undefined {

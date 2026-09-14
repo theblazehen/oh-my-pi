@@ -24,6 +24,13 @@ describe("InteractiveMode loop auto-submit", () => {
 	let tempDir: TempDir;
 	let pendingInput: Promise<SubmittedUserInput> | undefined;
 
+	async function acceptLoopCommand(args: string): Promise<string> {
+		const prompt = await mode.handleLoopCommand(args);
+		if (!prompt) throw new Error(`Expected /loop ${args} to return a prompt`);
+		mode.finishLoopCommandSubmission(prompt);
+		return prompt;
+	}
+
 	beforeAll(async () => {
 		initTheme();
 		resetSettingsForTest();
@@ -80,8 +87,7 @@ describe("InteractiveMode loop auto-submit", () => {
 		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => compacting });
 		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
 
-		mode.loopModeEnabled = true;
-		mode.loopPrompt = "repeat this";
+		expect(await acceptLoopCommand("repeat this")).toBe("repeat this");
 		const resolved: SubmittedUserInput[] = [];
 		pendingInput = mode.getUserInput();
 		void pendingInput.then(input => resolved.push(input));
@@ -109,8 +115,7 @@ describe("InteractiveMode loop auto-submit", () => {
 			return "ok";
 		});
 
-		mode.loopModeEnabled = true;
-		mode.loopPrompt = "repeat after compact";
+		expect(await acceptLoopCommand("repeat after compact")).toBe("repeat after compact");
 		const resolved: SubmittedUserInput[] = [];
 		pendingInput = mode.getUserInput();
 		void pendingInput.then(input => resolved.push(input));
@@ -136,8 +141,7 @@ describe("InteractiveMode loop auto-submit", () => {
 		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
 		Object.defineProperty(session, "hasPostPromptWork", { configurable: true, get: () => hasPendingWork });
 
-		mode.loopModeEnabled = true;
-		mode.loopPrompt = "deliver this";
+		expect(await acceptLoopCommand("deliver this")).toBe("deliver this");
 		const resolved: SubmittedUserInput[] = [];
 		pendingInput = mode.getUserInput();
 		void pendingInput.then(input => resolved.push(input));
@@ -160,8 +164,7 @@ describe("InteractiveMode loop auto-submit", () => {
 		vi.useFakeTimers();
 		settings.set("loop.mode", "reset");
 		mode.vibeModeEnabled = true;
-		mode.loopModeEnabled = true;
-		mode.loopPrompt = "do not resubmit";
+		expect(await acceptLoopCommand("do not resubmit")).toBe("do not resubmit");
 		const showStatus = vi.spyOn(mode, "showStatus");
 		const resolved: SubmittedUserInput[] = [];
 		pendingInput = mode.getUserInput();
@@ -176,28 +179,25 @@ describe("InteractiveMode loop auto-submit", () => {
 		expect(showStatus).toHaveBeenCalledWith("Exit vibe mode before using reset loops. Loop mode disabled.");
 	});
 
-	it("reports waiting, running, paused, resumed, and disabled loop states", async () => {
+	it("captures an inline prompt immediately and reports running, paused, resumed, and disabled states", async () => {
 		const setLoopModeStatus = vi.spyOn(mode.statusLine, "setLoopModeStatus");
 
-		await mode.handleLoopCommand("3");
-		expect(setLoopModeStatus).toHaveBeenLastCalledWith({
-			state: "waiting",
-			limit: { kind: "iterations", initial: 3, remaining: 3 },
-		});
-
-		mode.setLoopPrompt("repeat this");
+		expect(await acceptLoopCommand("3 repeat this")).toBe("repeat this");
 		expect(setLoopModeStatus).toHaveBeenLastCalledWith({
 			state: "running",
 			limit: { kind: "iterations", initial: 3, remaining: 3 },
 		});
+		expect(mode.loopPrompt).toBe("repeat this");
 
 		mode.pauseLoop();
+		expect(mode.loopPrompt).toBe("repeat this");
 		expect(setLoopModeStatus).toHaveBeenLastCalledWith({
 			state: "paused",
 			limit: { kind: "iterations", initial: 3, remaining: 3 },
 		});
 
-		mode.setLoopPrompt("resume this");
+		await mode.handleLoopCommand("resume");
+		expect(mode.loopPrompt).toBe("repeat this");
 		expect(setLoopModeStatus).toHaveBeenLastCalledWith({
 			state: "running",
 			limit: { kind: "iterations", initial: 3, remaining: 3 },
@@ -205,5 +205,307 @@ describe("InteractiveMode loop auto-submit", () => {
 
 		mode.disableLoopMode();
 		expect(setLoopModeStatus).toHaveBeenLastCalledWith(undefined);
+	});
+
+	it("atomically replaces an active prompt, resets its limit, and cancels the stale timer", async () => {
+		vi.useFakeTimers();
+		expect(await acceptLoopCommand("5 original prompt")).toBe("original prompt");
+
+		const resolved: SubmittedUserInput[] = [];
+		void mode.getUserInput().then(input => resolved.push(input));
+		expect(await mode.handleLoopCommand("2 replacement prompt")).toBe("replacement prompt");
+		mode.finishLoopCommandSubmission("replacement prompt");
+
+		expect(mode.loopPrompt).toBe("replacement prompt");
+		expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 2, remaining: 2 });
+		expect(mode.loopModePaused).toBe(false);
+		vi.advanceTimersByTime(800);
+		await flushMicrotasks();
+		// The old scheduled prompt must not race the replacement returned for immediate submission.
+		expect(resolved).toHaveLength(0);
+		await mode.handleLoopCommand("resume");
+		vi.advanceTimersByTime(800);
+		await flushMicrotasks();
+		expect(resolved).toHaveLength(1);
+		expect(resolved[0].text).toBe("replacement prompt");
+		mode.finishPendingSubmission(resolved[0]);
+
+		expect(await acceptLoopCommand("now unbounded")).toBe("now unbounded");
+		expect(mode.loopPrompt).toBe("now unbounded");
+		expect(mode.loopLimit).toBeUndefined();
+	});
+
+	it("keeps a paused prompt dormant until resume schedules it through the normal delay", async () => {
+		vi.useFakeTimers();
+		expect(await acceptLoopCommand("3 retained prompt")).toBe("retained prompt");
+		mode.pauseLoop();
+
+		const resolved: SubmittedUserInput[] = [];
+		void mode.getUserInput().then(input => resolved.push(input));
+		vi.advanceTimersByTime(2_400);
+		await flushMicrotasks();
+		expect(resolved).toHaveLength(0);
+		expect(mode.loopPrompt).toBe("retained prompt");
+		expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 3, remaining: 3 });
+
+		await mode.handleLoopCommand("resume");
+		expect(mode.loopModePaused).toBe(false);
+		expect(mode.loopPrompt).toBe("retained prompt");
+		expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 3, remaining: 3 });
+		vi.advanceTimersByTime(800);
+		await flushMicrotasks();
+
+		expect(resolved).toHaveLength(1);
+		expect(resolved[0].text).toBe("retained prompt");
+		expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 3, remaining: 2 });
+		mode.finishPendingSubmission(resolved[0]);
+	});
+
+	it("does not submit after pausing a deferred blocked iteration", async () => {
+		vi.useFakeTimers();
+		let compacting = true;
+		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => compacting });
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
+		expect(await acceptLoopCommand("retained prompt")).toBe("retained prompt");
+
+		const resolved: SubmittedUserInput[] = [];
+		void mode.getUserInput().then(input => resolved.push(input));
+		vi.advanceTimersByTime(800);
+		await flushMicrotasks();
+		expect(resolved).toHaveLength(0);
+
+		mode.pauseLoop();
+		compacting = false;
+		vi.advanceTimersByTime(1_600);
+		await flushMicrotasks();
+		expect(resolved).toHaveLength(0);
+		expect(mode.loopModePaused).toBe(true);
+		expect(mode.loopPrompt).toBe("retained prompt");
+
+		await mode.handleLoopCommand("resume");
+		vi.advanceTimersByTime(800);
+		await flushMicrotasks();
+		expect(resolved).toHaveLength(1);
+		mode.finishPendingSubmission(resolved[0]);
+	});
+
+	it.each(["compact", "reset"] as const)(
+		"preserves the remaining count when paused during an awaited %s action",
+		async action => {
+			vi.useFakeTimers();
+			settings.set("loop.mode", action);
+			Object.defineProperty(session, "isCompacting", { configurable: true, get: () => false });
+			Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
+			const actionGate = Promise.withResolvers<void>();
+			const actionSpy =
+				action === "compact"
+					? vi.spyOn(mode, "handleCompactCommand").mockImplementation(async () => {
+							await actionGate.promise;
+							return "ok";
+						})
+					: vi.spyOn(mode, "handleClearCommand").mockImplementation(async () => {
+							await actionGate.promise;
+						});
+			expect(await acceptLoopCommand("3 retained prompt")).toBe("retained prompt");
+
+			const resolved: SubmittedUserInput[] = [];
+			void mode.getUserInput().then(input => resolved.push(input));
+			vi.advanceTimersByTime(800);
+			await flushMicrotasks();
+			expect(actionSpy).toHaveBeenCalledTimes(1);
+			expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 3, remaining: 3 });
+
+			mode.pauseLoop();
+			actionGate.resolve();
+			await flushMicrotasks();
+			vi.advanceTimersByTime(1_600);
+			await flushMicrotasks();
+			expect(resolved).toHaveLength(0);
+			expect(mode.loopModePaused).toBe(true);
+			expect(mode.loopPrompt).toBe("retained prompt");
+			expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 3, remaining: 3 });
+
+			await mode.handleLoopCommand("resume");
+			vi.advanceTimersByTime(800);
+			await flushMicrotasks();
+			await flushMicrotasks();
+			expect(resolved).toHaveLength(1);
+			expect(resolved[0].text).toBe("retained prompt");
+			expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 3, remaining: 2 });
+			mode.finishPendingSubmission(resolved[0]);
+		},
+	);
+
+	it.each(["compact", "reset"] as const)(
+		"waits for an in-flight %s action before applying a replacement",
+		async action => {
+			vi.useFakeTimers();
+			settings.set("loop.mode", action);
+			Object.defineProperty(session, "isCompacting", { configurable: true, get: () => false });
+			Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
+			const actionGate = Promise.withResolvers<void>();
+			const actionSpy =
+				action === "compact"
+					? vi.spyOn(mode, "handleCompactCommand").mockImplementation(async () => {
+							await actionGate.promise;
+							return "ok";
+						})
+					: vi.spyOn(mode, "handleClearCommand").mockImplementation(async () => {
+							await actionGate.promise;
+						});
+			expect(await acceptLoopCommand("3 original prompt")).toBe("original prompt");
+
+			const resolved: SubmittedUserInput[] = [];
+			void mode.getUserInput().then(input => resolved.push(input));
+			vi.advanceTimersByTime(800);
+			await flushMicrotasks();
+			expect(actionSpy).toHaveBeenCalledTimes(1);
+
+			let replacementSettled = false;
+			const replacement = mode.handleLoopCommand("2 replacement prompt").then(prompt => {
+				replacementSettled = true;
+				return prompt;
+			});
+			await flushMicrotasks();
+			expect(replacementSettled).toBe(false);
+			expect(mode.loopModePaused).toBe(true);
+			expect(mode.loopPrompt).toBe("original prompt");
+
+			actionGate.resolve();
+			await flushMicrotasks();
+			expect(await replacement).toBe("replacement prompt");
+			expect(resolved).toHaveLength(0);
+			expect(mode.loopModeEnabled).toBe(true);
+			expect(mode.loopModePaused).toBe(false);
+			expect(mode.loopPrompt).toBe("replacement prompt");
+			expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 2, remaining: 2 });
+			mode.finishLoopCommandSubmission("replacement prompt");
+		},
+	);
+
+	it("restores the prior retained loop when replacement delivery is rejected", async () => {
+		expect(await acceptLoopCommand("4 original prompt")).toBe("original prompt");
+		mode.pauseLoop();
+
+		expect(await mode.handleLoopCommand("2 replacement prompt")).toBe("replacement prompt");
+		expect(mode.loopPrompt).toBe("replacement prompt");
+		expect(mode.loopModePaused).toBe(false);
+
+		mode.finishLoopCommandSubmission("replacement prompt", new Error("queue rejected"));
+
+		expect(mode.loopModeEnabled).toBe(true);
+		expect(mode.loopModePaused).toBe(true);
+		expect(mode.loopPrompt).toBe("original prompt");
+		expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 4, remaining: 4 });
+	});
+
+	it("reschedules a prior running loop when replacement delivery is rejected", async () => {
+		vi.useFakeTimers();
+		expect(await acceptLoopCommand("4 original prompt")).toBe("original prompt");
+		const resolved: SubmittedUserInput[] = [];
+		void mode.getUserInput().then(input => resolved.push(input));
+
+		expect(await mode.handleLoopCommand("2 replacement prompt")).toBe("replacement prompt");
+		mode.finishLoopCommandSubmission("replacement prompt", new Error("queue rejected"));
+
+		expect(mode.loopModeEnabled).toBe(true);
+		expect(mode.loopModePaused).toBe(false);
+		expect(mode.loopPrompt).toBe("original prompt");
+		expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 4, remaining: 4 });
+		vi.advanceTimersByTime(800);
+		await flushMicrotasks();
+		expect(resolved).toHaveLength(1);
+		expect(resolved[0].text).toBe("original prompt");
+		expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 4, remaining: 3 });
+		mode.finishPendingSubmission(resolved[0]);
+	});
+
+	it("returns to disabled when the first loop prompt is rejected", async () => {
+		expect(await mode.handleLoopCommand("first prompt")).toBe("first prompt");
+		expect(mode.loopModeEnabled).toBe(true);
+
+		mode.finishLoopCommandSubmission("first prompt", new Error("model unavailable"));
+
+		expect(mode.loopModeEnabled).toBe(false);
+		expect(mode.loopModePaused).toBe(false);
+		expect(mode.loopPrompt).toBeUndefined();
+		expect(mode.loopLimit).toBeUndefined();
+	});
+
+	it("does not undo an explicit pause when pending replacement delivery later rejects", async () => {
+		expect(await acceptLoopCommand("4 original prompt")).toBe("original prompt");
+		expect(await mode.handleLoopCommand("2 replacement prompt")).toBe("replacement prompt");
+
+		mode.pauseLoop();
+		mode.finishLoopCommandSubmission("replacement prompt", new Error("late rejection"));
+
+		expect(mode.loopModeEnabled).toBe(true);
+		expect(mode.loopModePaused).toBe(true);
+		expect(mode.loopPrompt).toBe("replacement prompt");
+		expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 2, remaining: 2 });
+	});
+
+	it("ignores a stale rejection after a newer replacement command takes ownership", async () => {
+		expect(await acceptLoopCommand("4 original prompt")).toBe("original prompt");
+		expect(await mode.handleLoopCommand("3 intermediate prompt")).toBe("intermediate prompt");
+		expect(await mode.handleLoopCommand("2 latest prompt")).toBe("latest prompt");
+
+		mode.finishLoopCommandSubmission("intermediate prompt", new Error("stale rejection"));
+
+		expect(mode.loopModeEnabled).toBe(true);
+		expect(mode.loopModePaused).toBe(false);
+		expect(mode.loopPrompt).toBe("latest prompt");
+		expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 2, remaining: 2 });
+		mode.finishLoopCommandSubmission("latest prompt");
+	});
+
+	it("stops and clears retained state through bare loop, stop, and off", async () => {
+		for (const command of ["", "stop", "off"] as const) {
+			expect(await acceptLoopCommand("4 retained prompt")).toBe("retained prompt");
+			mode.pauseLoop();
+
+			await mode.handleLoopCommand(command);
+			expect(mode.loopModeEnabled).toBe(false);
+			expect(mode.loopModePaused).toBe(false);
+			expect(mode.loopPrompt).toBeUndefined();
+			expect(mode.loopLimit).toBeUndefined();
+		}
+	});
+
+	it("does not arm a disabled loop without a prompt", async () => {
+		const showError = vi.spyOn(mode, "showError");
+
+		expect(await mode.handleLoopCommand()).toBeUndefined();
+		expect(mode.loopModeEnabled).toBe(false);
+		expect(mode.loopModePaused).toBe(false);
+		expect(mode.loopPrompt).toBeUndefined();
+		expect(mode.loopLimit).toBeUndefined();
+		expect(showError).toHaveBeenCalledWith(expect.stringContaining("/loop stop"));
+		expect(showError).toHaveBeenCalledWith(expect.stringContaining("/loop off"));
+	});
+
+	it("uses update as an explicit replace-and-resume alias", async () => {
+		expect(await acceptLoopCommand("4 retained prompt")).toBe("retained prompt");
+		mode.pauseLoop();
+
+		expect(await mode.handleLoopCommand("update 2 replacement prompt")).toBe("replacement prompt");
+		mode.finishLoopCommandSubmission("replacement prompt");
+		expect(mode.loopModeEnabled).toBe(true);
+		expect(mode.loopModePaused).toBe(false);
+		expect(mode.loopPrompt).toBe("replacement prompt");
+		expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 2, remaining: 2 });
+	});
+
+	it("requires a prompt for update without mutating the retained loop", async () => {
+		expect(await acceptLoopCommand("4 retained prompt")).toBe("retained prompt");
+		mode.pauseLoop();
+		const showError = vi.spyOn(mode, "showError");
+
+		expect(await mode.handleLoopCommand("update")).toBeUndefined();
+		expect(mode.loopModeEnabled).toBe(true);
+		expect(mode.loopModePaused).toBe(true);
+		expect(mode.loopPrompt).toBe("retained prompt");
+		expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 4, remaining: 4 });
+		expect(showError).toHaveBeenCalledWith(expect.stringContaining("Usage: /loop"));
 	});
 });

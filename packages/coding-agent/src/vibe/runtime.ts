@@ -459,9 +459,9 @@ export class VibeSessionRegistry {
 		);
 	}
 
-	#hasInMemoryTombstone(session: VibeParentSession, record: VibeRecord): boolean {
+	async #hasInMemoryTombstone(session: VibeParentSession, record: VibeRecord): Promise<boolean> {
 		let terminalReason: VibeTombstoneReason | undefined;
-		for (const entry of session.sessionManager?.getEntries() ?? []) {
+		for (const entry of (await session.sessionManager?.getAllEntries()) ?? []) {
 			if (entry.type !== "custom" || entry.customType !== VIBE_LIFECYCLE_CUSTOM_TYPE) continue;
 			const event = parseLifecycleEvent(entry.data);
 			if (
@@ -614,9 +614,9 @@ export class VibeSessionRegistry {
 		}));
 	}
 
-	#persistedIds(session: VibeParentSession, scope: VibeOwnerScope): Set<string> {
+	async #persistedIds(session: VibeParentSession, scope: VibeOwnerScope): Promise<Set<string>> {
 		const ids = new Set<string>();
-		for (const entry of session.sessionManager?.getEntries() ?? []) {
+		for (const entry of (await session.sessionManager?.getAllEntries()) ?? []) {
 			if (entry.type !== "custom" || entry.customType !== VIBE_LIFECYCLE_CUSTOM_TYPE) continue;
 			const event = parseLifecycleEvent(entry.data);
 			if (event?.ownerId === scope.ownerId && event.parentSessionId === scope.parentSessionId) ids.add(event.id);
@@ -733,7 +733,7 @@ export class VibeSessionRegistry {
 		const scope = this.ownerScope(session);
 		const allSpawns = new Map<string, VibeSpawnLifecycleEvent>();
 		const terminalIntents = new Map<string, VibeTombstoneReason>();
-		for (const entry of sessionManager.getEntries()) {
+		for (const entry of await sessionManager.getAllEntries()) {
 			if (entry.type !== "custom" || entry.customType !== VIBE_LIFECYCLE_CUSTOM_TYPE) continue;
 			const event = parseLifecycleEvent(entry.data);
 			if (!event || event.ownerId !== scope.ownerId || event.parentSessionId !== scope.parentSessionId) continue;
@@ -745,7 +745,7 @@ export class VibeSessionRegistry {
 		}
 
 		const candidates = new Map<string, VibeRestoreCandidate>();
-		for (const entry of sessionManager.getBranch()) {
+		for (const entry of await sessionManager.getBranchAsync()) {
 			if (entry.type !== "custom" || entry.customType !== VIBE_LIFECYCLE_CUSTOM_TYPE) continue;
 			const event = parseLifecycleEvent(entry.data);
 			if (!event || event.ownerId !== scope.ownerId || event.parentSessionId !== scope.parentSessionId) continue;
@@ -859,7 +859,7 @@ export class VibeSessionRegistry {
 		if (!session.agentOutputManager) {
 			session.agentOutputManager = new AgentOutputManager(session.getArtifactsDir ?? (() => null));
 		}
-		const reservedIds = this.#persistedIds(session, scope);
+		const reservedIds = await this.#persistedIds(session, scope);
 		for (const ref of AgentRegistry.global().list()) reservedIds.add(ref.id);
 		await session.agentOutputManager.reserve(reservedIds);
 		const requestedName = args.name?.replace(/[^A-Za-z0-9_-]+/g, "").slice(0, 48);
@@ -1149,7 +1149,7 @@ export class VibeSessionRegistry {
 			record => matchesScope(record, scope) && !(record.state === "dead" && record.terminalPersisted),
 		);
 		if (records.length === 0) {
-			const entries = session.sessionManager?.getBranch() ?? [];
+			const entries = (await session.sessionManager?.getBranchAsync()) ?? [];
 			for (let index = entries.length - 1; index >= 0; index--) {
 				const entry = entries[index];
 				if (entry.type !== "mode_change") continue;
@@ -1201,7 +1201,7 @@ export class VibeSessionRegistry {
 					if (!recover) throw new ToolError("Vibe tombstone recovery requires parent-session persistence.");
 					await recover.call(session.sessionManager);
 				}
-				if (!this.#hasInMemoryTombstone(session, record) && record.childSessionFile) {
+				if (!(await this.#hasInMemoryTombstone(session, record)) && record.childSessionFile) {
 					if (!(await this.#appendTombstone(session, record, reason))) {
 						throw new ToolError(`Vibe session "${record.id}" changed parent scope before termination.`);
 					}
@@ -1252,7 +1252,7 @@ export class VibeSessionRegistry {
 			if (recover) {
 				try {
 					await recover.call(session.sessionManager);
-					if (!this.#hasInMemoryTombstone(session, record) && record.childSessionFile) {
+					if (!(await this.#hasInMemoryTombstone(session, record)) && record.childSessionFile) {
 						if (!(await this.#appendTombstone(session, record, reason))) {
 							throw new ToolError(`Vibe session "${record.id}" changed parent scope before termination.`);
 						}

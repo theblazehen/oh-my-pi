@@ -131,6 +131,7 @@ export class CollabHost {
 	#sessionId = "";
 	#unsubscribe?: () => void;
 	#peers = new Map<number, { name: string; canWrite: boolean }>();
+	#pendingHellos = new Map<number, object>();
 	#uiReqSeq = 0;
 	#pendingUi = new Map<number, { request: CollabUiRequest; settle(result: CollabGuestUiResult): void }>();
 	#lastStateJson = "";
@@ -320,6 +321,7 @@ export class CollabHost {
 		for (const pending of this.#pendingUi.values()) pending.settle({ kind: "unavailable" });
 		this.#pendingUi.clear();
 		this.#peers.clear();
+		this.#pendingHellos.clear();
 		this.#socket?.close();
 		this.#socket = null;
 		this.#ctx.collabHost = undefined;
@@ -376,6 +378,36 @@ export class CollabHost {
 	}
 
 	#handleHello(name: string, proto: number, writeToken: string | undefined, fromPeer: number): void {
+		const socket = this.#socket;
+		if (!socket || this.#stopped) return;
+		const request = {};
+		this.#pendingHellos.set(fromPeer, request);
+		void this.#ctx.sessionManager
+			.withFullHistory(() => {
+				if (
+					this.#stopped ||
+					this.#socket !== socket ||
+					this.#pendingHellos.get(fromPeer) !== request ||
+					this.#ctx.sessionManager.getSessionId() !== this.#sessionId
+				)
+					return;
+				// Keep snapshot creation and synchronous socket enqueueing in one turn.
+				// Releasing residency before enqueueing would introduce a live-event gap.
+				this.#sendHello(name, proto, writeToken, fromPeer);
+			})
+			.catch(error => {
+				logger.warn("Collab snapshot failed", { error: String(error), fromPeer });
+				if (this.#socket === socket && this.#pendingHellos.get(fromPeer) === request) {
+					socket.send({ t: "error", message: "Failed to load session history for collaboration" }, fromPeer);
+					this.#ctx.session.emitNotice("warning", `Collab snapshot failed: ${String(error)}`, "collab");
+				}
+			})
+			.finally(() => {
+				if (this.#pendingHellos.get(fromPeer) === request) this.#pendingHellos.delete(fromPeer);
+			});
+	}
+
+	#sendHello(name: string, proto: number, writeToken: string | undefined, fromPeer: number): void {
 		if (proto !== COLLAB_PROTO) {
 			this.#socket?.send(
 				{ t: "error", message: `protocol mismatch: host speaks v${COLLAB_PROTO}, guest sent v${proto}` },
@@ -519,6 +551,7 @@ export class CollabHost {
 	}
 
 	#handlePeerLeft(peer: number): void {
+		this.#pendingHellos.delete(peer);
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
 		if (name) this.#ctx.session.emitNotice("info", `${name} left the collab session`, "collab");

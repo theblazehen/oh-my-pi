@@ -1426,7 +1426,7 @@ export async function runRpcMode(
 			}
 
 			case "get_branch_messages": {
-				const messages = session.getUserMessagesForBranching();
+				const messages = await session.getUserMessagesForBranching();
 				return success(id, "get_branch_messages", { messages });
 			}
 

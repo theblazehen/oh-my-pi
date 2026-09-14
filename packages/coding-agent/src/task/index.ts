@@ -26,7 +26,7 @@ import taskAsyncContractTemplate from "../prompts/tools/task-async-contract.md" 
 import { TASK_EFFORTS, type TaskEffort } from "../thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { isIrcEnabled } from "../tools/hub";
-import type { ForkContextSnapshot } from "./executor";
+import { type ForkContextSnapshot, selectEffectiveTaskForkEntries } from "./executor";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
 import { isScoutSpawnable, resolveSpawnPolicy } from "./spawn-policy";
@@ -335,10 +335,12 @@ interface SyncSpawnRef {
 	preAllocatedId?: string;
 }
 
-function captureForkContext(session: ToolSession): ForkContextSnapshot | undefined {
+async function captureForkContext(session: ToolSession): Promise<ForkContextSnapshot | undefined> {
 	const manager = session.sessionManager;
-	if (!manager || typeof manager.getBranch !== "function") return undefined;
-	const branch = manager.getBranch();
+	if (!manager) return undefined;
+	const parentModel = session.getActiveModel?.();
+	const sourceFile = session.getSessionFile();
+	const branch = await manager.getBranchAsync();
 	let sourceLeafId: string | null = null;
 	let foundAssistant = false;
 	for (let index = branch.length - 1; index >= 0; index--) {
@@ -350,18 +352,19 @@ function captureForkContext(session: ToolSession): ForkContextSnapshot | undefin
 		}
 	}
 	if (!foundAssistant && branch.length > 0) sourceLeafId = branch[branch.length - 1]!.id;
-	// Re-request the branch from the located leaf so the snapshot ends at the
-	// last completed assistant turn — excluding the in-flight task call and any
-	// later entries appended by the live manager after scheduling.
-	const captured = manager.getBranch(sourceLeafId ?? undefined);
+	// Slice the captured branch at the located leaf so the snapshot ends at the
+	// last completed assistant turn without observing later parent mutations.
+	const sourceIndex = sourceLeafId === null ? -1 : branch.findIndex(entry => entry.id === sourceLeafId);
+	const captured = sourceIndex < 0 ? [] : branch.slice(0, sourceIndex + 1);
 	return {
-		sourceFile: session.getSessionFile(),
+		sourceFile,
 		sourceLeafId,
+		parentModel: parentModel ? { provider: parentModel.provider, id: parentModel.id } : null,
 		// Freeze the completed pre-task branch at scheduling time: deep-clone
-		// exactly the entries under the located leaf so later parent mutation
-		// (in-flight task call, subsequent messages, compactions) cannot leak
-		// into the child. The child owns all compaction/provider/runtime state.
-		entries: structuredClone(captured),
+		// only its effective compacted region so later parent mutation (in-flight
+		// task call, subsequent messages, compactions) cannot leak into the child
+		// and superseded raw history is never cloned per spawn.
+		entries: structuredClone(selectEffectiveTaskForkEntries(captured)),
 	};
 }
 
@@ -739,7 +742,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const params = repairTaskParams(rawParams as TaskParams);
-		const forkContext = captureForkContext(this.session);
 		// Schema defaults fill `agent` for model calls, but internal callers
 		// and stale transcripts can bypass arktype. `spawnParamsFor` resolves each
 		// item's agent type against the session's actual default agent.
@@ -754,6 +756,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const spawnItems = resolveSpawnItems(params);
+		const normalizedSpawnParams = spawnItems.map(item => spawnParamsFor(params, item, defaultAgent));
+		// Capture once before asynchronous preflight, only when an effective item
+		// requests inheritance. Fresh-only batches must not hydrate cold history.
+		const forkContext = normalizedSpawnParams.some(spawn => spawn.source === "fork")
+			? await captureForkContext(this.session)
+			: undefined;
 		const evalToolNames = spawnItems.flatMap(item => item.tools ?? []);
 		if (evalToolNames.length > 0) {
 			if (this.session.getPlanModeState?.()?.enabled === true) {
@@ -767,7 +775,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				);
 			}
 		}
-		const normalizedSpawnParams = spawnItems.map(item => spawnParamsFor(params, item, defaultAgent));
 		const resolvedAgents = normalizedSpawnParams.map(spawn => spawn.agent ?? defaultAgent);
 		// Resolve every item before choosing an execution path. No executor or
 		// job manager may observe a batch unless every effective policy is valid.
@@ -1239,7 +1246,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					throw new Error("Aborted before execution");
 				}
 				try {
-					markRunning();
+					await markRunning();
 					progress.status = "running";
 					await reportProgress(
 						`Running background task ${agentId}...`,

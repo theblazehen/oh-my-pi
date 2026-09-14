@@ -17,7 +17,7 @@ ThinkingLevel: TypeAlias = Literal[
 ]
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
-InterruptMode: TypeAlias = Literal["immediate", "wait"]
+InterruptMode: TypeAlias = Literal["immediate", "blocking", "wait"]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
 WidgetPlacement: TypeAlias = Literal["aboveEditor", "belowEditor"]
@@ -71,7 +71,9 @@ _EFFORT_VALUES: Final[frozenset[str]] = frozenset(
 )
 _THINKING_LEVEL_VALUES: Final[frozenset[str]] = _EFFORT_VALUES | frozenset({"off"})
 _STEERING_MODE_VALUES: Final[frozenset[str]] = frozenset({"all", "one-at-a-time"})
-_INTERRUPT_MODE_VALUES: Final[frozenset[str]] = frozenset({"immediate", "wait"})
+_INTERRUPT_MODE_VALUES: Final[frozenset[str]] = frozenset(
+    {"immediate", "blocking", "wait"}
+)
 _STOP_REASON_VALUES: Final[frozenset[str]] = frozenset(
     {"stop", "length", "toolUse", "error", "aborted"}
 )

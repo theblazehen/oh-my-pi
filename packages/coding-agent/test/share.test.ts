@@ -109,27 +109,27 @@ describe("sealToFit", () => {
 });
 
 describe("buildShareSnapshot", () => {
-	test("redacts secrets through the obfuscator and leaves the original untouched", () => {
+	test("redacts secrets through the obfuscator and leaves the original untouched", async () => {
 		const entries = [messageEntry("e1", null, "the token is hunter2-XYZZY, keep safe")];
 		const sm = {
 			getHeader: () => sessionData([], "x").header,
-			getEntries: () => entries,
+			getAllEntries: async () => entries,
 			getLeafId: () => "e1",
 		} as unknown as SessionManager;
 		const obfuscator = new SecretObfuscator([{ type: "plain", content: "hunter2-XYZZY" }]);
 
-		const snapshot = buildShareSnapshot(sm, { obfuscator });
+		const snapshot = await buildShareSnapshot(sm, { obfuscator });
 
 		expect(JSON.stringify(snapshot)).not.toContain("hunter2-XYZZY");
 		expect(JSON.stringify(snapshot)).toContain("the token is");
 		// Source entries must keep the real value; redaction is share-only.
 		expect(JSON.stringify(entries)).toContain("hunter2-XYZZY");
 
-		const plain = buildShareSnapshot(sm, {});
+		const plain = await buildShareSnapshot(sm, {});
 		expect(JSON.stringify(plain)).toContain("hunter2-XYZZY");
 	});
 
-	test("redacts header cwd, bookmark labels, and file-mention paths", () => {
+	test("redacts header cwd, bookmark labels, and file-mention paths", async () => {
 		const secret = "shareleak-ABCDE";
 		const ts = "2026-06-12T00:00:00.000Z";
 		const entries: SessionEntry[] = [
@@ -163,12 +163,12 @@ describe("buildShareSnapshot", () => {
 		};
 		const sm = {
 			getHeader: () => header,
-			getEntries: () => entries,
+			getAllEntries: async () => entries,
 			getLeafId: () => "e1",
 		} as unknown as SessionManager;
 		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
 
-		const snapshot = buildShareSnapshot(sm, { obfuscator });
+		const snapshot = await buildShareSnapshot(sm, { obfuscator });
 		const flat = JSON.stringify(snapshot);
 
 		// cwd, label, file path, and file content are all redacted...
@@ -180,7 +180,7 @@ describe("buildShareSnapshot", () => {
 		expect(JSON.stringify(header)).toContain(secret);
 	});
 
-	test("redacts assistant tool calls / error messages and bash meta, and drops provider replay payloads", () => {
+	test("redacts assistant tool calls / error messages and bash meta, and drops provider replay payloads", async () => {
 		const secret = "asst-secret-ABCDE";
 		const replaySentinel = "REPLAY_BLOB_SENTINEL_XYZ";
 		const serverToolSentinel = "SERVER_TOOL_ENCRYPTED_SENTINEL_QWE";
@@ -261,12 +261,12 @@ describe("buildShareSnapshot", () => {
 		];
 		const sm = {
 			getHeader: () => sessionData([], "x").header,
-			getEntries: () => entries,
+			getAllEntries: async () => entries,
 			getLeafId: () => "b1",
 		} as unknown as SessionManager;
 		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
 
-		const flat = JSON.stringify(buildShareSnapshot(sm, { obfuscator }));
+		const flat = JSON.stringify(await buildShareSnapshot(sm, { obfuscator }));
 
 		// Every freeform occurrence (text, tool-call args/intent/rawBlock, errorMessage, bash output + meta) is redacted.
 		expect(flat).not.toContain(secret);
@@ -280,7 +280,7 @@ describe("buildShareSnapshot", () => {
 		expect(JSON.stringify(entries)).toContain(secret);
 	});
 
-	test("redacts every title-change field before sharing", () => {
+	test("redacts every title-change field before sharing", async () => {
 		const secret = "share-title-secret";
 		const entries: SessionEntry[] = [
 			{
@@ -296,10 +296,10 @@ describe("buildShareSnapshot", () => {
 		];
 		const sm = {
 			getHeader: () => sessionData([], "x").header,
-			getEntries: () => entries,
+			getAllEntries: async () => entries,
 			getLeafId: () => "title-1",
 		} as unknown as SessionManager;
-		const snapshot = buildShareSnapshot(sm, {
+		const snapshot = await buildShareSnapshot(sm, {
 			obfuscator: new SecretObfuscator([{ type: "plain", content: secret }]),
 		});
 
@@ -307,7 +307,7 @@ describe("buildShareSnapshot", () => {
 		expect(JSON.stringify(entries)).toContain(secret);
 	});
 
-	test("includes every title-change field in the regex collision pre-scan", () => {
+	test("includes every title-change field in the regex collision pre-scan", async () => {
 		const plainTitle = "PLAIN_TITLE_SECRET";
 		const plainPreviousTitle = "PLAIN_PREVIOUS_TITLE_SECRET";
 		const plainTrigger = "PLAIN_TRIGGER_SECRET";
@@ -331,7 +331,7 @@ describe("buildShareSnapshot", () => {
 				...sessionData([], "x").header,
 				title: `${plainTitle} ${plainPreviousTitle} ${plainTrigger}`,
 			}),
-			getEntries: () => entries,
+			getAllEntries: async () => entries,
 			getLeafId: () => "title-1",
 		} as unknown as SessionManager;
 		const obfuscator = new SecretObfuscator([
@@ -343,14 +343,14 @@ describe("buildShareSnapshot", () => {
 			{ type: "regex", content: "tok_trigger_[a-z]+" },
 		]);
 
-		const flat = JSON.stringify(buildShareSnapshot(sm, { obfuscator }));
+		const flat = JSON.stringify(await buildShareSnapshot(sm, { obfuscator }));
 
 		expect(flat).not.toContain(friendlyTitle);
 		expect(flat).not.toContain(friendlyPreviousTitle);
 		expect(flat).not.toContain(friendlyTrigger);
 	});
 
-	test("collects regex-protected values across the whole snapshot so an earlier field's friendly-name placeholder cannot leak a later field's secret", () => {
+	test("collects regex-protected values across the whole snapshot so an earlier field's friendly-name placeholder cannot leak a later field's secret", async () => {
 		// `buildShareSnapshot` must precompute regex-matched secret values across the ENTIRE
 		// snapshot (header + entries) before redacting any single field. Otherwise the header
 		// (redacted first) would obfuscate `plainSecret` under its friendly name unaware that
@@ -387,7 +387,7 @@ describe("buildShareSnapshot", () => {
 		];
 		const sm = {
 			getHeader: () => header,
-			getEntries: () => entries,
+			getAllEntries: async () => entries,
 			getLeafId: () => "b1",
 		} as unknown as SessionManager;
 		const obfuscator = new SecretObfuscator([
@@ -395,7 +395,7 @@ describe("buildShareSnapshot", () => {
 			{ type: "regex", content: "tok_[a-z0-9]+" },
 		]);
 
-		const flat = JSON.stringify(buildShareSnapshot(sm, { obfuscator }));
+		const flat = JSON.stringify(await buildShareSnapshot(sm, { obfuscator }));
 
 		// Neither raw secret leaves the share...
 		expect(flat).not.toContain(plainSecret);
@@ -412,7 +412,7 @@ describe("buildShareSnapshot", () => {
 		expect(obfuscator.deobfuscate(recovered)).toBe(recovered);
 	});
 
-	test("skips raw image payload bytes when collecting regex-protected values, so image data cannot spuriously trigger friendly-prefix collision avoidance", () => {
+	test("skips raw image payload bytes when collecting regex-protected values, so image data cannot spuriously trigger friendly-prefix collision avoidance", async () => {
 		// Regression: the whole-snapshot collision pre-scan only skipped strings
 		// already shaped like a `data:image/...` URL, but `ImageContent.data` at
 		// rest is raw base64 (that URL form only exists in the rendered viewer).
@@ -447,7 +447,7 @@ describe("buildShareSnapshot", () => {
 		];
 		const sm = {
 			getHeader: () => sessionData([], "x").header,
-			getEntries: () => entries,
+			getAllEntries: async () => entries,
 			getLeafId: () => "a1",
 		} as unknown as SessionManager;
 		const obfuscator = new SecretObfuscator([
@@ -455,7 +455,7 @@ describe("buildShareSnapshot", () => {
 			{ type: "regex", content: "tok_[a-z0-9]+" },
 		]);
 
-		const flat = JSON.stringify(buildShareSnapshot(sm, { obfuscator }));
+		const flat = JSON.stringify(await buildShareSnapshot(sm, { obfuscator }));
 
 		expect(flat).not.toContain(plainSecret);
 		// The image payload is left byte-for-byte intact — redaction never
@@ -467,7 +467,7 @@ describe("buildShareSnapshot", () => {
 		expect(flat).toContain(`${friendlyName}_`);
 	});
 
-	test("ignores dropped provider replay payloads when collecting regex collision values", () => {
+	test("ignores dropped provider replay payloads when collecting regex collision values", async () => {
 		const plainSecret = "OTHERSECRET";
 		const friendlyName = "TOKABC123";
 		const regexSecret = "tok_abc123";
@@ -488,7 +488,7 @@ describe("buildShareSnapshot", () => {
 		];
 		const sm = {
 			getHeader: () => sessionData([], "x").header,
-			getEntries: () => entries,
+			getAllEntries: async () => entries,
 			getLeafId: () => "a1",
 		} as unknown as SessionManager;
 		const obfuscator = new SecretObfuscator([
@@ -496,14 +496,14 @@ describe("buildShareSnapshot", () => {
 			{ type: "regex", content: "tok_[a-z0-9]+" },
 		]);
 
-		const flat = JSON.stringify(buildShareSnapshot(sm, { obfuscator }));
+		const flat = JSON.stringify(await buildShareSnapshot(sm, { obfuscator }));
 
 		expect(flat).not.toContain(plainSecret);
 		expect(flat).not.toContain(regexSecret);
 		expect(flat).toContain(`${friendlyName}_`);
 	});
 
-	test("collects regex values from tool arguments that resemble image blocks", () => {
+	test("collects regex values from tool arguments that resemble image blocks", async () => {
 		const plainSecret = "OTHERSECRET";
 		const friendlyName = "TOKABC123";
 		const regexSecret = "tok_abc123";
@@ -525,7 +525,7 @@ describe("buildShareSnapshot", () => {
 		];
 		const sm = {
 			getHeader: () => ({ ...sessionData([], "x").header, title: `remember ${plainSecret}` }),
-			getEntries: () => entries,
+			getAllEntries: async () => entries,
 			getLeafId: () => "a1",
 		} as unknown as SessionManager;
 		const obfuscator = new SecretObfuscator([
@@ -533,7 +533,7 @@ describe("buildShareSnapshot", () => {
 			{ type: "regex", content: "tok_[a-z0-9]+" },
 		]);
 
-		const flat = JSON.stringify(buildShareSnapshot(sm, { obfuscator }));
+		const flat = JSON.stringify(await buildShareSnapshot(sm, { obfuscator }));
 
 		expect(flat).not.toContain(plainSecret);
 		expect(flat).not.toContain(regexSecret);
@@ -555,7 +555,7 @@ describe("shareSession", () => {
 		const entries = [messageEntry("e1", null, "share me"), messageEntry("e2", "e1", "second")];
 		const sm = {
 			getHeader: () => sessionData([], "x").header,
-			getEntries: () => entries,
+			getAllEntries: async () => entries,
 			getLeafId: () => "e2",
 		} as unknown as SessionManager;
 

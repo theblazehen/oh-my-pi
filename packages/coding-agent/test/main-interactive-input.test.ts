@@ -74,6 +74,7 @@ describe("submitInteractiveInput", () => {
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => false),
 			finishPendingSubmission: vi.fn(),
+			finishLoopCommandSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
 		};
@@ -96,6 +97,7 @@ describe("submitInteractiveInput", () => {
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => false),
 			finishPendingSubmission: vi.fn(),
+			finishLoopCommandSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
 		};
@@ -118,6 +120,7 @@ describe("submitInteractiveInput", () => {
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => true),
 			finishPendingSubmission: vi.fn(),
+			finishLoopCommandSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
 		};
@@ -150,6 +153,7 @@ describe("submitInteractiveInput", () => {
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => true),
 			finishPendingSubmission: vi.fn(),
+			finishLoopCommandSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
 		};
@@ -170,6 +174,7 @@ describe("submitInteractiveInput", () => {
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => true),
 			finishPendingSubmission: vi.fn(),
+			finishLoopCommandSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
 		};
@@ -193,6 +198,7 @@ describe("submitInteractiveInput", () => {
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => true),
 			finishPendingSubmission: vi.fn(),
+			finishLoopCommandSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
 		};
@@ -223,6 +229,7 @@ describe("submitInteractiveInput", () => {
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => true),
 			finishPendingSubmission: vi.fn(),
+			finishLoopCommandSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
 		};
@@ -241,10 +248,11 @@ describe("submitInteractiveInput", () => {
 		expect(mode.showError).not.toHaveBeenCalled();
 	});
 
-	it("parks the loop when dispatch consumes the armed body locally", async () => {
+	it("does not alter an existing loop when an ordinary body is consumed locally", async () => {
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => true),
 			finishPendingSubmission: vi.fn(),
+			finishLoopCommandSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
 			loopPrompt: "/void-cmd",
@@ -260,7 +268,7 @@ describe("submitInteractiveInput", () => {
 		await submitInteractiveInput(mode, session, input);
 
 		expect(session.prompt).toHaveBeenCalledWith("/void-cmd", { images: undefined, streamingBehavior: "followUp" });
-		expect(mode.pauseLoop).toHaveBeenCalledTimes(1);
+		expect(mode.pauseLoop).not.toHaveBeenCalled();
 		expect(mode.showError).not.toHaveBeenCalled();
 	});
 
@@ -268,6 +276,7 @@ describe("submitInteractiveInput", () => {
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => true),
 			finishPendingSubmission: vi.fn(),
+			finishLoopCommandSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
 			loopPrompt: "repeat me",
@@ -290,6 +299,7 @@ describe("submitInteractiveInput", () => {
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => true),
 			finishPendingSubmission: vi.fn(),
+			finishLoopCommandSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
 			loopPrompt: "repeat me",
@@ -308,10 +318,11 @@ describe("submitInteractiveInput", () => {
 		expect(mode.showError).not.toHaveBeenCalled();
 	});
 
-	it("parks the loop when dispatch rejects the armed body", async () => {
+	it("does not alter an existing loop when an ordinary body is rejected", async () => {
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => true),
 			finishPendingSubmission: vi.fn(),
+			finishLoopCommandSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
 			loopPrompt: "failing body",
@@ -328,7 +339,7 @@ describe("submitInteractiveInput", () => {
 
 		await submitInteractiveInput(mode, session, input);
 
-		expect(mode.pauseLoop).toHaveBeenCalledTimes(1);
+		expect(mode.pauseLoop).not.toHaveBeenCalled();
 		expect(mode.showError).toHaveBeenCalledWith("attachment too large");
 		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
 	});
@@ -337,6 +348,7 @@ describe("submitInteractiveInput", () => {
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => true),
 			finishPendingSubmission: vi.fn(),
+			finishLoopCommandSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
 			loopPrompt: "repeat me",
@@ -356,5 +368,77 @@ describe("submitInteractiveInput", () => {
 		expect(mode.pauseLoop).not.toHaveBeenCalled();
 		expect(mode.showError).toHaveBeenCalledWith("attachment too large");
 		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
+	});
+
+	it.each([
+		{ label: "accepted", error: undefined, forwarded: true },
+		{ label: "rejected", error: new Error("queue rejected"), forwarded: true },
+		{ label: "handled locally", error: undefined, forwarded: false },
+	])("finishes a command-owned loop submission exactly once when delivery is $label", async ({ error, forwarded }) => {
+		const finishLoopCommandSubmission = vi.fn();
+		const mode = {
+			markPendingSubmissionStarted: vi.fn(() => true),
+			finishPendingSubmission: vi.fn(),
+			finishLoopCommandSubmission,
+			showError: vi.fn(),
+			checkShutdownRequested: vi.fn(async () => {}),
+		};
+		const session = {
+			prompt: vi.fn(async () => {
+				if (error) throw error;
+				return forwarded;
+			}),
+			promptCustomMessage: vi.fn(async () => true),
+			isStreaming: false,
+		};
+		const input = createInput({ text: "replacement prompt", loopCommandPrompt: "replacement prompt" });
+
+		await submitInteractiveInput(mode, session, input);
+
+		expect(session.prompt).toHaveBeenCalledWith("replacement prompt", {
+			images: undefined,
+			streamingBehavior: "followUp",
+			expandPromptTemplates: false,
+		});
+		expect(finishLoopCommandSubmission).toHaveBeenCalledTimes(1);
+		if (error) {
+			expect(finishLoopCommandSubmission).toHaveBeenCalledWith("replacement prompt", error);
+			expect(mode.showError).toHaveBeenCalledWith("queue rejected");
+		} else if (!forwarded) {
+			expect(finishLoopCommandSubmission).toHaveBeenCalledWith(
+				"replacement prompt",
+				"Submission was handled locally",
+			);
+			expect(mode.showError).not.toHaveBeenCalled();
+		} else {
+			expect(finishLoopCommandSubmission).toHaveBeenCalledWith("replacement prompt", undefined);
+			expect(mode.showError).not.toHaveBeenCalled();
+		}
+		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
+	});
+
+	it("rolls back a command-owned loop submission cancelled before dispatch", async () => {
+		const finishLoopCommandSubmission = vi.fn();
+		const mode = {
+			markPendingSubmissionStarted: vi.fn(() => false),
+			finishPendingSubmission: vi.fn(),
+			finishLoopCommandSubmission,
+			showError: vi.fn(),
+			checkShutdownRequested: vi.fn(async () => {}),
+		};
+		const session = {
+			prompt: vi.fn(async () => true),
+			promptCustomMessage: vi.fn(async () => true),
+			isStreaming: false,
+		};
+		const input = createInput({ text: "replacement prompt", loopCommandPrompt: "replacement prompt" });
+
+		await submitInteractiveInput(mode, session, input);
+
+		expect(session.prompt).not.toHaveBeenCalled();
+		expect(finishLoopCommandSubmission).toHaveBeenCalledTimes(1);
+		expect(finishLoopCommandSubmission).toHaveBeenCalledWith("replacement prompt", "Submission cancelled");
+		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
+		expect(mode.showError).not.toHaveBeenCalled();
 	});
 });

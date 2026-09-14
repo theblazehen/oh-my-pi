@@ -148,7 +148,7 @@ Important edge behavior from runtime:
 
 - `{ id?, type: "set_steering_mode", mode: "all" | "one-at-a-time" }`
 - `{ id?, type: "set_follow_up_mode", mode: "all" | "one-at-a-time" }`
-- `{ id?, type: "set_interrupt_mode", mode: "immediate" | "wait" }`
+- `{ id?, type: "set_interrupt_mode", mode: "immediate" | "blocking" | "wait" }`
 
 ### Compaction
 
@@ -253,7 +253,7 @@ is re-armed.
   "isCompacting": false,
   "steeringMode": "all|one-at-a-time",
   "followUpMode": "all|one-at-a-time",
-  "interruptMode": "immediate|wait",
+  "interruptMode": "immediate|blocking|wait",
   "sessionFile": "...",
   "sessionId": "...",
   "sessionName": "...",
@@ -577,7 +577,8 @@ From `packages/agent/src/agent.ts` defaults:
   - `"one-at-a-time"`: dequeue one queued message per turn
   - `"all"`: dequeue entire queue at once
 - `set_interrupt_mode`
-  - `"immediate"`: tool execution checks steering between tool calls; pending steering can abort remaining tool calls in the turn
+  - `"immediate"`: watch every tool batch for steering; pending steering can abort remaining tool calls in the turn
+  - `"blocking"`: interrupt only passive waits or tools that explicitly support cooperative/background yielding; arbitrary tool calls continue normally
   - `"wait"`: defer steering until turn completion
 
 ## Extension UI Sub-Protocol

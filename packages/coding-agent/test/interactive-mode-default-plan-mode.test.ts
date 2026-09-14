@@ -151,8 +151,11 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 	): boolean {
 		return shouldEnterPlanModeOnStartup(
 			{
-				buildSessionContext: () => ({ messages: options.conversation ? [{}] : [] }) as never,
-				getEntries: () => (options.explicitMode ? [{ type: "mode_change" }] : []) as never,
+				buildSessionContext: () =>
+					({
+						messages: options.conversation ? [{}] : [],
+						mode: options.explicitMode ? "none" : undefined,
+					}) as never,
 			},
 			sessionSettings,
 		);

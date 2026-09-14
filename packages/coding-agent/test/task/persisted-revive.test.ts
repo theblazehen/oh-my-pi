@@ -668,7 +668,14 @@ describe("persisted subagent revival", () => {
 	it("cold-revives persisted child history with its provider cache lineage", async () => {
 		const cwd = makeTempDir("@pi-cache-revive-");
 		const providerPromptCacheKey = "persisted-child-cache-key";
-		const sessionFile = await createPersistedSession(cwd, false, undefined, undefined, undefined, providerPromptCacheKey);
+		const sessionFile = await createPersistedSession(
+			cwd,
+			false,
+			undefined,
+			undefined,
+			undefined,
+			providerPromptCacheKey,
+		);
 		let capturedOptions: CreateAgentSessionOptions | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			capturedOptions = options;

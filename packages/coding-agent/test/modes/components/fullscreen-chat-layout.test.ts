@@ -28,6 +28,23 @@ class PersistentMutableLines implements Component {
 	}
 }
 
+class CountingBlock implements Component {
+	renderCalls = 0;
+
+	constructor(readonly lines: readonly string[]) {}
+
+	render(): readonly string[] {
+		this.renderCalls++;
+		return this.lines;
+	}
+}
+
+class FullComposeForbiddenTranscript extends TranscriptContainer {
+	override render(): readonly string[] {
+		throw new Error("fullscreen aggregate must use the block seam");
+	}
+}
+
 class RecordingEditor implements Component, Focusable {
 	readonly input: string[] = [];
 	focused = false;
@@ -94,6 +111,35 @@ afterEach(() => {
 });
 
 describe("FullscreenChatLayout", () => {
+	it("keeps complete blocks accessible without rewinding native retirement", () => {
+		const transcript = new TranscriptContainer();
+		let allocation = 1;
+		const block = {
+			setTranscriptAllocation(rows: number) {
+				allocation = rows;
+			},
+			render() {
+				return ["", ...["first", "second", "third"].slice(0, allocation), ""];
+			},
+		};
+		transcript.addChild(block);
+		const batch = transcript.peekFlushBatch(80);
+		expect(batch).toBeDefined();
+		transcript.acknowledgeFinalizedBatch(batch!.id);
+		expect(transcript.blockStates()).toEqual(["committed"]);
+		block.setTranscriptAllocation(1);
+		expect(transcript.renderTranscriptBlock(0, 80)).toEqual(["first", "second", "third"]);
+		expect(transcript.getTranscriptBlockIdentity(0)).toBe(block);
+		const layout = new FullscreenChatLayout({
+			transcript,
+			editor: new RecordingEditor(["editor"]),
+			getTerminalRows: () => 4,
+		});
+		expect(layout.render(80)).toEqual(["first", "second", "third", "editor"]);
+		expect(transcript.blockStates()).toEqual(["committed"]);
+		expect(transcript.peekFlushBatch(80)).toBeUndefined();
+	});
+
 	it("shows transcript rows appended through a persistent child array reference", () => {
 		const transcript = new PersistentMutableLines();
 		const layout = new FullscreenChatLayout({
@@ -105,6 +151,108 @@ describe("FullscreenChatLayout", () => {
 		expect(layout.render(20)).toContain("initial");
 		transcript.lines.push("streamed");
 		expect(layout.render(20)).toContain("streamed");
+	});
+
+	it("pages hundreds of nested blocks without full composition or physical-row cutoffs", () => {
+		const transcript = new FullComposeForbiddenTranscript();
+		const first = new CountingBlock([
+			"\x1b[31mFIRST-MARKER\x1b[0m",
+			...Array.from({ length: 24 }, (_, index) => `first-body-${index}`),
+			"\x1b[31mFIRST-END\x1b[0m",
+		]);
+		const blocks = [first];
+		transcript.addChild(first);
+		for (let index = 1; index < 300; index++) {
+			const block = new CountingBlock([`block-${index}`]);
+			blocks.push(block);
+			transcript.addChild(block);
+		}
+		const layout = new FullscreenChatLayout({
+			transcript: new FullscreenTranscriptAggregate([transcript]),
+			editor: new RecordingEditor(["editor"]),
+			getTerminalRows: () => 7,
+			maxTranscriptRows: 20,
+		});
+		const plainTranscript = (frame: readonly string[]) =>
+			frame.slice(0, -1).map(line => stripVTControlCharacters(line));
+		const totalRenderCalls = () => blocks.reduce((total, block) => total + block.renderCalls, 0);
+
+		const initial = plainTranscript(layout.render(60));
+		expect(initial).toContain("block-299");
+		expect(first.renderCalls).toBe(0);
+		expect(totalRenderCalls()).toBeLessThan(40);
+
+		layout.handleInput("\x1b[7^");
+		const home = plainTranscript(layout.render(60));
+		expect(home[0]).toBe("FIRST-MARKER");
+		expect(first.renderCalls).toBe(1);
+
+		let sawFirstEnd = false;
+		let sawMiddle = false;
+		let reachedTail = false;
+		for (let page = 0; page < 200; page++) {
+			const callsBefore = totalRenderCalls();
+			layout.handleInput("\x1b[6;2~");
+			const frame = plainTranscript(layout.render(60));
+			expect(totalRenderCalls() - callsBefore).toBeLessThan(50);
+			sawFirstEnd ||= frame.includes("FIRST-END");
+			sawMiddle ||= frame.includes("block-150");
+			if (frame.includes("block-299")) {
+				reachedTail = true;
+				break;
+			}
+		}
+		expect(sawFirstEnd).toBe(true);
+		expect(sawMiddle).toBe(true);
+		expect(reachedTail).toBe(true);
+
+		layout.handleInput("\x1b[8^");
+		expect(plainTranscript(layout.render(60))).toContain("block-299");
+		const appended = new CountingBlock(["LIVE-APPEND"]);
+		blocks.push(appended);
+		transcript.addChild(appended);
+		expect(plainTranscript(layout.render(60))).toContain("LIVE-APPEND");
+
+		layout.handleInput("\x1b[1;2A");
+		const parked = plainTranscript(layout.render(60));
+		const parkedAppend = new CountingBlock(["PARKED-APPEND"]);
+		blocks.push(parkedAppend);
+		transcript.addChild(parkedAppend);
+		expect(plainTranscript(layout.render(60))).toEqual(parked);
+	});
+
+	it("joins stripped nested contributions with exactly one separator", () => {
+		const transcript = new FullComposeForbiddenTranscript();
+		transcript.addChild(new CountingBlock(["", "nested-a", ""]));
+		transcript.addChild(new CountingBlock(["", "  "]));
+		transcript.addChild(new CountingBlock(["", "nested-b", ""]));
+		const layout = new FullscreenChatLayout({
+			transcript: new FullscreenTranscriptAggregate([new CountingBlock(["ordinary"]), transcript]),
+			editor: new RecordingEditor(["editor"]),
+			getTerminalRows: () => 7,
+		});
+
+		expect(layout.render(40).slice(0, 4)).toEqual(["ordinary", "nested-a", "", "nested-b"]);
+	});
+
+	it("keeps a parked nested block anchored when ordinary aggregate children shift ordinals", () => {
+		const transcript = new FullComposeForbiddenTranscript();
+		for (let index = 0; index < 80; index++) transcript.addChild(new CountingBlock([`nested-${index}`]));
+		const ordinary = new CountingBlock(["ordinary"]);
+		const aggregateChildren: Component[] = [ordinary, transcript];
+		const layout = new FullscreenChatLayout({
+			transcript: new FullscreenTranscriptAggregate(aggregateChildren),
+			editor: new RecordingEditor(["editor"]),
+			getTerminalRows: () => 6,
+		});
+
+		layout.render(40);
+		layout.handleInput("\x1b[5;2~");
+		const parked = layout.render(40).slice(0, -1);
+		aggregateChildren.unshift(new CountingBlock(["inserted-before"]));
+		expect(layout.render(40).slice(0, -1)).toEqual(parked);
+		aggregateChildren.shift();
+		expect(layout.render(40).slice(0, -1)).toEqual(parked);
 	});
 
 	it("fills the terminal and pins lower chrome and editor at the bottom", () => {
@@ -168,7 +316,7 @@ describe("FullscreenChatLayout", () => {
 		const hud = new MutableLines(["status: starting", "todo: inspect"]);
 		const editor = new RecordingEditor(["> "]);
 		const layout = new FullscreenChatLayout({
-			transcript,
+			transcript: new FullscreenTranscriptAggregate([transcript]),
 			editor,
 			beforeEditor: [hud],
 			getTerminalRows: () => 9,
@@ -304,6 +452,40 @@ describe("FullscreenChatLayout", () => {
 		expect(layout.render(20).join("")).not.toContain("\x1b[7m");
 	});
 
+	it("cancels a drag when paging evicts its anchor and remains usable", () => {
+		const copied: string[] = [];
+		const editor = new RecordingEditor(["editor"]);
+		let renderRequests = 0;
+		const layout = new FullscreenChatLayout({
+			transcript: new FullscreenTranscriptAggregate(
+				Array.from({ length: 80 }, (_, index) => new CountingBlock([`block-${index}`])),
+			),
+			editor,
+			getTerminalRows: () => 5,
+			maxTranscriptRows: 8,
+			copyText: text => copied.push(text),
+			requestRender: () => renderRequests++,
+		});
+
+		layout.render(20);
+		layout.handleInput("\x1b[<0;1;4M");
+		const selectedFrame = layout.render(20);
+		expect(selectedFrame.join("")).toContain("\x1b[7m");
+		for (let step = 0; step < 9; step++) {
+			const requestsBefore = renderRequests;
+			layout.handleInput("\x1b[<32;1;1M");
+			expect(renderRequests).toBe(requestsBefore + 1);
+		}
+
+		const frame = layout.render(20);
+		expect(frame.join("")).not.toContain("\x1b[7m");
+		layout.handleInput("\x1b[<0;1;1m");
+		layout.handleInput("x");
+		expect(copied).toEqual([]);
+		expect(editor.input.at(-1)).toBe("x");
+		expect(layout.render(20)).toContain("editor");
+	});
+
 	it("does not copy a click and never starts selection in pinned chrome", () => {
 		const copied: string[] = [];
 		const layout = new FullscreenChatLayout({
@@ -323,7 +505,7 @@ describe("FullscreenChatLayout", () => {
 		expect(copied).toEqual([]);
 	});
 
-	it("bounds retained transcript rows and preserves a scrolled absolute position when dropping the head", () => {
+	it("retains a complete oversized ordinary block and preserves its scrolled position", () => {
 		const transcript = new MutableLines(Array.from({ length: 7 }, (_, index) => `t${index}`));
 		const layout = new FullscreenChatLayout({
 			transcript,
@@ -338,6 +520,8 @@ describe("FullscreenChatLayout", () => {
 		expect(layout.render(20).slice(0, 3)).toEqual(["t3", "t4", "t5"]);
 		transcript.lines.push("t7");
 		expect(layout.render(20).slice(0, 3)).toEqual(["t3", "t4", "t5"]);
+		layout.handleInput("\x1b[1;5H");
+		expect(layout.render(20).slice(0, 3)).toEqual(["t0", "t1", "t2"]);
 	});
 
 	it("routes exact pinned render rows to MouseRoutable components", () => {

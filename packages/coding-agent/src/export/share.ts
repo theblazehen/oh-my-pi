@@ -90,8 +90,8 @@ export interface ShareSessionResult {
 }
 
 /** Build the snapshot that gets sealed and uploaded, redacted when an obfuscator is provided. */
-export function buildShareSnapshot(sm: SessionManager, options?: ShareSessionOptions): SessionData {
-	const data = buildSessionData(sm, options?.state);
+export async function buildShareSnapshot(sm: SessionManager, options?: ShareSessionOptions): Promise<SessionData> {
+	const data = await buildSessionData(sm, options?.state);
 	return options?.obfuscator?.hasSecrets() ? redactSessionDataForShare(options.obfuscator, data) : data;
 }
 
@@ -484,7 +484,7 @@ function redactShareMessage(
 
 /** Share the session; uploads to the share server unless `options.store` is `"gist"`. */
 export async function shareSession(sm: SessionManager, options?: ShareSessionOptions): Promise<ShareSessionResult> {
-	const data = buildShareSnapshot(sm, options);
+	const data = await buildShareSnapshot(sm, options);
 	const keyBytes = new Uint8Array(SHARE_KEY_BYTES);
 	crypto.getRandomValues(keyBytes);
 	const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);

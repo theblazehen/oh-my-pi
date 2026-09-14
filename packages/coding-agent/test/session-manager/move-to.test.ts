@@ -6,6 +6,7 @@ import * as path from "node:path";
 import type { SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { resetSessionTitleIndexForTests } from "@oh-my-pi/pi-coding-agent/session/title-index";
 import { stripOuterDoubleQuotes } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
 
@@ -60,6 +61,11 @@ describe("stripOuterDoubleQuotes", () => {
 // -- moveTo() tests ---------------------------------------------------------
 
 describe("SessionManager.moveTo", () => {
+	const managers: SessionManager[] = [];
+	const track = (manager: SessionManager) => {
+		managers.push(manager);
+		return manager;
+	};
 	let testAgentDir: string;
 	let cwdA: string;
 	let cwdB: string;
@@ -76,6 +82,8 @@ describe("SessionManager.moveTo", () => {
 	});
 
 	afterEach(async () => {
+		for (const manager of managers.splice(0).reverse()) await manager.close();
+		resetSessionTitleIndexForTests();
 		if (originalAgentDir) {
 			setAgentDir(originalAgentDir);
 		} else {
@@ -86,7 +94,7 @@ describe("SessionManager.moveTo", () => {
 	});
 
 	it("moves session file and updates header cwd (baseline)", async () => {
-		const session = SessionManager.create(cwdA);
+		const session = track(SessionManager.create(cwdA));
 		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
 		await session.flush();
@@ -111,7 +119,7 @@ describe("SessionManager.moveTo", () => {
 	});
 
 	it("persists the captured header and workspace roots after a rollback relocation", async () => {
-		const session = SessionManager.create(cwdA);
+		const session = track(SessionManager.create(cwdA));
 		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
 		await session.addWorkspaceDirectory(cwdB);
@@ -153,7 +161,7 @@ describe("SessionManager.moveTo", () => {
 			return realAccess(target, mode);
 		});
 		try {
-			const session = await SessionManager.open(deniedFile, undefined, undefined, { initialCwd: cwdA });
+			const session = track(await SessionManager.open(deniedFile, undefined, undefined, { initialCwd: cwdA }));
 			try {
 				const snapshot = session.captureState();
 				await session.moveTo(cwdA);
@@ -174,7 +182,7 @@ describe("SessionManager.moveTo", () => {
 	});
 
 	it("succeeds on fresh session without ENOENT, then deferred persistence works", async () => {
-		const session = SessionManager.create(cwdA);
+		const session = track(SessionManager.create(cwdA));
 		// No messages — file never written to disk
 		const oldFile = session.getSessionFile()!;
 		expect(fs.existsSync(oldFile)).toBe(false);
@@ -199,7 +207,7 @@ describe("SessionManager.moveTo", () => {
 	});
 
 	it("recreates file from memory when old file is deleted (assistant exists)", async () => {
-		const session = SessionManager.create(cwdA);
+		const session = track(SessionManager.create(cwdA));
 		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
 		await session.flush();
@@ -226,7 +234,7 @@ describe("SessionManager.moveTo", () => {
 	it("moves header-only session and rewrites cwd", async () => {
 		// Create a header-only session via open() with a non-existent explicit path
 		const explicitPath = path.join(cwdA, "explicit-session.jsonl");
-		const session = await SessionManager.open(explicitPath);
+		const session = track(await SessionManager.open(explicitPath));
 
 		expect(fs.existsSync(explicitPath)).toBe(true);
 
@@ -246,7 +254,7 @@ describe("SessionManager.moveTo", () => {
 	it("moves header-only session with pending user message (#flushed regression)", async () => {
 		// Create a header-only session
 		const explicitPath = path.join(cwdA, "explicit-session-2.jsonl");
-		const session = await SessionManager.open(explicitPath);
+		const session = track(await SessionManager.open(explicitPath));
 
 		expect(fs.existsSync(explicitPath)).toBe(true);
 
@@ -268,7 +276,7 @@ describe("SessionManager.moveTo", () => {
 	});
 
 	it("moves artifact dir independently when session file does not exist", async () => {
-		const session = SessionManager.create(cwdA);
+		const session = track(SessionManager.create(cwdA));
 		// Allocate an artifact — creates dir via ArtifactManager
 		const { path: artifactPath } = await session.allocateArtifactPath("bash");
 		if (!artifactPath) throw new Error("Expected artifact path");
@@ -291,7 +299,7 @@ describe("SessionManager.moveTo", () => {
 		expect(fs.existsSync(newArtifactDir)).toBe(true);
 	});
 	it("does not orphan appends that race the session file rename", async () => {
-		const session = SessionManager.create(cwdA);
+		const session = track(SessionManager.create(cwdA));
 		session.appendMessage({ role: "user", content: "before move", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
 		await session.flush();
@@ -334,7 +342,7 @@ describe("SessionManager.moveTo", () => {
 	});
 
 	it("does not orphan a flushSync that races the session file rename", async () => {
-		const session = SessionManager.create(cwdA);
+		const session = track(SessionManager.create(cwdA));
 		session.appendMessage({ role: "user", content: "before move", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
 		await session.flush();
@@ -380,7 +388,7 @@ describe("SessionManager.moveTo", () => {
 	});
 
 	it("does not orphan title changes that race the session file rename", async () => {
-		const session = SessionManager.create(cwdA);
+		const session = track(SessionManager.create(cwdA));
 		session.appendMessage({ role: "user", content: "before move", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
 		await session.flush();
@@ -422,7 +430,7 @@ describe("SessionManager.moveTo", () => {
 		// ensureOnDisk(), which schedules its materializing rewrite on the disk
 		// chain. Starting moveTo() before that task runs must not cancel it, or
 		// the explicitly materialized session is lost and never discoverable.
-		const session = SessionManager.create(cwdA);
+		const session = track(SessionManager.create(cwdA));
 		const ensure = session.ensureOnDisk();
 		await session.moveTo(cwdB);
 		await ensure;
@@ -441,7 +449,7 @@ describe("SessionManager.moveTo", () => {
 		// still the source path, and the trailing atomic rewrite has not run.
 		// Completed entries appended in this window must land on dest (not recreate
 		// source) and survive a crash-equivalent snapshot + reopen.
-		const session = SessionManager.create(cwdA);
+		const session = track(SessionManager.create(cwdA));
 		session.appendMessage({ role: "user", content: "before move", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
 		await session.flush();
@@ -488,7 +496,7 @@ describe("SessionManager.moveTo", () => {
 
 			const crashPath = path.join(testAgentDir, "crashed-move.jsonl");
 			fs.writeFileSync(crashPath, crashBytes);
-			const reopened = await SessionManager.open(crashPath);
+			const reopened = track(await SessionManager.open(crashPath));
 			const reopenedEntries = reopened.getEntries();
 			expect(
 				reopenedEntries.some(
@@ -533,7 +541,7 @@ describe("SessionManager.moveTo", () => {
 	});
 
 	it("keeps the manager pointed at the moved file when the inverse relocation fails", async () => {
-		const session = SessionManager.create(cwdA);
+		const session = track(SessionManager.create(cwdA));
 		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
 		await session.flush();

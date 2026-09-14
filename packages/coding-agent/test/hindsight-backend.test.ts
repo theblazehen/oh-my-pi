@@ -30,7 +30,7 @@ function makeFakeSession(deps: FakeSessionDeps) {
 		sessionId: deps.sessionId,
 		settings: deps.settings ?? Settings.isolated(),
 		sessionManager: {
-			getEntries: () =>
+			getAllEntries: async () =>
 				entries.map((e, i) => ({
 					id: `e${i}`,
 					parentId: i === 0 ? null : `e${i - 1}`,

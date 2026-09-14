@@ -178,6 +178,20 @@ describe("Editor component", () => {
 			editor.handleInput("x"); // Type a character - exits history mode
 
 			expect(editor.getText()).toBe("old promptx");
+			expect(editor.getCursor()).toEqual({ line: 0, col: "old promptx".length });
+		});
+
+		it("preserves the untouched history start anchor for slash-prefixed printable input", () => {
+			const editor = new Editor(defaultEditorTheme);
+
+			editor.addToHistory("repeat this");
+			editor.handleInput("\x1b[A");
+			expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
+
+			editor.handleInput("/help ");
+
+			expect(editor.getText()).toBe("/help repeat this");
+			expect(editor.getCursor()).toEqual({ line: 0, col: "/help ".length });
 		});
 
 		it("exits history mode on setText", () => {

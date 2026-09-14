@@ -2038,13 +2038,22 @@ export const SETTINGS_SCHEMA = {
 
 	interruptMode: {
 		type: "enum",
-		values: ["immediate", "wait"] as const,
+		values: ["immediate", "blocking", "wait"] as const,
 		default: "immediate",
 		ui: {
 			tab: "interaction",
 			group: "Input",
 			label: "Interrupt Mode",
 			description: "When steering messages interrupt tool execution",
+			options: [
+				{ value: "immediate", label: "immediate", description: "Interrupt every tool batch" },
+				{
+					value: "blocking",
+					label: "blocking",
+					description: "Interrupt only passive waits or backgroundable work",
+				},
+				{ value: "wait", label: "wait", description: "Defer steering until the current turn completes" },
+			],
 		},
 	},
 

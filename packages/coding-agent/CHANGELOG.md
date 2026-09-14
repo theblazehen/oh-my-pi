@@ -2,8 +2,16 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Integrated fullscreen history with the shared transcript-block and Composer interfaces, retaining bounded block paging independently of native scrollback retirement.
+- Kept large-session history cold outside scoped complete-history operations, including collaboration snapshots and forks, while preserving the complete persisted journal.
+- Reused task initialization and prompt submission paths for bounded fork inheritance and explicit `/loop` ownership; fresh-only task batches no longer hydrate parent history.
+
 ### Fixed
 
+- Finalized outstanding autoresearch database statements during shutdown so temporary database files are released immediately.
+- Fixed daemon distribution smoke cleanup racing the broker's actual process exit on network-backed temporary storage.
 - Fixed worker subprocesses failing to declare themselves as worker hosts before dispatching selectors, which prevented nested thread worker spawns during `/usage` stats sync on multi-core systems.
 - Fixed `/usage` displaying a misleading generic database read failure when activity loading fails; the error detail is now sanitized, collapsed to a single line with shortened paths, and surfaced in the dashboard.
 
@@ -1599,17 +1607,24 @@
 - Fixed the in-process `kill` builtin to validate signals, preserve negative PID operands, signal every process in pipeline jobs, continue after bad targets, and refuse non-probe signals aimed at the host process or process group.
 ### Added
 
-- Added task context sources (`fresh` and `fork`), with `fork` inheriting a frozen, provider-neutral native-text copy of the completed parent conversation while removing parent compaction and execution-control state so text-only child models work and compact the inherited history normally.
+- Added `omp sessions`, an integrated cross-project session browser with bounded, progressively loaded conversation previews and resume in the original session's directory. Compact Project / Session / Updated columns retain global recency order, with a 55/45 list/preview split and a preview header showing the selected project's label, session title, and full resume directory.
+- Added the `blocking` `interruptMode` setting, which watches for steering only while the running tool batch contains interruptible or cooperatively yieldable work; eligible foreground Bash calls cooperatively move to a background job when steered instead of being hard-aborted.
+- Added task context sources (`fresh` and `fork`), with `fork` inheriting a frozen, bounded copy of the completed parent's effective compacted context while removing execution-control state and provider-native replay that is incompatible with the child model.
 - Added a fixed 29-minute background-job wait option alongside the existing adaptive polling mode.
 
 ### Changed
 
+- Large session resumes now keep only recent compaction segments resident and hydrate complete history only on demand; current fullscreen conversations and parked-agent transcript files render through bounded, complete-block paging windows instead of re-rendering or physically truncating their entire history.
+- Loop prompts are now owned by explicit `/loop` commands: ordinary messages no longer replace or resume running or paused loops, `/loop <prompt>` atomically restarts with a new prompt, and paused prompts can be resumed or stopped explicitly.
 - OMP worker subprocesses now default to nice 19 without lowering the interactive CLI or Bun worker threads; `OMP_SUBPROCESS_NICE` can override the value or use `inherit` to opt out.
 - Headless Chromium now enables ANGLE Vulkan on Linux when an accessible DRM render node is available, while retaining the existing software/default path elsewhere.
 
 ### Fixed
 
+- Fixed pruning rewrites rehydrating cold session history; large file-backed sessions now re-window optional history after compaction and continued growth while preserving complete persisted branches, replay payloads, and image blobs.
 - Added a 10-minute default `compaction.remoteTimeoutSeconds` setting for provider-native compaction while retaining the agent library's existing default for direct callers.
+- Fixed active autoresearch loops dropping their hidden continuation nudge whenever unrelated user, advisor, or cross-session messages were already queued at turn completion.
+- Fixed oversized `source:"fork"` tasks failing before launch; inherited contexts now shed native compaction payloads and fall back to the largest coherent recent tail within the child's usable budget.
 
 ## [17.2.3] - 2026-08-01
 

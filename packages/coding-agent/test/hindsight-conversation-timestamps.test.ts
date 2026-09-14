@@ -132,8 +132,8 @@ describe("Hindsight conversation source timestamps", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("keeps user/assistant SessionEntry timestamps and drops thinking/tool entries", () => {
-		const extracted = extractMessages({ getEntries: () => conversationEntries() });
+	it("keeps user/assistant SessionEntry timestamps and drops thinking/tool entries", async () => {
+		const extracted = await extractMessages({ getAllEntries: async () => conversationEntries() });
 		expect(extracted).toEqual([
 			{
 				role: "user",
@@ -162,7 +162,7 @@ describe("Hindsight conversation source timestamps", () => {
 			session: {
 				sessionId: "sess-ts",
 				sessionManager: {
-					getEntries: () => entries,
+					getAllEntries: async () => entries,
 					getHeader: () => ({
 						type: "session",
 						id: "sess-ts",
@@ -175,7 +175,7 @@ describe("Hindsight conversation source timestamps", () => {
 			banksSet: new Set(["personal"]),
 		});
 
-		const first = extractMessages({ getEntries: () => entries });
+		const first = await extractMessages({ getAllEntries: async () => entries });
 		await state.retainSession(first);
 		const laterEntries = [
 			...entries,
@@ -191,7 +191,7 @@ describe("Hindsight conversation source timestamps", () => {
 				},
 			} as SessionEntry,
 		];
-		await state.retainSession(extractMessages({ getEntries: () => laterEntries }));
+		await state.retainSession(await extractMessages({ getAllEntries: async () => laterEntries }));
 
 		expect(bodies).toHaveLength(2);
 		expectSameInstant(firstItem(bodies[0]).timestamp, SESSION_START);
@@ -216,7 +216,7 @@ describe("Hindsight conversation source timestamps", () => {
 			session: {
 				sessionId: "sess-bad-ts",
 				sessionManager: {
-					getEntries: () => entries,
+					getAllEntries: async () => entries,
 					getHeader: () => ({
 						type: "session",
 						id: "sess-bad-ts",
@@ -229,7 +229,7 @@ describe("Hindsight conversation source timestamps", () => {
 			banksSet: new Set(["personal"]),
 		});
 
-		await state.retainSession(extractMessages({ getEntries: () => entries }));
+		await state.retainSession(await extractMessages({ getAllEntries: async () => entries }));
 		expect(bodies).toHaveLength(1);
 		expect(firstItem(bodies[0]).timestamp).not.toBe("not-a-date");
 		expect(Number.isNaN(Date.parse(String(firstItem(bodies[0]).timestamp)))).toBe(false);
