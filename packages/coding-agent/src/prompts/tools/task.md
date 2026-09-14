@@ -62,11 +62,8 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 {{/if}}
 {{/if}}
 
-- `source`: Task context source: `fresh` or `fork`. `fresh` starts with normal blank child history. `fork` inherits the scheduling-time completed-parent branch as native conversation messages, scrubbing the parent-only eager task/todo, todo, checkpoint, and rewind control calls/results; it uses the selected child agent's normal model, prompt, tools, permissions, schema, and isolation. Agent type and context source are independent choices. In batch calls, a top-level `source` is inherited by items unless an item specifies its own source.
-- Prefer `fork` for work that benefits from the current conversation. Use `fresh` when independence or a clean perspective is specifically valuable.
-
 # Communication
-Subagents start blank — no conversation history, except forked tasks, which inherit the completed parent conversation as normal messages.{{#if ircEnabled}} Parent-to-subagent IRC delivered immediately as steering.{{/if}}
+Subagents start blank — no conversation history.{{#if ircEnabled}} Parent-to-subagent IRC delivered immediately as steering.{{/if}}
 Pass large payloads via `local://<path>` URIs, NEVER inline text.
 
 # Format Contracts

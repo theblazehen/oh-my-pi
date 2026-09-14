@@ -142,6 +142,13 @@ export interface TranscriptBlockSource extends Component {
 	getTranscriptBlockSeparatorGroup?(index: number): Component | undefined;
 }
 
+/** One live block's row span in the last `renderViewport` output (half-open `[start, end)`). */
+export interface TranscriptViewportSpan {
+	component: Component;
+	start: number;
+	end: number;
+}
+
 /** Owns transcript order, live capacity, and ordered immutable retirement. */
 export class TranscriptContainer extends Container implements TranscriptBlockSource {
 	#entries: TranscriptEntry[] = [];
@@ -158,6 +165,8 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 	// retirement: everything behind it stays live and degrades to one-line
 	// allocations. Logs once per pinned episode after a grace period.
 	#pinnedFrontier: { index: number; since: number; logged: boolean } | undefined;
+	/** Block spans of the last `renderViewport` output, for click hit-testing. */
+	#lastViewportSpans: TranscriptViewportSpan[] = [];
 
 	override addChild(component: Component): void {
 		if (isToolActivityComponent(component)) component.setToolActivityVisible(this.#toolActivityVisible);
@@ -190,6 +199,7 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 		this.#pinnedFrontier = undefined;
 		this.#replayPending = false;
 		this.#replayRequested = false;
+		this.#lastViewportSpans = [];
 	}
 
 	setToolActivityVisible(visible: boolean): void {
@@ -317,6 +327,29 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 		return total;
 	}
 
+	/** Block spans of the last `renderViewport` output, in output coordinates. Empty when the tail is empty. */
+	getLastViewportSpans(): readonly TranscriptViewportSpan[] {
+		return this.#lastViewportSpans;
+	}
+
+	/** Collapse a per-line owner list into run-length block spans, clamped to `length`. */
+	#commitViewportSpans(owners: readonly (Component | undefined)[], length: number = owners.length): void {
+		const spans: TranscriptViewportSpan[] = [];
+		let index = 0;
+		while (index < length) {
+			const component = owners[index];
+			if (component === undefined) {
+				index++;
+				continue;
+			}
+			let end = index + 1;
+			while (end < length && owners[end] === component) end++;
+			spans.push({ component, start: index, end });
+			index = end;
+		}
+		this.#lastViewportSpans = spans;
+	}
+
 	/** Render the live tail, constrained to the supplied transcript height. */
 	renderViewport(width: number, rows: number, frame: AnimationFrame): readonly string[] {
 		this.#lastFrame = frame;
@@ -324,7 +357,10 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 		this.#settleFinalized();
 		const live = this.#liveEntries();
 		const capacity = Math.max(0, Math.trunc(rows));
-		if (live.length === 0 || capacity === 0) return EMPTY_ROWS;
+		if (live.length === 0 || capacity === 0) {
+			this.#lastViewportSpans = [];
+			return EMPTY_ROWS;
+		}
 
 		const shown: Array<{ entry: TranscriptEntry; index: number }> = [];
 		const blocks: (readonly string[])[] = [];
@@ -338,14 +374,26 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 			shown.push(candidate);
 			blocks.push(block);
 		}
-		if (shown.length === 0) return EMPTY_ROWS;
+		if (shown.length === 0) {
+			this.#lastViewportSpans = [];
+			return EMPTY_ROWS;
+		}
 		if (shown.length > capacity) return this.#renderEmergency(shown, width, capacity, frame);
 		if (total <= capacity) {
 			const output: string[] = [];
-			for (const rendered of blocks) {
-				if (output.length > 0) output.push("");
-				output.push(...rendered);
+			const owners: (Component | undefined)[] = [];
+			for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+				if (output.length > 0) {
+					output.push("");
+					owners.push(undefined);
+				}
+				const component = shown[blockIndex]!.entry.component;
+				for (const line of blocks[blockIndex]!) {
+					output.push(line);
+					owners.push(component);
+				}
 			}
+			this.#commitViewportSpans(owners, output.length);
 			return output;
 		}
 
@@ -369,6 +417,7 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 			surplus -= extra;
 		}
 		const output: string[] = [];
+		const owners: (Component | undefined)[] = [];
 		for (let index = 0; index < shown.length; index++) {
 			const candidate = shown[index]!;
 			const allocated = allocation[index]!;
@@ -376,10 +425,15 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 			const rendered = this.#renderEntry(candidate.entry, width).slice(
 				this.#projectedEmitted(candidate.entry, candidate.index, width),
 			);
-			if (rendered.length <= allocated) output.push(...rendered);
-			else output.push(...rendered.slice(rendered.length - allocated));
+			const visible = rendered.length <= allocated ? rendered : rendered.slice(rendered.length - allocated);
+			for (const line of visible) {
+				output.push(line);
+				owners.push(candidate.entry.component);
+			}
 		}
-		return output.length > capacity ? output.slice(output.length - capacity) : output;
+		const drop = Math.max(0, output.length - capacity);
+		this.#commitViewportSpans(owners.slice(drop), output.length - drop);
+		return drop > 0 ? output.slice(drop) : output;
 	}
 
 	/** Offers stable-head emission or the shortest finalized prefix needed under pressure. */
@@ -749,9 +803,11 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 		}
 
 		const output = hiddenActive > 0 ? [`${hiddenActive} more transcript blocks active`] : [];
+		const owners: (Component | undefined)[] = hiddenActive > 0 ? [undefined] : [];
 		for (const candidate of visible) {
 			if (candidate === emergencyCandidate) {
 				output.push(emergencyRow ?? "");
+				owners.push(candidate.entry.component);
 				continue;
 			}
 			this.#setAllocation(candidate.entry.component, 1, frame);
@@ -759,8 +815,11 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 				this.#projectedEmitted(candidate.entry, candidate.index, width),
 			);
 			output.push(rendered[0] ?? "");
+			owners.push(candidate.entry.component);
 		}
-		return output.slice(0, rows);
+		const visibleOutput = output.slice(0, rows);
+		this.#commitViewportSpans(owners, visibleOutput.length);
+		return visibleOutput;
 	}
 
 	#projectedEmitted(entry: TranscriptEntry, index: number, width: number): number {

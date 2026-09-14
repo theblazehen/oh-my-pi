@@ -74,6 +74,17 @@ export class TtsrCoordinator {
 		this.#manager?.resetBuffer();
 	}
 
+	/**
+	 * Resets stream buffers when an assistant message begins. The agent loop
+	 * turns the first provider `start` of every response into `message_start`,
+	 * so this is the boundary between two responses inside one turn (an aborted
+	 * response and its retry, or a continuation after an interruption); without
+	 * it, text from the earlier response would combine with the later one.
+	 */
+	onAssistantMessageStart(): void {
+		this.#manager?.resetBuffer();
+	}
+
 	/** Advances repeat-after-gap tracking at turn end. */
 	onTurnEnd(): void {
 		this.#manager?.incrementMessageCount();
@@ -83,19 +94,33 @@ export class TtsrCoordinator {
 	async checkMessageUpdate(event: AgentEvent): Promise<boolean> {
 		if (event.type !== "message_update" || !this.#manager?.hasRules()) return false;
 		const assistantEvent = event.assistantMessageEvent;
+		// A later `start` inside one response restarts its partial; the buffers
+		// describe the discarded attempt and must not survive it.
+		if (assistantEvent.type === "start") {
+			this.#manager.resetBuffer();
+			return false;
+		}
 		let matchContext: TtsrMatchContext | undefined;
 		let streamingToolCall: ToolCall | undefined;
+		let delta: string | undefined;
 		if (assistantEvent.type === "text_delta") {
 			matchContext = { source: "text" };
+			delta = assistantEvent.delta;
 		} else if (assistantEvent.type === "thinking_delta") {
 			matchContext = { source: "thinking" };
+			delta = assistantEvent.delta;
 		} else if (assistantEvent.type === "toolcall_delta") {
 			streamingToolCall = this.#getStreamingToolCallBlock(event.message, assistantEvent.contentIndex);
 			matchContext = this.#getToolMatchContext(streamingToolCall, assistantEvent.contentIndex);
+			delta = assistantEvent.delta;
+		} else if (assistantEvent.type === "toolcall_end") {
+			streamingToolCall = assistantEvent.toolCall;
+			matchContext = this.#getToolMatchContext(streamingToolCall, assistantEvent.contentIndex);
+			delta = "";
 		}
-		if (!matchContext || !("delta" in assistantEvent)) return false;
+		if (!matchContext || delta === undefined) return false;
 		const targetMessageTimestamp = event.message.role === "assistant" ? event.message.timestamp : undefined;
-		const matches = this.#checkStream(assistantEvent.delta, matchContext, streamingToolCall);
+		const matches = this.#checkStream(delta, matchContext, streamingToolCall, assistantEvent.type === "toolcall_end");
 		if (matches.length > 0 && this.#handleMatches(matches, matchContext, targetMessageTimestamp)) return true;
 		// AST rules use the reconstructed edit/write snapshot and are awaited so
 		// the manager self-throttles native matching.
@@ -325,7 +350,12 @@ export class TtsrCoordinator {
 		return this.#extractFilePathsFromArgs(args);
 	}
 
-	#checkStream(delta: string, matchContext: TtsrMatchContext, toolCall: ToolCall | undefined): Rule[] {
+	#checkStream(
+		delta: string,
+		matchContext: TtsrMatchContext,
+		toolCall: ToolCall | undefined,
+		isFinal = false,
+	): Rule[] {
 		if (!this.#manager) return [];
 		const entries = this.#resolveMatcherEntries(toolCall);
 		if (entries) {
@@ -336,9 +366,17 @@ export class TtsrCoordinator {
 			return matches;
 		}
 		const digest = this.#resolveMatcherDigest(toolCall);
-		return digest !== undefined
-			? this.#manager.checkSnapshot(digest, matchContext)
-			: this.#manager.checkDelta(delta, matchContext);
+		if (digest !== undefined) return this.#manager.checkSnapshot(digest, matchContext);
+		// Tools without matcher hooks accumulate raw argument deltas. Providers
+		// that emit toolcall_start -> toolcall_end with no intermediate deltas
+		// (Cursor exec synthesis, OpenAI lossy-proxy fallback) leave that buffer
+		// empty, so the finalized arguments must seed the snapshot themselves.
+		const finalArgs = isFinal ? toolCall?.arguments : undefined;
+		if (finalArgs !== undefined && finalArgs !== null) {
+			const snapshot = typeof finalArgs === "string" ? finalArgs : JSON.stringify(finalArgs);
+			return this.#manager.checkSnapshot(snapshot, matchContext);
+		}
+		return this.#manager.checkDelta(delta, matchContext);
 	}
 
 	#resolveMatcherDigest(toolCall: ToolCall | undefined): string | undefined {

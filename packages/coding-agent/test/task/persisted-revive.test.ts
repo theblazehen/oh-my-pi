@@ -17,6 +17,7 @@ import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { IrcBus, type IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createSessionDefaults } from "../helpers/session-defaults";
 
 const tempDirs: TempDir[] = [];
 
@@ -56,6 +57,7 @@ function createRevivedSession(activeToolNames: string[][], extensionRunner?: unk
 	let lastAssistantText: string | undefined;
 	const trackedReplies: Promise<void>[] = [];
 	const session = {
+		...createSessionDefaults(),
 		getMountedXdevToolNames: () => [],
 		setActiveToolsByName: async (names: string[]) => {
 			activeToolNames.push(names);
@@ -67,7 +69,6 @@ function createRevivedSession(activeToolNames: string[][], extensionRunner?: unk
 		trackIrcReply: (pending: Promise<void>) => {
 			trackedReplies.push(pending);
 		},
-		subscribeRunState: () => () => {},
 		getLastAssistantMessage: () =>
 			lastAssistantText === undefined
 				? undefined
@@ -89,13 +90,9 @@ async function createPersistedSession(
 	restrictToolNames?: boolean,
 	modelRole?: string,
 	advisor?: string,
-	contract?: { tools?: string[]; readOnly?: boolean; agent?: string },
-	providerPromptCacheKey?: string,
+	contract?: { tools?: string[]; readOnly?: boolean; agent?: string; isolated?: boolean },
 ): Promise<string> {
 	const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
-	if (providerPromptCacheKey !== undefined) {
-		await manager.newSession({ providerPromptCacheKey });
-	}
 	const sessionFile = manager.getSessionFile();
 	if (!sessionFile) throw new Error("Expected a persisted session file");
 	manager.appendSessionInit({
@@ -108,6 +105,7 @@ async function createPersistedSession(
 		advisor,
 		readOnly: contract?.readOnly,
 		agent: contract?.agent,
+		isolated: contract?.isolated,
 	});
 	manager.appendMessage({
 		role: "assistant",
@@ -280,6 +278,21 @@ describe("persisted subagent revival", () => {
 		expect(capturedOptions?.enableLsp).toBe(true);
 		expect(capturedOptions?.mcpManager).toBe(hostileMcp);
 		expect(capturedOptions?.customTools?.map(tool => tool.name)).toEqual(["mcp__server_read"]);
+	});
+
+	it("leaves isolated sessions transcript-only even when the workspace still exists", async () => {
+		// Isolated runs are never resumable: the worktree is merged + cleaned,
+		// and the parent is told messaging is impossible. A retained workspace
+		// (capture/persist failure) still passes the cwd probe, so the stamped
+		// contract — not directory existence — must gate revival. Otherwise a
+		// restart + Hub message revives the agent in the parent cwd, outside
+		// isolation.
+		const cwd = makeTempDir("@pi-isolated-revive-");
+		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, { isolated: true });
+
+		const ref = createRef(sessionFile);
+		const reviver = await createFactory(cwd)(ref);
+		expect(reviver).toBeUndefined();
 	});
 
 	it("restores the persisted agent definition name on cold revival so agent-scoped rules keep matching", async () => {
@@ -663,42 +676,5 @@ describe("persisted subagent revival", () => {
 			AgentRegistry.resetGlobalForTests();
 			IrcBus.resetGlobalForTests();
 		});
-	});
-
-	it("cold-revives persisted child history with its provider cache lineage", async () => {
-		const cwd = makeTempDir("@pi-cache-revive-");
-		const providerPromptCacheKey = "persisted-child-cache-key";
-		const sessionFile = await createPersistedSession(
-			cwd,
-			false,
-			undefined,
-			undefined,
-			undefined,
-			providerPromptCacheKey,
-		);
-		let capturedOptions: CreateAgentSessionOptions | undefined;
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-			capturedOptions = options;
-			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
-		});
-
-		const ref = createRef(sessionFile);
-		const reviver = await createFactory(cwd)(ref);
-		if (!reviver) throw new Error("Expected a persisted reviver");
-		await reviver(ref);
-
-		const sessionManager = capturedOptions?.sessionManager;
-		if (!sessionManager) throw new Error("Expected the reopened session manager");
-		const options = capturedOptions;
-		if (!options) throw new Error("Expected createAgentSession options");
-		expect(
-			sessionManager
-				.getEntries()
-				.filter(entry => entry.type === "message")
-				.map(entry => (entry.type === "message" ? entry.message : undefined)),
-		).toEqual([expect.objectContaining({ role: "assistant", content: [{ type: "text", text: "persisted" }] })]);
-		expect(sessionManager.getHeader()?.providerPromptCacheKey).toBe(providerPromptCacheKey);
-		expect(options.providerPromptCacheKey).toBe(providerPromptCacheKey);
-		expect(options.providerPromptCacheKeySource).toBe("fork");
 	});
 });

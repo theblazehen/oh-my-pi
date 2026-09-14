@@ -221,7 +221,12 @@ export class Tokenizer {
 		switch (message.role) {
 			case "user":
 			case "developer": {
-				const content: string | Array<{ type: string; text?: string }> = message.content;
+				// Both roles carry `string | (TextContent | ImageContent)[]` and both are
+				// sent to the provider -- convertMessageToLlm handles developer alongside
+				// user -- so they are counted alike. Without the developer case the switch
+				// fell through to `default: return 0`, and the old annotation narrowed the
+				// blocks to text-only, hiding the image charge the toolResult arm applies.
+				const content = message.content;
 				if (typeof content === "string") {
 					fragments.push(content);
 				} else if (Array.isArray(content)) {

@@ -23,10 +23,10 @@ import type { Theme } from "../modes/theme/theme";
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskAsyncContractTemplate from "../prompts/tools/task-async-contract.md" with { type: "text" };
+import taskFollowUpTemplate from "../prompts/tools/task-follow-up.md" with { type: "text" };
 import { TASK_EFFORTS, type TaskEffort } from "../thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { isIrcEnabled } from "../tools/hub";
-import { type ForkContextSnapshot, selectEffectiveTaskForkEntries } from "./executor";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
 import { isScoutSpawnable, resolveSpawnPolicy } from "./spawn-policy";
@@ -113,7 +113,6 @@ export type {
 	SubagentEventPayload,
 	SubagentLifecyclePayload,
 	SubagentProgressPayload,
-	TaskContextSource,
 	TaskParams,
 	TaskToolDetails,
 } from "./types";
@@ -217,27 +216,6 @@ function validateEffort(effort: TaskEffort | undefined, label: string): string |
 	return `${label} has an invalid \`effort\` value ${JSON.stringify(effort)}. Use "lo", "med", or "hi".`;
 }
 
-function validateContextSource(source: unknown, label: string): string | undefined {
-	if (source === undefined || source === "fresh" || source === "fork") return undefined;
-	return `${label} has an invalid \`source\` value ${JSON.stringify(source)}. Use "fresh" or "fork".`;
-}
-
-function validateContextSources(params: TaskParams): string | undefined {
-	const topLevelError = validateContextSource(params.source, "The call");
-	if (topLevelError) return topLevelError;
-	if (Array.isArray(params.tasks)) {
-		for (let i = 0; i < params.tasks.length; i++) {
-			const item = params.tasks[i];
-			const itemError = validateContextSource(
-				item?.source,
-				`Task ${i + 1}${item?.name ? ` (\`${item.name}\`)` : ""}`,
-			);
-			if (itemError) return itemError;
-		}
-	}
-	return undefined;
-}
-
 function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string | undefined {
 	const hasTask = typeof params.task === "string" && params.task.trim() !== "";
 	const tasks = params.tasks;
@@ -291,7 +269,6 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 		return params.tasks;
 	}
 	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task };
-	if ("source" in params) item.source = params.source;
 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
 	if ("tools" in params) item.tools = params.tools;
@@ -314,8 +291,6 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if (item.name !== undefined) spawn.name = item.name;
 	if (item.task !== undefined) spawn.task = item.task;
 	if (params.context !== undefined) spawn.context = params.context;
-	if ("source" in item) spawn.source = item.source;
-	else if ("source" in params) spawn.source = params.source;
 	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
 	if ("tools" in item) spawn.tools = item.tools;
@@ -333,39 +308,6 @@ interface SyncSpawnRef {
 	item: TaskItem;
 	index: number;
 	preAllocatedId?: string;
-}
-
-async function captureForkContext(session: ToolSession): Promise<ForkContextSnapshot | undefined> {
-	const manager = session.sessionManager;
-	if (!manager) return undefined;
-	const parentModel = session.getActiveModel?.();
-	const sourceFile = session.getSessionFile();
-	const branch = await manager.getBranchAsync();
-	let sourceLeafId: string | null = null;
-	let foundAssistant = false;
-	for (let index = branch.length - 1; index >= 0; index--) {
-		const entry = branch[index];
-		if (entry?.type === "message" && entry.message.role === "assistant") {
-			foundAssistant = true;
-			sourceLeafId = entry.id;
-			break;
-		}
-	}
-	if (!foundAssistant && branch.length > 0) sourceLeafId = branch[branch.length - 1]!.id;
-	// Slice the captured branch at the located leaf so the snapshot ends at the
-	// last completed assistant turn without observing later parent mutations.
-	const sourceIndex = sourceLeafId === null ? -1 : branch.findIndex(entry => entry.id === sourceLeafId);
-	const captured = sourceIndex < 0 ? [] : branch.slice(0, sourceIndex + 1);
-	return {
-		sourceFile,
-		sourceLeafId,
-		parentModel: parentModel ? { provider: parentModel.provider, id: parentModel.id } : null,
-		// Freeze the completed pre-task branch at scheduling time: deep-clone
-		// only its effective compacted region so later parent mutation (in-flight
-		// task call, subsequent messages, compactions) cannot leak into the child
-		// and superseded raw history is never cloned per spawn.
-		entries: structuredClone(selectEffectiveTaskForkEntries(captured)),
-	};
 }
 
 /** Merged view of a sync spawn set's payloads: joined text plus flattened results/usage/paths. */
@@ -715,7 +657,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			assignment: (params.task ?? "").trim(),
 			context: this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined,
 			agent: params.agent,
-			contextSource: params.source,
 			...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 			...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 			...(params.effort !== undefined ? { effort: params.effort } : {}),
@@ -747,21 +688,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// item's agent type against the session's actual default agent.
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
 		const batchEnabled = this.#isBatchEnabled();
-		const validationError =
-			validateContextSources(params) ??
-			validateShapeParams(batchEnabled, params) ??
-			validateSpawnParams(params, batchEnabled);
+		const validationError = validateShapeParams(batchEnabled, params) ?? validateSpawnParams(params, batchEnabled);
 		if (validationError) {
 			return createTaskModeError(validationError);
 		}
 
 		const spawnItems = resolveSpawnItems(params);
 		const normalizedSpawnParams = spawnItems.map(item => spawnParamsFor(params, item, defaultAgent));
-		// Capture once before asynchronous preflight, only when an effective item
-		// requests inheritance. Fresh-only batches must not hydrate cold history.
-		const forkContext = normalizedSpawnParams.some(spawn => spawn.source === "fork")
-			? await captureForkContext(this.session)
-			: undefined;
 		const evalToolNames = spawnItems.flatMap(item => item.tools ?? []);
 		if (evalToolNames.length > 0) {
 			if (this.session.getPlanModeState?.()?.enabled === true) {
@@ -842,7 +775,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const result = await this.#executeSyncFanout(
 				toolCallId,
 				params,
-				forkContext,
 				spawnItems.map((item, index) => ({ item, index })),
 				defaultAgent,
 				signal,
@@ -898,7 +830,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				await this.#executeSyncFanout(
 					toolCallId,
 					params,
-					forkContext,
 					spawnItems.map((item, index) => ({ item, index })),
 					defaultAgent,
 					signal,
@@ -1006,7 +937,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					manager,
 					toolCallId,
 					spawnParams: spawnParamsFor(params, spawn.item, defaultAgent),
-					forkContext,
 					agentId: spawn.agentId,
 					progress: spawn.progress,
 					ircEnabled,
@@ -1112,7 +1042,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const payloads = await this.#runSyncSpawns({
 			toolCallId,
 			params,
-			forkContext,
 			defaultAgent,
 			signal,
 			spawns: syncSpawns.map(spawn => ({ item: spawn.item, index: spawn.index, preAllocatedId: spawn.agentId })),
@@ -1174,7 +1103,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		manager: AsyncJobManager;
 		toolCallId: string;
 		spawnParams: TaskParams;
-		forkContext?: ForkContextSnapshot;
 		agentId: string;
 		progress: AgentProgress;
 		ircEnabled: boolean;
@@ -1187,7 +1115,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			manager,
 			toolCallId,
 			spawnParams,
-			forkContext,
 			agentId,
 			progress,
 			ircEnabled,
@@ -1197,19 +1124,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			onSettled,
 		} = options;
 		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
-			if (aborted) {
-				const ref = AgentRegistry.global().get(agentId);
-				const transcript = (await hasResolvableTranscript(agentId))
-					? `transcript at history://${agentId}`
-					: "transcript unavailable";
-				if (ref?.status === "idle" || ref?.status === "parked") {
-					const followUp = ircEnabled ? "message it via `hub` to resume; " : "";
-					return `\n\n${agentId} was stopped but is still resumable — ${followUp}${transcript}`;
-				}
-				return `\n\n${agentId} was aborted — ${transcript}`;
-			}
-			const followUp = ircEnabled ? "message it via `hub` to follow up; " : "";
-			return `\n\n${agentId} is now idle — ${followUp}transcript at history://${agentId}`;
+			// Isolated runs are parked without a reviver once the run ends
+			// (`finalizeSubagentLifecycle`), so "message it" would point the
+			// caller at a follow-up path that no longer exists. The template says
+			// nothing about the worktree itself: the runner keeps it when captured
+			// changes could not be written, and names that path in the result.
+			const isolated = spawnParams.isolated === true;
+			const ref = aborted ? AgentRegistry.global().get(agentId) : undefined;
+			return `\n\n${prompt.render(taskFollowUpTemplate, {
+				agentId,
+				aborted,
+				isolated,
+				ircEnabled,
+				resumable: !isolated && (ref?.status === "idle" || ref?.status === "parked"),
+				transcriptAvailable: aborted ? await hasResolvableTranscript(agentId) : true,
+			})}`;
 		};
 		return manager.register(
 			"task",
@@ -1262,8 +1191,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							// status back to the subagent's initial "pending" snapshot.
 							progress.modelRole = nextProgress.modelRole ?? progress.modelRole;
 							progress.resolvedModel = nextProgress.resolvedModel;
-							progress.resolvedModelIsFallback =
-								nextProgress.resolvedModelIsFallback ?? progress.resolvedModelIsFallback;
+							progress.resolvedModelIdentity = nextProgress.resolvedModelIdentity;
+							progress.resolvedThinkingLevel = nextProgress.resolvedThinkingLevel;
+							progress.resolvedModelIsFallback = nextProgress.resolvedModel
+								? nextProgress.resolvedModelIsFallback
+								: undefined;
+							progress.advisor = nextProgress.advisor ?? progress.advisor;
 							progress.tokens = nextProgress.tokens;
 							progress.requests = nextProgress.requests;
 							progress.contextTokens = nextProgress.contextTokens;
@@ -1284,7 +1217,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					const result = await this.#executeSync(
 						toolCallId,
 						spawnParams,
-						forkContext,
 						runSignal,
 						forwardSyncProgress,
 						agentId,
@@ -1307,8 +1239,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 					const singleResult = result.details?.results[0];
 					// A missing result means the sync path failed at the tool level
-					// (results: []) — treat it as a failure, not success.
-					const resultFailed = !singleResult || (singleResult.aborted ?? false) || singleResult.exitCode !== 0;
+					// (results: []) — treat it as a failure, not success. A runner
+					// error on a zero exit (changes captured but not landed, or a
+					// retained workspace) is a failure too: the work needs manual
+					// recovery, which a "completed" job would hide. Mirrors the sync
+					// path's status derivation.
+					const resultFailed =
+						!singleResult ||
+						(singleResult.aborted ?? false) ||
+						singleResult.exitCode !== 0 ||
+						singleResult.error !== undefined;
 					progress.status = singleResult?.aborted ? "aborted" : resultFailed ? "failed" : "completed";
 					progress.durationMs = singleResult?.durationMs ?? Math.max(0, Date.now() - startedAt);
 					progress.tokens = singleResult?.tokens ?? 0;
@@ -1320,12 +1260,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					progress.retryFailure = singleResult?.retryFailure;
 					progress.retryState = undefined;
 					progress.modelRole = singleResult?.modelRole ?? progress.modelRole;
+					progress.advisor = singleResult?.advisor ?? progress.advisor;
 					if (singleResult?.resolvedModel) {
 						progress.resolvedModel = singleResult.resolvedModel;
-						progress.resolvedModelIsFallback =
-							singleResult.resolvedModelIsFallback ?? progress.resolvedModelIsFallback;
+						progress.resolvedModelIdentity = singleResult.resolvedModelIdentity;
+						progress.resolvedThinkingLevel = singleResult.resolvedThinkingLevel;
+						progress.resolvedModelIsFallback = singleResult.resolvedModelIsFallback;
 					} else {
 						delete progress.resolvedModel;
+						delete progress.resolvedModelIdentity;
+						delete progress.resolvedThinkingLevel;
 						delete progress.resolvedModelIsFallback;
 					}
 					if (singleResult) onResult?.(singleResult);
@@ -1378,7 +1322,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	async #executeSyncFanout(
 		toolCallId: string,
 		params: TaskParams,
-		forkContext: ForkContextSnapshot | undefined,
 		spawns: SyncSpawnRef[],
 		defaultAgent: string,
 		signal?: AbortSignal,
@@ -1394,7 +1337,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				return await this.#executeSync(
 					toolCallId,
 					spawnParamsFor(params, spawn.item, defaultAgent),
-					forkContext,
 					signal,
 					onUpdate,
 					spawn.preAllocatedId,
@@ -1426,7 +1368,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const payloads = await this.#runSyncSpawns({
 			toolCallId,
 			params,
-			forkContext,
 			defaultAgent,
 			signal,
 			spawns,
@@ -1462,13 +1403,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	async #runSyncSpawns(args: {
 		toolCallId: string;
 		params: TaskParams;
-		forkContext: ForkContextSnapshot | undefined;
 		defaultAgent: string;
 		spawns: SyncSpawnRef[];
 		signal?: AbortSignal;
 		onItemProgress?: (index: number, progress: AgentProgress) => void;
 	}): Promise<(AgentToolResult<TaskToolDetails> | undefined)[]> {
-		const { toolCallId, params, forkContext, defaultAgent, spawns, signal, onItemProgress } = args;
+		const { toolCallId, params, defaultAgent, spawns, signal, onItemProgress } = args;
 		const semaphore = this.#getSpawnSemaphore();
 		const { results } = await mapWithConcurrencyLimitAllSettled(
 			spawns,
@@ -1494,7 +1434,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					return await this.#executeSync(
 						toolCallId,
 						spawnParamsFor(params, spawn.item, defaultAgent),
-						forkContext,
 						workerSignal,
 						itemOnUpdate,
 						spawn.preAllocatedId,
@@ -1534,7 +1473,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	async #executeSync(
 		toolCallId: string,
 		params: TaskParams,
-		forkContext: ForkContextSnapshot | undefined,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 		preAllocatedId?: string,
@@ -1546,7 +1484,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return this.#runSpawn(
 			toolCallId,
 			params,
-			forkContext,
 			signal,
 			onUpdate,
 			preAllocatedId,
@@ -1561,7 +1498,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	async #runSpawn(
 		toolCallId: string,
 		params: TaskParams,
-		forkContext: ForkContextSnapshot | undefined,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 		preAllocatedId?: string,
@@ -1581,8 +1517,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				assignment,
 				context,
 				agent: params.agent,
-				contextSource: params.source,
-				forkContext,
 				...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 				...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 				...(params.effort !== undefined ? { effort: params.effort } : {}),

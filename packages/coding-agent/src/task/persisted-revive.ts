@@ -67,6 +67,13 @@ export function createPersistedSubagentReviverFactory(
 		// is gone (isolated/merged worktree, moved dir): leave it transcript-only
 		// (history://) rather than resurrect a wrong or broken session.
 		if (!peek?.init) return undefined;
+		// Isolated runs are never resumable: their worktree is merged + cleaned,
+		// and the parent was told messaging is impossible. A retained workspace
+		// (capture/persist failure) still exists on disk and would pass the cwd
+		// probe below, so gate on the stamped contract instead — otherwise a
+		// restart + Hub message revives the agent outside isolation, in the
+		// parent cwd, contradicting the delivery notice.
+		if (peek.init.isolated) return undefined;
 		try {
 			await fs.stat(peek.cwd);
 		} catch {
@@ -116,7 +123,6 @@ export function createPersistedSubagentReviverFactory(
 			const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
 				suppressBreadcrumb: true,
 			});
-			const providerPromptCacheKey = reopened.getHeader()?.providerPromptCacheKey;
 			const artifactManager = ctx.session.sessionManager.getArtifactManager();
 			if (artifactManager) reopened.adoptArtifactManager(artifactManager);
 			// A restricted persisted contract must not consult process-global MCP
@@ -165,9 +171,6 @@ export function createPersistedSubagentReviverFactory(
 				restrictToolNames: restrictToolNames || undefined,
 				requireYieldTool: true,
 				systemPrompt: () => [init.systemPrompt],
-				...(providerPromptCacheKey !== undefined
-					? { providerPromptCacheKey, providerPromptCacheKeySource: "fork" as const }
-					: {}),
 				// Old files predate persisted spawns: deny re-spawning rather than let
 				// createAgentSession default to wildcard ("*").
 				spawns: init.spawns ?? "",

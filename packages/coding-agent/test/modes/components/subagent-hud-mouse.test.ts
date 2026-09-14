@@ -1,79 +1,78 @@
 import { beforeAll, describe, expect, it } from "bun:test";
-import { SubagentHudComponent } from "@oh-my-pi/pi-coding-agent/modes/components/subagent-hud";
-import type { ObservableSession } from "@oh-my-pi/pi-coding-agent/modes/session-observer-registry";
+import { FullscreenChatLayout } from "@oh-my-pi/pi-coding-agent/modes/components/fullscreen-chat-layout";
+import { SubagentHudComponent } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import { PINNED_HUD_TOGGLE_ID } from "@oh-my-pi/pi-coding-agent/modes/composer";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { SgrMouseEvent } from "@oh-my-pi/pi-tui";
+import { Container, Text } from "@oh-my-pi/pi-tui";
 
-function session(id: string): ObservableSession {
-	return {
-		id,
-		kind: "subagent",
-		label: id,
-		status: "active",
-		detached: true,
-		lastUpdate: 0,
-	};
+function click(layout: FullscreenChatLayout, row: number): void {
+	layout.handleInput(`\x1b[<0;2;${row + 1}M`);
+	layout.handleInput(`\x1b[<0;2;${row + 1}m`);
 }
 
-function mouse(overrides: Partial<SgrMouseEvent> = {}): SgrMouseEvent {
-	return {
-		button: 0,
-		buttonId: 0,
-		col: 0,
-		row: 0,
-		release: false,
-		wheel: null,
-		motion: false,
-		shift: false,
-		alt: false,
-		ctrl: false,
-		leftClick: true,
-		...overrides,
-	};
-}
-
-describe("subagent HUD mouse routing", () => {
+describe("shared fullscreen subagent click routing", () => {
 	beforeAll(initTheme);
 
-	it("maps physical agent rows to their session ids", () => {
-		const focused: string[] = [];
-		const component = new SubagentHudComponent({ onAgent: id => focused.push(id), onManager: () => {} });
-		component.update([session("First"), session("Second")], 100);
-
-		component.routeMouse(mouse(), 2, 5);
-		component.routeMouse(mouse(), 3, 5);
-
-		expect(focused).toEqual(["First", "Second"]);
-	});
-
-	it("opens the manager from the header and overflow summary", () => {
-		let opened = 0;
-		const component = new SubagentHudComponent({ onAgent: () => {}, onManager: () => opened++ });
-		component.update(
-			Array.from({ length: 9 }, (_, index) => session(`Agent${index}`)),
-			100,
-		);
-
-		component.routeMouse(mouse(), 1, 0);
-		component.routeMouse(mouse(), 10, 0);
-
-		expect(opened).toBe(2);
-	});
-
-	it("ignores release, drag, non-left, blank, and out-of-range events", () => {
-		const actions: string[] = [];
-		const component = new SubagentHudComponent({
-			onAgent: id => actions.push(id),
-			onManager: () => actions.push("manager"),
+	it("uses the upstream physical row map for wrapped HUD rows", () => {
+		const focused: string[][] = [];
+		const hud = new Container();
+		hud.addChild(new SubagentHudComponent(["", "Subagents", "First lengthy description continued", "Second"], ["First", "Second"]));
+		const layout = new FullscreenChatLayout({
+			transcript: new Text("history"),
+			editor: new Text("editor"),
+			beforeEditor: [hud],
+			getTerminalRows: () => 12,
+			onClickCandidates: ids => focused.push(ids),
 		});
-		component.update([session("First")], 100);
+		const lines = layout.render(20);
+		const continuation = lines.findIndex(line => line.includes("continued"));
+		const second = lines.findIndex(line => line.includes("Second"));
+		expect(continuation).toBeGreaterThanOrEqual(0);
+		expect(second).toBeGreaterThan(continuation);
+		click(layout, continuation);
+		click(layout, second);
+		expect(focused).toEqual([["First"], ["Second"]]);
+	});
 
-		component.routeMouse(mouse({ release: true, leftClick: false }), 2, 0);
-		component.routeMouse(mouse({ button: 32, motion: true, leftClick: false }), 2, 0);
-		component.routeMouse(mouse({ button: 2, buttonId: 2, leftClick: false }), 2, 0);
-		component.routeMouse(mouse(), 0, 0);
-		component.routeMouse(mouse(), 3, 0);
+	it("preserves target offsets when the pinned HUD is clipped at the top", () => {
+		const focused: string[][] = [];
+		const hud = new Container();
+		hud.addChild(new SubagentHudComponent(["", "Subagents", "First", "Second", "Expand"], ["First", "Second"], 4));
+		const layout = new FullscreenChatLayout({
+			transcript: new Text("history"),
+			editor: new Text("editor", 0, 0),
+			beforeEditor: [hud],
+			getTerminalRows: () => 3,
+			onClickCandidates: ids => focused.push(ids),
+		});
+		const lines = layout.render(40);
+		const second = lines.findIndex(line => line.includes("Second"));
+		const toggle = lines.findIndex(line => line.includes("Expand"));
+		expect(second).toBe(0);
+		expect(toggle).toBe(1);
+		click(layout, second);
+		click(layout, toggle);
+		expect(focused).toEqual([["Second"], [PINNED_HUD_TOGGLE_ID]]);
+	});
 
-		expect(actions).toEqual([]);
+	it("focuses a transcript card on click but copies a drag without focusing", () => {
+		const focused: string[][] = [];
+		const transcript = { render: () => ["agent output"], getClickFocusAgentIds: () => ["First"] };
+		const copied: string[] = [];
+		const layout = new FullscreenChatLayout({
+			transcript,
+			editor: new Text("editor"),
+			getTerminalRows: () => 5,
+			onClickCandidates: ids => focused.push(ids),
+			copyText: text => copied.push(text),
+		});
+		const row = layout.render(40).findIndex(line => line.includes("agent output"));
+		expect(row).toBeGreaterThanOrEqual(0);
+		click(layout, row);
+		layout.handleInput(`\x1b[<0;1;${row + 1}M`);
+		layout.handleInput(`\x1b[<32;5;${row + 1}M`);
+		layout.handleInput(`\x1b[<0;5;${row + 1}m`);
+		expect(focused).toEqual([["First"]]);
+		expect(copied).toEqual(["agent"]);
 	});
 });

@@ -19,8 +19,6 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -50,16 +48,13 @@ function createSession(
 		agentId?: string;
 		planMode?: boolean;
 		spawns?: string;
-		sessionManager?: ToolSession["sessionManager"];
-		sessionFile?: string | null;
 	} = {},
 ): ToolSession {
 	return {
 		cwd: "/tmp",
 		hasUI: false,
 		settings: Settings.isolated(options.settings ?? {}),
-		getSessionFile: () => options.sessionFile ?? null,
-		sessionManager: options.sessionManager,
+		getSessionFile: () => null,
 		getSessionSpawns: () => options.spawns ?? "*",
 		getAgentId: () => options.agentId ?? null,
 		getPlanModeState: options.planMode ? () => ({ enabled: true }) : undefined,
@@ -759,115 +754,5 @@ describe("task.batch spawning", () => {
 		expect(last?.async?.state).toBe("failed");
 		expect(last?.progress?.find(p => p.id === "Second")?.status).toBe("aborted");
 		expect(last?.progress?.find(p => p.id === "First")?.status).toBe("completed");
-	});
-
-	it("captures the fork leaf before a delayed background spawn runs", async () => {
-		mockDiscovery();
-		const storage = new MemorySessionStorage();
-		const manager = SessionManager.create("/tmp", "/tmp/sessions", storage);
-		const capturedParent = manager.appendMessage({ role: "user", content: "parent", timestamp: Date.now() });
-		const capturedAssistant = manager.appendMessage({
-			role: "assistant",
-			provider: "anthropic",
-			model: "test",
-			api: "anthropic-messages",
-			content: [{ type: "text", text: "captured" }],
-			stopReason: "stop",
-			timestamp: Date.now(),
-		} as never);
-		const inFlightTaskCall = manager.appendCustomEntry("tool_execution_start", {
-			toolCallId: "task-call",
-			toolName: "task",
-		});
-		const sourceFile = manager.getSessionFile();
-		if (!sourceFile) throw new Error("expected session file");
-		const readBranch = vi.spyOn(manager, "getBranchAsync");
-		const seen: Array<{
-			sourceFile: string | null;
-			sourceLeafId: string | null;
-			entries: Array<{
-				id: string;
-				type: string;
-				parentId: string | null;
-				message?: { role?: string; content?: Array<{ type?: string; text?: string }> };
-			}>;
-		}> = [];
-		const executorReached = Promise.withResolvers<void>();
-		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
-			seen.push({
-				sourceFile: options.forkContext?.sourceFile ?? null,
-				sourceLeafId: options.forkContext?.sourceLeafId ?? null,
-				entries: (options.forkContext?.entries ?? []).map(entry => ({
-					id: entry.id,
-					type: entry.type,
-					parentId: entry.parentId,
-					message:
-						entry.type === "message" && entry.message.role === "assistant"
-							? {
-									role: entry.message.role,
-									content: entry.message.content.map(part => ({
-										type: part.type,
-										text: part.type === "text" ? part.text : undefined,
-									})),
-								}
-							: undefined,
-				})),
-			});
-			executorReached.resolve();
-			return makeResult(options.id ?? "?");
-		});
-		const jobs = createManager();
-		const tool = await TaskTool.create(
-			createSession({
-				manager: jobs,
-				sessionManager: manager,
-				sessionFile: sourceFile,
-				settings: { "async.enabled": true, "task.batch": false },
-			}),
-		);
-		const result = await tool.execute("tc-captured", { agent: "task", task: "Do it.", source: "fork" } as TaskParams);
-		expect(readBranch).toHaveBeenCalledTimes(1);
-		// The full fork branch was captured before scheduling and
-		// handed to the executor as a deep-cloned snapshot.
-		await executorReached.promise;
-		expect(seen).toHaveLength(1);
-		const captured = seen[0]!;
-		// Mutate the live manager after scheduling: append a later assistant,
-		// reset the leaf, and append an unrelated root. None of this may leak
-		// into the already-frozen snapshot.
-		const laterMessage = manager.appendMessage({
-			role: "assistant",
-			provider: "anthropic",
-			model: "test",
-			api: "anthropic-messages",
-			content: [{ type: "text", text: "later" }],
-			stopReason: "stop",
-			timestamp: Date.now(),
-		} as never);
-		manager.resetLeaf();
-		const resetMessage = manager.appendMessage({ role: "user", content: "reset", timestamp: Date.now() });
-		// Verify the live branch now differs from the captured snapshot: the leaf
-		// advanced onto the reset entry, so any alias into the live manager would
-		// show up in the frozen entries.
-		expect(manager.getBranch(undefined).at(-1)?.id).toBe(resetMessage);
-		await jobs.getJob(result.details?.async?.jobId ?? "")?.promise;
-		expect(captured.sourceFile).toBe(sourceFile);
-		expect(captured.sourceLeafId).toBe(capturedAssistant);
-		expect(capturedAssistant).not.toBe(capturedParent);
-		// The snapshot is exactly the completed pre-task branch: it contains the
-		// parent user message and the captured assistant turn, but never the
-		// in-flight task call nor the later/reset entries added after scheduling.
-		const capturedIds = captured.entries.map(entry => entry.id);
-		expect(capturedIds).toContain(capturedParent);
-		expect(capturedIds).toContain(capturedAssistant);
-		expect(capturedIds.some(id => id === inFlightTaskCall)).toBe(false);
-		expect(capturedIds.some(id => id === laterMessage)).toBe(false);
-		expect(capturedIds.some(id => id === resetMessage)).toBe(false);
-		// The frozen assistant turn keeps its exact content and lives at the leaf.
-		const frozenAssistant = captured.entries.find(entry => entry.id === capturedAssistant);
-		expect(frozenAssistant).toMatchObject({
-			type: "message",
-			message: { role: "assistant", content: [{ type: "text", text: "captured" }] },
-		});
 	});
 });

@@ -4,6 +4,8 @@ import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import * as loopCondition from "@oh-my-pi/pi-coding-agent/modes/loop-condition";
+import type { LoopConditionVerdict } from "@oh-my-pi/pi-coding-agent/modes/loop-condition";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -401,11 +403,14 @@ describe("InteractiveMode loop auto-submit", () => {
 
 	it("reschedules a prior running loop when replacement delivery is rejected", async () => {
 		vi.useFakeTimers();
-		expect(await acceptLoopCommand("4 original prompt")).toBe("original prompt");
+		vi.spyOn(loopCondition, "evaluateLoopCondition").mockImplementation(async condition =>
+			condition.command === "true" ? { kind: "continue" } : { kind: "halt", message: "replacement gate" },
+		);
+		expect(await acceptLoopCommand("4 --while 'true' original prompt")).toBe("original prompt");
 		const resolved: SubmittedUserInput[] = [];
 		void mode.getUserInput().then(input => resolved.push(input));
 
-		expect(await mode.handleLoopCommand("2 replacement prompt")).toBe("replacement prompt");
+		expect(await mode.handleLoopCommand("2 --until 'false' replacement prompt")).toBe("replacement prompt");
 		mode.finishLoopCommandSubmission("replacement prompt", new Error("queue rejected"));
 
 		expect(mode.loopModeEnabled).toBe(true);
@@ -507,5 +512,252 @@ describe("InteractiveMode loop auto-submit", () => {
 		expect(mode.loopPrompt).toBe("retained prompt");
 		expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 4, remaining: 4 });
 		expect(showError).toHaveBeenCalledWith(expect.stringContaining("Usage: /loop"));
+	});
+
+	describe("continue condition", () => {
+		function idleSession(): void {
+			Object.defineProperty(session, "isCompacting", { configurable: true, get: () => false });
+			Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
+			Object.defineProperty(session, "hasPostPromptWork", { configurable: true, get: () => false });
+		}
+
+		function armLoop(prompt: string): SubmittedUserInput[] {
+			const resolved: SubmittedUserInput[] = [];
+			mode.loopModeEnabled = true;
+			mode.loopPrompt = prompt;
+			pendingInput = mode.getUserInput();
+			void pendingInput.then(input => resolved.push(input));
+			return resolved;
+		}
+
+		it("submits the next iteration when the condition says continue", async () => {
+			vi.useFakeTimers();
+			idleSession();
+			const evaluate = vi.spyOn(loopCondition, "evaluateLoopCondition").mockResolvedValue({ kind: "continue" });
+			mode.loopCondition = { command: "test -f GO", until: false };
+
+			const resolved = armLoop("keep going");
+			vi.advanceTimersByTime(800);
+			await flushMicrotasks();
+
+			expect(evaluate).toHaveBeenCalledTimes(1);
+			expect(evaluate.mock.calls[0][0]).toEqual({ command: "test -f GO", until: false });
+			expect(resolved).toHaveLength(1);
+			expect(resolved[0].text).toBe("keep going");
+			expect(mode.loopModeEnabled).toBe(true);
+		});
+
+		it("disables the loop and submits nothing when the condition says halt", async () => {
+			vi.useFakeTimers();
+			idleSession();
+			vi.spyOn(loopCondition, "evaluateLoopCondition").mockResolvedValue({
+				kind: "halt",
+				message: "Loop condition `bun test` is now satisfied. Loop mode disabled.",
+			});
+			const showStatus = vi.spyOn(mode, "showStatus");
+			mode.loopCondition = { command: "bun test", until: true };
+
+			const resolved = armLoop("fix the tests");
+			vi.advanceTimersByTime(800);
+			await flushMicrotasks();
+
+			expect(resolved).toHaveLength(0);
+			expect(mode.loopModeEnabled).toBe(false);
+			expect(showStatus).toHaveBeenCalledWith("Loop condition `bun test` is now satisfied. Loop mode disabled.");
+		});
+
+		// A halted iteration never ran, so it must not spend the user's budget:
+		// `/loop 3 --until ...` that stops early should still report 3 remaining.
+		it("does not consume the iteration budget when the condition halts", async () => {
+			vi.useFakeTimers();
+			idleSession();
+			vi.spyOn(loopCondition, "evaluateLoopCondition").mockResolvedValue({ kind: "halt", message: "stop" });
+			mode.loopCondition = { command: "bun test", until: true };
+			const limit = { kind: "iterations", initial: 3, remaining: 3 } as const;
+			mode.loopLimit = { ...limit };
+			const observed = mode.loopLimit;
+
+			armLoop("fix the tests");
+			vi.advanceTimersByTime(800);
+			await flushMicrotasks();
+
+			expect(observed).toEqual(limit);
+		});
+
+		// Esc between iterations must kill the child process and skip the
+		// iteration without tearing down loop mode, and the late verdict that
+		// arrives afterwards must not resurrect the cancelled iteration.
+		it("aborts an in-flight condition on pause and ignores its late verdict", async () => {
+			vi.useFakeTimers();
+			idleSession();
+			const pending = Promise.withResolvers<LoopConditionVerdict>();
+			let captured: AbortSignal | undefined;
+			vi.spyOn(loopCondition, "evaluateLoopCondition").mockImplementation(async (_condition, options) => {
+				captured = options.signal;
+				return await pending.promise;
+			});
+			mode.loopCondition = { command: "sleep 30", until: false };
+
+			const resolved = armLoop("keep going");
+			vi.advanceTimersByTime(800);
+			await flushMicrotasks();
+
+			expect(captured?.aborted).toBe(false);
+
+			mode.pauseLoop();
+			expect(captured?.aborted).toBe(true);
+			expect(mode.loopModeEnabled).toBe(true);
+			expect(mode.loopModePaused).toBe(true);
+
+			pending.resolve({ kind: "continue" });
+			await flushMicrotasks();
+
+			expect(resolved).toHaveLength(0);
+			expect(mode.loopModeEnabled).toBe(true);
+		});
+
+		it("cancels the gate for a manual submission without replacing or pausing the owned loop", async () => {
+			vi.useFakeTimers();
+			idleSession();
+			const pending = Promise.withResolvers<LoopConditionVerdict>();
+			let signal: AbortSignal | undefined;
+			vi.spyOn(loopCondition, "evaluateLoopCondition").mockImplementation(async (_condition, options) => {
+				signal = options.signal;
+				return pending.promise;
+			});
+			mode.loopCondition = { command: "sleep 30", until: false };
+			const resolved = armLoop("owned prompt");
+			vi.advanceTimersByTime(800);
+			await flushMicrotasks();
+			const manual = mode.startPendingSubmission({ text: "manual message" });
+			expect(signal?.aborted).toBe(true);
+			pending.resolve({ kind: "halt", message: "stale gate" });
+			await flushMicrotasks();
+			expect(resolved).toHaveLength(0);
+			expect(mode.loopPrompt).toBe("owned prompt");
+			expect(mode.loopModeEnabled).toBe(true);
+			expect(mode.loopModePaused).toBe(false);
+			mode.finishPendingSubmission(manual);
+		});
+
+		it("aborts an in-flight condition when an explicit loop command replaces its prompt", async () => {
+			vi.useFakeTimers();
+			idleSession();
+			const pending = Promise.withResolvers<LoopConditionVerdict>();
+			let captured: AbortSignal | undefined;
+			vi.spyOn(loopCondition, "evaluateLoopCondition").mockImplementation(async (_condition, options) => {
+				captured = options.signal;
+				return await pending.promise;
+			});
+			mode.loopCondition = { command: "sleep 30", until: false };
+
+			armLoop("keep going");
+			vi.advanceTimersByTime(800);
+			await flushMicrotasks();
+
+			expect(captured?.aborted).toBe(false);
+
+			await acceptLoopCommand("a replacement loop prompt");
+			expect(captured?.aborted).toBe(true);
+			pending.resolve({ kind: "halt", message: "stale gate" });
+			await flushMicrotasks();
+			expect(mode.loopPrompt).toBe("a replacement loop prompt");
+			expect(mode.loopModeEnabled).toBe(true);
+		});
+
+		it("ignores a stale condition verdict when an explicit replacement repeats the same prompt", async () => {
+			vi.useFakeTimers();
+			idleSession();
+			const pending = Promise.withResolvers<LoopConditionVerdict>();
+			let captured: AbortSignal | undefined;
+			vi.spyOn(loopCondition, "evaluateLoopCondition").mockImplementation(async (_condition, options) => {
+				captured = options.signal;
+				return await pending.promise;
+			});
+			mode.loopCondition = { command: "sleep 30", until: false };
+
+			armLoop("keep going");
+			vi.advanceTimersByTime(800);
+			await flushMicrotasks();
+
+			expect(captured?.aborted).toBe(false);
+
+			await acceptLoopCommand("keep going");
+			expect(captured?.aborted).toBe(true);
+			pending.resolve({ kind: "halt", message: "stale gate" });
+			await flushMicrotasks();
+			expect(mode.loopPrompt).toBe("keep going");
+			expect(mode.loopModeEnabled).toBe(true);
+		});
+
+		// /vibe enabled while the gate is awaiting must kill a reset loop: the
+		// pre-gate guard is stale by then, and handleClearCommand would only
+		// warn while the iteration still submitted without resetting. Goes
+		// through the real /vibe command so the vibeModeEnabled transition is
+		// exercised instead of assigned directly.
+		it("disables a reset loop when vibe is enabled while the condition is in flight", async () => {
+			vi.useFakeTimers();
+			settings.set("loop.mode", "reset");
+			idleSession();
+			const pending = Promise.withResolvers<LoopConditionVerdict>();
+			vi.spyOn(loopCondition, "evaluateLoopCondition").mockImplementation(async () => await pending.promise);
+			const clear = vi.spyOn(mode, "handleClearCommand");
+			const showStatus = vi.spyOn(mode, "showStatus");
+			vi.spyOn(session, "activateVibeTools").mockResolvedValue();
+			mode.loopCondition = { command: "sleep 30", until: false };
+
+			const resolved = armLoop("reset me");
+			vi.advanceTimersByTime(800);
+			await flushMicrotasks();
+
+			await mode.handleVibeModeCommand();
+			expect(mode.vibeModeEnabled).toBe(true);
+			pending.resolve({ kind: "continue" });
+			await flushMicrotasks();
+
+			expect(clear).not.toHaveBeenCalled();
+			expect(resolved).toHaveLength(0);
+			expect(mode.loopModeEnabled).toBe(false);
+			expect(mode.loopPrompt).toBeUndefined();
+			expect(showStatus).toHaveBeenCalledWith("Exit vibe mode before using reset loops. Loop mode disabled.");
+		});
+
+		// The condition can resolve while /vibe tool activation is still in
+		// flight: vibeModeEnabled is still false, but the reset must not run
+		// concurrently with the toolset switch. The loop must disable on the
+		// entering transition, not just the settled flag.
+		it("disables a reset loop when the condition resolves during vibe activation", async () => {
+			vi.useFakeTimers();
+			settings.set("loop.mode", "reset");
+			idleSession();
+			const pending = Promise.withResolvers<LoopConditionVerdict>();
+			vi.spyOn(loopCondition, "evaluateLoopCondition").mockImplementation(async () => await pending.promise);
+			const clear = vi.spyOn(mode, "handleClearCommand");
+			const showStatus = vi.spyOn(mode, "showStatus");
+			const vibeGate = Promise.withResolvers<void>();
+			vi.spyOn(session, "activateVibeTools").mockImplementation(() => vibeGate.promise);
+			mode.loopCondition = { command: "sleep 30", until: false };
+
+			const resolved = armLoop("reset me");
+			vi.advanceTimersByTime(800);
+			await flushMicrotasks();
+
+			const vibeEnter = mode.handleVibeModeCommand();
+			await flushMicrotasks();
+			expect(mode.vibeModeEnabled).toBe(false);
+
+			pending.resolve({ kind: "continue" });
+			await flushMicrotasks();
+
+			expect(clear).not.toHaveBeenCalled();
+			expect(resolved).toHaveLength(0);
+			expect(mode.loopModeEnabled).toBe(false);
+			expect(mode.loopPrompt).toBeUndefined();
+			expect(showStatus).toHaveBeenCalledWith("Exit vibe mode before using reset loops. Loop mode disabled.");
+
+			vibeGate.resolve();
+			await vibeEnter;
+			expect(mode.vibeModeEnabled).toBe(true);
+		});
 	});
 });

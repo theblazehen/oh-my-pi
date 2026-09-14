@@ -11,6 +11,7 @@ import {
 	sliceWithWidth,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
+import { renderClickTargets, type RenderedClickTargets, routeViewportClick, type ViewportClickSpan } from "../composer";
 import type { TranscriptBlockSource } from "./transcript-container";
 
 export interface FullscreenChatLayoutOptions {
@@ -35,6 +36,8 @@ export interface FullscreenChatLayoutOptions {
 	maxTranscriptRows?: number;
 	/** Receives plain text when an application-owned drag selection is released. */
 	copyText?: (text: string) => void;
+	/** Uses the same registry and toggle resolution as inline click capture. */
+	onClickCandidates?: (candidates: string[]) => void;
 }
 
 interface FullscreenTranscriptBlockRender {
@@ -133,10 +136,6 @@ interface PinnedHitRange {
 	componentLineOffset: number;
 }
 
-interface RenderedComponents {
-	lines: string[];
-	counts: number[];
-}
 
 interface ResidentTranscriptBlock extends FullscreenTranscriptBlockRender {
 	ordinal: number;
@@ -186,6 +185,8 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 	#pagedInitialized = false;
 	#pendingPagedJump: PendingPagedJump | undefined;
 	#pinnedHitRanges: readonly PinnedHitRange[] = [];
+	#pinnedClickSpans: readonly ViewportClickSpan[] = [];
+	#onClickCandidates: ((candidates: string[]) => void) | undefined;
 	#selectionAnchor: SelectionPoint | undefined;
 	#selectionFocus: SelectionPoint | undefined;
 	#selectionDragged = false;
@@ -211,6 +212,7 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 				? Math.max(1, Math.trunc(options.maxTranscriptRows))
 				: 10_000;
 		this.#copyText = options.copyText ?? (() => {});
+		this.#onClickCandidates = options.onClickCandidates;
 	}
 
 	get focused(): boolean {
@@ -272,9 +274,9 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 	render(width: number): readonly string[] {
 		const requestedRows = this.#getTerminalRows();
 		const terminalRows = Number.isFinite(requestedRows) ? Math.max(0, Math.trunc(requestedRows)) : 0;
-		const beforeEditor = this.#renderAll(this.#beforeEditor, width);
+		const beforeEditor = renderClickTargets(this.#beforeEditor, width);
 		const editor = [...this.#editorHost.render(width)];
-		const afterEditor = this.#renderAll(this.#afterEditor, width);
+		const afterEditor = renderClickTargets(this.#afterEditor, width);
 		const pinned = [...beforeEditor.lines, ...editor, ...afterEditor.lines];
 		const transcriptHeight = Math.max(0, terminalRows - pinned.length);
 
@@ -630,16 +632,6 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 		return Math.max(32, this.#transcriptHeight * 4);
 	}
 
-	#renderAll(components: readonly Component[], width: number): RenderedComponents {
-		const lines: string[] = [];
-		const counts: number[] = [];
-		for (const component of components) {
-			const rendered = component.render(width);
-			counts.push(rendered.length);
-			lines.push(...rendered);
-		}
-		return { lines, counts };
-	}
 
 	#handleSelectionMouse(event: SgrMouseEvent): boolean {
 		const point = this.#transcriptPoint(event);
@@ -675,6 +667,12 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 			if (this.#selectionDragged && this.#selectionFocus) {
 				const text = this.#selectedText(this.#selectionAnchor, this.#selectionFocus);
 				if (text.length > 0) this.#copyText(text);
+			}
+			else if (point && this.#onClickCandidates) {
+				const block = this.#residentBlocks.find(block => point.row >= block.startRow + block.separatorRows && point.row < block.startRow + block.rowCount);
+				const target = block?.identity as Partial<{ getClickFocusAgentIds(): string[] }> | undefined;
+				const candidates = target?.getClickFocusAgentIds?.();
+				if (candidates?.length) this.#onClickCandidates(candidates);
 			}
 			this.#selectionAnchor = undefined;
 			this.#selectionFocus = undefined;
@@ -725,6 +723,13 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 	}
 
 	#routePinnedMouse(event: SgrMouseEvent): boolean {
+		if (event.leftClick && this.#onClickCandidates) {
+			const candidates = routeViewportClick(this.#pinnedClickSpans, event.row);
+			if (candidates.length > 0) {
+				this.#onClickCandidates(candidates);
+				return true;
+			}
+		}
 		const hit = this.#pinnedHitRanges.find(range => event.row >= range.start && event.row < range.end);
 		if (!hit) return false;
 		const target = hit.component as Partial<MouseRoutable>;
@@ -735,15 +740,26 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 
 	#buildPinnedHitRanges(
 		terminalRows: number,
-		before: RenderedComponents,
+		before: RenderedClickTargets,
 		editorRows: number,
-		after: RenderedComponents,
+		after: RenderedClickTargets,
 	): readonly PinnedHitRange[] {
 		const components = [...this.#beforeEditor, this.#editorHost, ...this.#afterEditor];
 		const lengths = [...before.counts, editorRows, ...after.counts];
 		const pinnedRows = before.lines.length + editorRows + after.lines.length;
 		const clipped = Math.max(0, pinnedRows - terminalRows);
 		const screenBase = Math.max(0, terminalRows - pinnedRows);
+		this.#pinnedClickSpans = [
+			...before.spans,
+			...after.spans.map(span => ({ ...span, start: span.start + before.lines.length + editorRows, end: span.end + before.lines.length + editorRows })),
+		].filter(span => span.end > clipped).map(span => {
+			const visibleStart = Math.max(span.start, clipped);
+			return {
+				start: screenBase + visibleStart - clipped,
+				end: screenBase + span.end - clipped,
+				candidates: local => span.candidates(local + visibleStart - span.start),
+			};
+		});
 		const ranges: PinnedHitRange[] = [];
 		let aggregateStart = 0;
 		for (let index = 0; index < components.length; index++) {

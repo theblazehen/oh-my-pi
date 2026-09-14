@@ -290,6 +290,7 @@ class SessionList implements Component {
 	#projectWidth = 0;
 	#compactHeight = 0;
 	#compactVisibleCount = 1;
+	readonly #getCurrentSessionPath: () => string | undefined;
 	readonly #historyMatcher?: SessionHistoryMatcher;
 	#historyMergeTimer: NodeJS.Timeout | undefined;
 	/** Re-render hook for async list updates (fuzzy scan chunks, history merge). */
@@ -314,6 +315,10 @@ class SessionList implements Component {
 	 * only append below the literal group, which never shifts existing rows.)
 	 */
 	#selectionMoved = false;
+	/** True after a nonempty query; empty refilter restores current only then. */
+	#hadFilterQuery = false;
+	/** Last query passed to {@link #filterSessions}; same-query refilter keeps the index. */
+	#lastFilterQuery = "";
 
 	constructor(
 		sessions: SessionInfo[],
@@ -321,13 +326,17 @@ class SessionList implements Component {
 		historyMatcher?: SessionHistoryMatcher,
 		getTerminalRows: () => number = () => 24,
 		pinnedIds: ReadonlySet<string> = new Set(),
+		currentSessionPath?: string | (() => string | undefined),
 	) {
 		this.#getTerminalRows = getTerminalRows;
 		this.#allSessions = sessions;
 		this.#showCwd = showCwd;
 		this.#pinnedIds = pinnedIds;
+		this.#getCurrentSessionPath =
+			typeof currentSessionPath === "function" ? currentSessionPath : () => currentSessionPath;
 		this.#historyMatcher = historyMatcher;
 		this.#filteredSessions = sessions;
+		this.#selectCurrentSession();
 		this.#searchInput = new Input();
 
 		// Handle Enter in search input - select current item
@@ -423,6 +432,7 @@ class SessionList implements Component {
 		);
 		const end = Math.min(start + this.#compactVisibleCount, this.#filteredSessions.length);
 		const now = Date.now();
+		const currentPath = this.#getCurrentSessionPath();
 		const rows: string[] = [];
 		for (let index = start; index < end; index++) {
 			const session = this.#filteredSessions[index]!;
@@ -446,11 +456,12 @@ class SessionList implements Component {
 				replaceTabs(sanitizeText(session.firstMessage)).replace(/\n/g, " ").trim() ||
 				session.id;
 			const pinPrefix = this.#pinnedIds.has(session.id) ? `${theme.icon.pin} ` : "";
+			const currentPrefix = session.path === currentPath ? "[current] " : "";
 			const project = cell(this.getProjectLabel(session), projectWidth);
 			const content =
 				theme.fg("accent", selected ? theme.bold(project) : project) +
 				(titleWidth
-					? `  ${selected ? theme.bold(cell(pinPrefix + title, titleWidth)) : cell(pinPrefix + title, titleWidth)}`
+					? `  ${selected ? theme.bold(cell(currentPrefix + pinPrefix + title, titleWidth)) : cell(currentPrefix + pinPrefix + title, titleWidth)}`
 					: "") +
 				(updatedWidth ? `  ${theme.fg("muted", cell(updated, updatedWidth, true))}` : "");
 			rows.push(
@@ -471,6 +482,14 @@ class SessionList implements Component {
 		return lines.slice(0, this.#compactHeight);
 	}
 
+	/** Focus the live session when it is in the visible list. */
+	#selectCurrentSession(): void {
+		const currentPath = this.#getCurrentSessionPath();
+		if (!currentPath) return;
+		const index = this.#filteredSessions.findIndex(s => s.path === currentPath);
+		if (index >= 0) this.#selectedIndex = index;
+	}
+
 	/** Replace the visible dataset, e.g. when toggling folder/all-projects scope. */
 	setSessions(sessions: SessionInfo[], showCwd: boolean, pinnedIds?: ReadonlySet<string>): void {
 		this.#allSessions = sessions;
@@ -478,6 +497,7 @@ class SessionList implements Component {
 		if (pinnedIds !== undefined) this.#pinnedIds = pinnedIds;
 		this.#selectedIndex = 0;
 		this.#filterSessions(this.#searchInput.getValue());
+		this.#selectCurrentSession();
 	}
 
 	#filterSessions(query: string): void {
@@ -493,9 +513,14 @@ class SessionList implements Component {
 		this.#fuzzyRanked = [];
 
 		const tokens = tokenizeSessionQuery(query);
+		const hadQuery = this.#hadFilterQuery;
+		const queryChanged = query !== this.#lastFilterQuery;
+		this.#hadFilterQuery = tokens.length > 0;
+		this.#lastFilterQuery = query;
 		if (tokens.length === 0) {
 			this.#filteredSessions = this.#allSessions;
 			this.#selectedIndex = Math.min(this.#selectedIndex, Math.max(0, this.#filteredSessions.length - 1));
+			if (hadQuery) this.#selectCurrentSession();
 			this.#scheduleHistoryMerge(query);
 			this.onSelectionChange?.();
 			return;
@@ -522,6 +547,11 @@ class SessionList implements Component {
 		// and spill the remainder into async chunks.
 		this.#scanFuzzySlice(this.#scanGeneration, tokens, rest, 0, FUZZY_SCAN_INLINE_COUNT);
 		this.#composeFiltered();
+		// New query rebuilds ranking from scratch. Same-query refilter (delete)
+		// and async compose (fuzzy chunks / history merge) only clamp so an
+		// arrow selection survives. A live-session index > 0 would otherwise
+		// land on a lower-ranked match after the first keystroke.
+		if (queryChanged) this.#selectedIndex = 0;
 		this.#scheduleHistoryMerge(query);
 	}
 
@@ -720,6 +750,7 @@ class SessionList implements Component {
 		const sessionRowIndex: number[] = [];
 		const overflow = startIndex > 0 || endIndex < filtered.length;
 		const rowWidth = Math.max(0, width - (overflow ? 1 : 0));
+		const currentPath = this.#getCurrentSessionPath();
 		for (let i = startIndex; i < endIndex; i++) {
 			const blockStart = sessionLines.length;
 			const session = this.#filteredSessions[i];
@@ -758,13 +789,17 @@ class SessionList implements Component {
 				sessionLines.push(messageLine);
 			}
 
-			// Metadata line: date + file size + lifecycle status (+ project dir in
-			// all-projects scope). The status segment carries its own color, so each
-			// segment is dimmed individually rather than wrapping the whole line.
+			// Metadata line: date + file size + current marker + lifecycle status
+			// (+ project dir in all-projects scope). The status segment carries
+			// its own color, so each segment is dimmed individually rather than
+			// wrapping the whole line.
 			const dim = (s: string) => theme.fg("dim", s);
 			const dot = dim(theme.sep.dot);
 			const modified = formatDate(session.modified);
 			let metadata = `  ${dim(modified)} ${dot} ${dim(formatBytes(session.size))}`;
+			if (currentPath !== undefined && session.path === currentPath) {
+				metadata += ` ${dot} ${theme.fg("accent", "current")}`;
+			}
 			const status = formatSessionStatus(session.status);
 			if (status) {
 				metadata += ` ${dot} ${status}`;
@@ -915,6 +950,8 @@ export interface SessionSelectorOptions {
 	fillHeight?: boolean;
 	/** Set of pinned session ids to display with a pin indicator. */
 	pinnedIds?: ReadonlySet<string>;
+	/** Path of the live session, or a getter so detach/newSession stays accurate. */
+	currentSessionPath?: string | (() => string | undefined);
 }
 
 /**
@@ -996,6 +1033,7 @@ export class SessionSelectorComponent extends OverlayPanel {
 			options.historyMatcher,
 			options.getTerminalRows,
 			options.pinnedIds,
+			options.currentSessionPath,
 		);
 		if (this.#preview) {
 			this.#sessionList.setProjectLabels(sessionProjectLabels([...(this.#globalSessions ?? []), ...sessions]));
@@ -1173,6 +1211,10 @@ export class SessionSelectorComponent extends OverlayPanel {
 						if (this.#disposed) return;
 						if (deleted) {
 							this.#sessionList.removeSession(session.path);
+							this.#folderSessions = this.#folderSessions.filter(s => s.path !== session.path);
+							if (this.#globalSessions) {
+								this.#globalSessions = this.#globalSessions.filter(s => s.path !== session.path);
+							}
 						}
 					} catch (err) {
 						this.#showError(err instanceof Error ? err.message : String(err));

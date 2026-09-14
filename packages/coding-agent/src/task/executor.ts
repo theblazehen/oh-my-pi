@@ -7,17 +7,9 @@
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
-import { EventLoopKeepalive, recordHandoff, resolveTelemetry, Tokenizer } from "@oh-my-pi/pi-agent-core";
-import {
-	type CompactionSettings,
-	estimateRemoteCompactionInputTokens,
-	getCompactionV2PreserveData,
-	getPreservedOpenAiRemoteCompactionData,
-	resolveBudgetReserveTokens,
-} from "@oh-my-pi/pi-agent-core/compaction";
+import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
-import * as snapcompact from "@oh-my-pi/snapcompact";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
@@ -33,7 +25,12 @@ import {
 	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
-import { buildServiceTierByFamily, resolveSubagentServiceTier } from "../config/service-tier";
+import {
+	buildServiceTierByFamily,
+	resolveAgentServiceTierOverride,
+	resolveSubagentServiceTier,
+	type ServiceTierInheritSettingValue,
+} from "../config/service-tier";
 import { Settings } from "../config/settings";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings-schema";
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
@@ -60,8 +57,6 @@ import { type ArtifactManager, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
-import { buildSessionContext } from "../session/session-context";
-import type { SessionEntry } from "../session/session-entries";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
 import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "../thinking";
@@ -96,7 +91,6 @@ import {
 	TASK_SUBAGENT_EVENT_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
-	type TaskContextSource,
 	type TaskToolDetails,
 	type YieldItem,
 } from "./types";
@@ -409,10 +403,6 @@ export interface ExecutorOptions {
 	assignment?: string;
 	/** Shared background from the task call (`task.batch`), rendered into the subagent's system prompt. */
 	context?: string;
-	/** Requested task context source. */
-	contextSource?: TaskContextSource;
-	/** Parent transcript snapshot captured before task scheduling. */
-	forkContext?: ForkContextSnapshot;
 	/**
 	 * The session's active overall plan, handed off so subagents spawned during
 	 * plan execution share the same plan context as the main agent. Omitted when
@@ -533,6 +523,12 @@ export interface ExecutorOptions {
 	 * inherit falls back to the subagent's configured `tier.*` settings.
 	 */
 	parentServiceTier?: ServiceTierByFamily | null;
+	/**
+	 * Exact-name `task.agentServiceTierOverrides` entry that task/eval dispatch
+	 * resolved for this agent, applied after model resolution. Spawns that keep
+	 * `tier.subagent` (Vibe workers) omit it.
+	 */
+	serviceTierOverride?: ServiceTierInheritSettingValue;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -572,484 +568,6 @@ export interface ExecutorOptions {
 	onCleanupDeferred?: (completion: Promise<void>) => void;
 	/** Internal cleanup grace override for deterministic lifecycle tests. */
 	cleanupGraceMs?: number;
-}
-
-export interface ForkContextSnapshot {
-	sourceFile: string | null;
-	sourceLeafId: string | null;
-	/** Parent model active when the completed branch was captured. */
-	parentModel: { provider: string; id: string } | null;
-	entries: readonly SessionEntry[];
-}
-
-/** Model information needed to sanitize provider-specific inherited state. */
-export interface TaskForkModelContext {
-	parentModel: ForkContextSnapshot["parentModel"];
-	childModel: Model;
-}
-
-function hasMatchingClassicCompactionItem(
-	replacementHistory: readonly Record<string, unknown>[],
-	compactionItem: { type: "compaction" | "compaction_summary"; encrypted_content?: string; summary?: string },
-): boolean {
-	if (compactionItem.type === "compaction") {
-		return replacementHistory.some(
-			item => item.type === "compaction" && item.encrypted_content === compactionItem.encrypted_content,
-		);
-	}
-	return replacementHistory.some(
-		item =>
-			item.type === "compaction_summary" &&
-			(compactionItem.summary === undefined || item.summary === compactionItem.summary),
-	);
-}
-
-function isValidCompactionV2MessageContentPart(part: unknown): boolean {
-	if (!isRecord(part)) return false;
-	if (part.type === "input_text") return typeof part.text === "string";
-	if (part.type === "input_image") {
-		const detail = part.detail;
-		if (detail !== "low" && detail !== "high" && detail !== "auto" && detail !== "original") {
-			return false;
-		}
-		return (
-			(typeof part.image_url === "string" && part.image_url.length > 0) ||
-			(typeof part.file_id === "string" && part.file_id.length > 0)
-		);
-	}
-	if (part.type === "input_file") {
-		const detail = part.detail;
-		if (detail !== undefined && detail !== null && detail !== "low" && detail !== "high") return false;
-		return (
-			(typeof part.file_data === "string" && part.file_data.length > 0) ||
-			(typeof part.file_id === "string" && part.file_id.length > 0) ||
-			(typeof part.file_url === "string" && part.file_url.length > 0)
-		);
-	}
-	return false;
-}
-
-/** Validate the canonical retained-user-messages + terminal encrypted compaction V2 shape. */
-function hasValidCompactionV2ReplacementHistory(replacementHistory: readonly Record<string, unknown>[]): boolean {
-	const terminalItem = replacementHistory.at(-1);
-	if (
-		terminalItem?.type !== "compaction" ||
-		typeof terminalItem.encrypted_content !== "string" ||
-		terminalItem.encrypted_content.length === 0
-	) {
-		return false;
-	}
-	for (let index = 0; index < replacementHistory.length - 1; index++) {
-		const item = replacementHistory[index];
-		if (
-			item?.type !== "message" ||
-			item.role !== "user" ||
-			!Array.isArray(item.content) ||
-			item.content.length === 0 ||
-			!item.content.every(isValidCompactionV2MessageContentPart)
-		) {
-			return false;
-		}
-	}
-	return true;
-}
-
-/**
- * Select the bounded region represented by the latest compaction.
- *
- * A session journal intentionally retains entries superseded by compaction for
- * transcript/history views. A task fork needs the effective LLM region instead:
- * the latest compaction, its retained pre-boundary tail, and entries after it.
- * Older compactions are excluded even when they fall inside the retained range.
- * Parent links are relinked shallowly so the selected region is a standalone
- * branch; callers still own deep-cloning its nested data.
- */
-export function selectEffectiveTaskForkEntries(entries: readonly SessionEntry[]): SessionEntry[] {
-	let compactionIndex = -1;
-	for (let index = entries.length - 1; index >= 0; index--) {
-		if (entries[index]?.type === "compaction") {
-			compactionIndex = index;
-			break;
-		}
-	}
-	if (compactionIndex < 0) return Array.from(entries);
-
-	const compaction = entries[compactionIndex];
-	if (compaction?.type !== "compaction") return Array.from(entries);
-	let firstKeptIndex = -1;
-	for (let index = 0; index < compactionIndex; index++) {
-		if (entries[index]?.id === compaction.firstKeptEntryId) {
-			firstKeptIndex = index;
-			break;
-		}
-	}
-	// A malformed/migrated boundary must remain bounded: the summary and its
-	// post-compaction tail are still useful even when the named kept row is gone.
-	const startIndex = firstKeptIndex >= 0 ? firstKeptIndex : compactionIndex;
-	const selected: SessionEntry[] = [];
-	for (let index = startIndex; index < entries.length; index++) {
-		const entry = entries[index];
-		if (!entry) continue;
-		if (entry.type === "compaction" && index !== compactionIndex) continue;
-		selected.push(entry);
-	}
-	const selectedCompactionIndex = selected.findIndex(entry => entry.id === compaction.id);
-	const firstRetainedId = selectedCompactionIndex > 0 ? selected[0]!.id : compaction.id;
-
-	return selected.map((entry, index) => {
-		const parentId = index === 0 ? null : selected[index - 1]!.id;
-		if (entry.type === "compaction" && entry.id === compaction.id) {
-			if (entry.parentId === parentId && entry.firstKeptEntryId === firstRetainedId) return entry;
-			return { ...entry, parentId, firstKeptEntryId: firstRetainedId };
-		}
-		return entry.parentId === parentId ? entry : { ...entry, parentId };
-	});
-}
-
-const FORK_CONTROL_TOOLS: Record<string, true> = { todo: true, checkpoint: true, rewind: true };
-const FORK_CONTROL_CUSTOM_TYPES: Record<string, true> = {
-	"eager-task-prelude": true,
-	"eager-todo-prelude": true,
-};
-
-/** Drop tool calls/results that do not have their counterpart in the same retained region. */
-function removeUnpairedForkToolEntries(entries: readonly SessionEntry[]): SessionEntry[] {
-	const pairedResultIds = new Set<string>();
-	for (const entry of entries) {
-		if (entry.type === "message" && entry.message.role === "toolResult") {
-			pairedResultIds.add(entry.message.toolCallId);
-		}
-	}
-	const presentCallIds = new Set<string>();
-	for (const entry of entries) {
-		if (entry.type === "message" && entry.message.role === "assistant") {
-			for (const part of entry.message.content) if (part.type === "toolCall") presentCallIds.add(part.id);
-		}
-	}
-	const pairedEntries: SessionEntry[] = [];
-	for (const entry of entries) {
-		if (entry.type === "message" && entry.message.role === "toolResult") {
-			if (!presentCallIds.has(entry.message.toolCallId)) continue;
-			pairedEntries.push(entry);
-			continue;
-		}
-		if (entry.type === "message" && entry.message.role === "assistant") {
-			const content = entry.message.content.filter(part => part.type !== "toolCall" || pairedResultIds.has(part.id));
-			if (content.length === 0) continue;
-			pairedEntries.push({ ...entry, message: { ...entry.message, content } });
-			continue;
-		}
-		pairedEntries.push(entry);
-	}
-	return pairedEntries;
-}
-
-/** Entry types that are parent-only runtime/config state, never conversation. */
-const FORK_NON_CONVERSATION_TYPES: Record<string, true> = {
-	session_init: true,
-	model_change: true,
-	thinking_level_change: true,
-	service_tier_change: true,
-	mode_change: true,
-	credential_pin: true,
-	ttsr_injection: true,
-	title: true,
-	title_change: true,
-	custom: true,
-	label: true,
-};
-
-/**
- * Clone the parent's bounded effective region into fresh entry objects for the
- * child, retaining conversation-bearing entries and the active compaction
- * while scrubbing parent-only execution control.
- *
- * "Clone before mutation": the returned entries are new objects, never
- * references into the parent session, so the in-place edits below cannot leak
- * into the parent's tree.
- *
- * Scrubbing:
- * - Non-conversation entry types (runtime/config) are dropped.
- * - Only the latest `compaction` is retained. Its summary and retained tail are
- *   portable; details and arbitrary preserveData are stripped. Provider-native
- *   remote replay survives only for the exact captured parent model, and a
- *   Snapcompact archive survives only for image-capable children.
- * - `custom` messages with an eager task/todo prelude `customType` vanish.
- * - `todo`/`checkpoint`/`rewind` toolCall blocks and their paired toolResults
- *   are removed, both from the assistant turn that issued them and any
- *   standalone `toolResult` row whose call id was removed.
- * - Dangling `toolCall` blocks (no retained result) and orphan `toolResult`s
- *   (no retained call) are dropped so the built child context has no unpaired
- *   tools.
- * - Every inherited assistant turn is provider-neutralized on the first pass,
- *   whether or not control scrubbing changed it: the child runs under its own
- *   provider/model/system contract, so no parent provider-native replay state
- *   may survive. `redactedThinking` (encrypted, no plaintext to keep) is
- *   dropped, signed `thinking` signatures are cleared so the provider encoder
- *   downgrades them to plain text, and `providerPayload` is removed. A turn
- *   left with no content is dropped entirely.
- *
- * Retained entries keep their structural types — branch summaries are never
- * folded into user text. Every retained `parentId` is relinked in original
- * order to the nearest surviving ancestor. Returned entries are
- * deep-independent clones: no returned object (or nested `message.content`,
- * `preserveData`, …) is shared with the source session.
- */
-export function scrubTaskForkEntries(
-	entries: readonly SessionEntry[],
-	modelContext: TaskForkModelContext,
-): SessionEntry[] {
-	const effectiveEntries = selectEffectiveTaskForkEntries(entries);
-	const entriesById = new Map<string, SessionEntry>();
-	for (const entry of effectiveEntries) entriesById.set(entry.id, entry);
-
-	const removedCallIds = new Set<string>();
-	const retained: SessionEntry[] = [];
-
-	for (const entry of effectiveEntries) {
-		// Eager task/todo preludes are persisted as custom_message entries too;
-		// drop them regardless of representation so no parent-only prelude
-		// survives into the child.
-		if (entry.type === "custom_message" && FORK_CONTROL_CUSTOM_TYPES[entry.customType ?? ""]) continue;
-		if (entry.type === "message") {
-			const message = entry.message;
-			if (message.role === "custom" && FORK_CONTROL_CUSTOM_TYPES[message.customType ?? ""]) continue;
-			if (message.role === "assistant") {
-				const content = message.content.filter(part => {
-					if (part.type !== "toolCall" || !FORK_CONTROL_TOOLS[part.name]) return true;
-					removedCallIds.add(part.id);
-					return false;
-				});
-				if (content.length === 0) continue;
-				// Neutralize protected reasoning unconditionally: redactedThinking
-				// dropped, signed thinking signatures cleared, and the provider's
-				// opaque native-history payload removed so nothing encrypted or
-				// provider-signed survives into the child's own lineage.
-				const neutralized = content
-					.filter(part => part.type !== "redactedThinking")
-					.map(part => (part.type === "thinking" ? { ...part, thinkingSignature: undefined } : part));
-				if (neutralized.length === 0) continue;
-				const { providerPayload: _providerPayload, ...messageRest } = message;
-				retained.push({ ...entry, message: { ...messageRest, content: neutralized } });
-				continue;
-			}
-			if (message.role === "toolResult") {
-				if (FORK_CONTROL_TOOLS[message.toolName] || removedCallIds.has(message.toolCallId)) continue;
-				retained.push(entry);
-				continue;
-			}
-			retained.push(entry);
-			continue;
-		}
-		if (FORK_NON_CONVERSATION_TYPES[entry.type]) continue;
-		if (entry.type === "compaction") {
-			const preserveData: Record<string, unknown> = {};
-			const sameModel =
-				modelContext.parentModel !== null &&
-				modelContext.parentModel.provider === modelContext.childModel.provider &&
-				modelContext.parentModel.id === modelContext.childModel.id;
-			const remoteCompaction = entry.preserveData?.openaiRemoteCompaction;
-			const replacementHistory = isRecord(remoteCompaction) ? remoteCompaction.replacementHistory : undefined;
-			let validRemoteCompaction = false;
-			if (
-				sameModel &&
-				isRecord(remoteCompaction) &&
-				remoteCompaction.provider === modelContext.childModel.provider &&
-				Array.isArray(replacementHistory) &&
-				replacementHistory.length > 0 &&
-				replacementHistory.every(isRecord)
-			) {
-				if (remoteCompaction.version === "v2") {
-					const v2 = getCompactionV2PreserveData(entry.preserveData);
-					validRemoteCompaction =
-						v2?.provider === modelContext.childModel.provider &&
-						hasValidCompactionV2ReplacementHistory(replacementHistory);
-				} else {
-					const classic = getPreservedOpenAiRemoteCompactionData(entry.preserveData);
-					validRemoteCompaction =
-						classic?.provider === modelContext.childModel.provider &&
-						hasMatchingClassicCompactionItem(replacementHistory, classic.compactionItem);
-				}
-			}
-			if (validRemoteCompaction) {
-				preserveData.openaiRemoteCompaction = remoteCompaction;
-			}
-			const snapcompactArchive = snapcompact.getPreservedArchive(entry.preserveData);
-			if (modelContext.childModel.input.includes("image") && snapcompactArchive) {
-				preserveData[snapcompact.PRESERVE_KEY] = entry.preserveData?.[snapcompact.PRESERVE_KEY];
-			}
-			retained.push({
-				...entry,
-				details: undefined,
-				preserveData: Object.keys(preserveData).length > 0 ? preserveData : undefined,
-			});
-			continue;
-		}
-		retained.push(entry);
-	}
-
-	// Drop dangling toolCall blocks and orphan toolResults that survive the
-	// control scrub (e.g. a non-control call whose result was on a sibling path).
-	const finalRetained = removeUnpairedForkToolEntries(retained);
-
-	// Relink every retained parentId to the nearest surviving ancestor (or null
-	// when none remains), preserving original branch order.
-	const retainedById = new Map<string, SessionEntry>();
-	for (const entry of finalRetained) retainedById.set(entry.id, entry);
-	const retainedCompactionIndex = finalRetained.findIndex(entry => entry.type === "compaction");
-	const retainedFirstKeptId =
-		retainedCompactionIndex > 0
-			? finalRetained[0]!.id
-			: retainedCompactionIndex === 0
-				? finalRetained[retainedCompactionIndex]!.id
-				: undefined;
-	return finalRetained.map(entry => {
-		let normalizedEntry = entry;
-		if (
-			entry.type === "compaction" &&
-			retainedFirstKeptId !== undefined &&
-			entry.firstKeptEntryId !== retainedFirstKeptId
-		) {
-			normalizedEntry = { ...entry, firstKeptEntryId: retainedFirstKeptId };
-		}
-		if (normalizedEntry.parentId === null) return structuredClone(normalizedEntry);
-		const seen = new Set<string>();
-		let cursor: string | null = normalizedEntry.parentId;
-		while (cursor !== null && !seen.has(cursor)) {
-			if (retainedById.has(cursor)) return structuredClone({ ...normalizedEntry, parentId: cursor });
-			seen.add(cursor);
-			cursor = entriesById.get(cursor)?.parentId ?? null;
-		}
-		return structuredClone({ ...normalizedEntry, parentId: null });
-	});
-}
-
-/** Validate the frozen branch before any sanitization can conceal malformed ancestry. */
-function validateForkContextSnapshot(forkContext: ForkContextSnapshot): void {
-	const entries = forkContext.entries;
-	if (forkContext.sourceLeafId !== null) {
-		if (entries.length === 0) {
-			throw new Error("Cannot fork task context: parent session snapshot is empty");
-		}
-		const tail = entries[entries.length - 1];
-		if (tail === undefined || tail.id !== forkContext.sourceLeafId) {
-			throw new Error("Cannot fork task context: parent session snapshot does not end at the located leaf");
-		}
-		const root = entries[0];
-		if (root === undefined || root.parentId !== null) {
-			throw new Error("Cannot fork task context: parent session snapshot does not start at a root entry");
-		}
-	}
-}
-
-interface PreparedForkContext {
-	/** Fresh, child-owned entries safe to ingest without another structural clone. */
-	entries: SessionEntry[];
-}
-
-/** Estimate the complete inherited request, including opaque native replay. */
-function estimateForkContextTokens(entries: SessionEntry[], tokenizer: Tokenizer): number {
-	if (entries.length === 0) return 0;
-	const leafId = entries.at(-1)?.id ?? null;
-	const messages = buildSessionContext(entries, leafId).messages;
-	let inheritedTokens = tokenizer.countMessages(messages);
-	// Provider replay is opaque to countMessage(compactionSummary). A positive
-	// V2 usage value is authoritative; classic and zero-usage payloads use the
-	// same conservative native-history estimator as remote compaction itself.
-	const activeCompaction = entries.findLast(
-		(entry): entry is Extract<SessionEntry, { type: "compaction" }> => entry.type === "compaction",
-	);
-	const remoteCompaction = activeCompaction?.preserveData?.openaiRemoteCompaction;
-	if (
-		isRecord(remoteCompaction) &&
-		Array.isArray(remoteCompaction.replacementHistory) &&
-		remoteCompaction.replacementHistory.every(isRecord)
-	) {
-		const usedTokens = remoteCompaction.usedTokens;
-		const replayTokens =
-			remoteCompaction.version === "v2" &&
-			typeof usedTokens === "number" &&
-			Number.isFinite(usedTokens) &&
-			usedTokens > 0
-				? Math.ceil(usedTokens)
-				: estimateRemoteCompactionInputTokens(remoteCompaction.replacementHistory, tokenizer, "");
-		const tailTokens = messages.slice(1).reduce((total, message) => total + tokenizer.countMessage(message), 0);
-		inheritedTokens = Math.max(inheritedTokens, replayTokens + tailTokens);
-	}
-	return inheritedTokens;
-}
-
-/** Remove opaque compaction payloads while retaining the portable summary and turns. */
-function stripForkCompactionPayloads(entries: readonly SessionEntry[]): SessionEntry[] {
-	return entries.map(entry => {
-		if (entry.type !== "compaction" || entry.preserveData === undefined) return entry;
-		const preserveData = { ...entry.preserveData };
-		delete preserveData.openaiRemoteCompaction;
-		delete preserveData[snapcompact.PRESERVE_KEY];
-		return {
-			...entry,
-			preserveData: Object.keys(preserveData).length > 0 ? preserveData : undefined,
-		};
-	});
-}
-
-/** A suffix may start only where a provider can receive a complete new turn. */
-function isCoherentForkBoundary(entry: SessionEntry): boolean {
-	if (entry.type === "message") return entry.message.role === "user" || entry.message.role === "custom";
-	return entry.type === "custom_message" || entry.type === "branch_summary";
-}
-
-/** Relink a retained suffix into a linear, standalone child branch. */
-function relinkStandaloneForkSuffix(entries: readonly SessionEntry[]): SessionEntry[] {
-	return entries.map((entry, index) => {
-		const parentId = index === 0 ? null : entries[index - 1]!.id;
-		return entry.parentId === parentId ? entry : { ...entry, parentId };
-	});
-}
-
-/** Select the largest recent suffix that starts coherently and fits the child budget. */
-function selectLargestFittingForkSuffix(
-	entries: readonly SessionEntry[],
-	usableBudget: number,
-	tokenizer: Tokenizer,
-): SessionEntry[] {
-	const withoutCompactions = entries.filter(entry => entry.type !== "compaction");
-	for (let index = 0; index < withoutCompactions.length; index++) {
-		const entry = withoutCompactions[index];
-		if (entry === undefined || !isCoherentForkBoundary(entry)) continue;
-		const suffix = relinkStandaloneForkSuffix(removeUnpairedForkToolEntries(withoutCompactions.slice(index)));
-		if (estimateForkContextTokens(suffix, tokenizer) <= usableBudget) return suffix;
-	}
-	return [];
-}
-
-/**
- * Validate, sanitize, build, and size inherited context before opening a child
- * journal. This is the fork's allocation/provider safety boundary: oversized
- * valid snapshots degrade first to portable compaction, then to a coherent
- * bounded tail, without changing the explicitly requested fork semantics.
- */
-function prepareForkContext(
-	forkContext: ForkContextSnapshot,
-	childModel: Model,
-	compactionSettings: CompactionSettings,
-): PreparedForkContext {
-	validateForkContextSnapshot(forkContext);
-	const entries = scrubTaskForkEntries(forkContext.entries, {
-		parentModel: forkContext.parentModel,
-		childModel,
-	});
-	const contextWindow = childModel.contextWindow;
-	if (!contextWindow || contextWindow <= 0) return { entries };
-	const reserveTokens = resolveBudgetReserveTokens(contextWindow, compactionSettings);
-	const usableBudget = Math.max(0, contextWindow - reserveTokens);
-	const tokenizer = new Tokenizer(childModel);
-	if (estimateForkContextTokens(entries, tokenizer) <= usableBudget) return { entries };
-
-	const portableEntries = stripForkCompactionPayloads(entries);
-	if (estimateForkContextTokens(portableEntries, tokenizer) <= usableBudget) return { entries: portableEntries };
-
-	return { entries: selectLargestFittingForkSuffix(portableEntries, usableBudget, tokenizer) };
 }
 
 function parseStringifiedJson(value: unknown): unknown {
@@ -1431,6 +949,19 @@ export function createMCPProxyTools(mcpManager: MCPManager): CustomTool[] {
 	});
 }
 
+function inheritedSubagentServiceTiers(
+	baseSettings: Settings,
+	inheritedServiceTier?: ServiceTierByFamily | null,
+): ServiceTierByFamily {
+	return inheritedServiceTier === undefined
+		? buildServiceTierByFamily(
+				baseSettings.get("tier.openai"),
+				baseSettings.get("tier.anthropic"),
+				baseSettings.get("tier.google"),
+			)
+		: (inheritedServiceTier ?? {});
+}
+
 export function createSubagentSettings(
 	baseSettings: Settings,
 	overrides?: Partial<Record<SettingPath, unknown>>,
@@ -1444,14 +975,7 @@ export function createSubagentSettings(
 	// match the parent's live tiers when a live session supplied them, else the
 	// subagent's own configured tier.* settings). The result is stamped back onto
 	// the snapshot so createAgentSession's tier.* reads pick it up.
-	const inheritedTiers =
-		inheritedServiceTier === undefined
-			? buildServiceTierByFamily(
-					baseSettings.get("tier.openai"),
-					baseSettings.get("tier.anthropic"),
-					baseSettings.get("tier.google"),
-				)
-			: (inheritedServiceTier ?? {});
+	const inheritedTiers = inheritedSubagentServiceTiers(baseSettings, inheritedServiceTier);
 	const subagentTiers = resolveSubagentServiceTier(baseSettings.get("tier.subagent"), inheritedTiers);
 	snapshot["tier.openai"] = subagentTiers.openai ?? "none";
 	snapshot["tier.anthropic"] = subagentTiers.anthropic ?? "none";
@@ -2262,6 +1786,15 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		scheduleProgress(flushProgress);
 	};
 
+	const publishAdvisorState = (session: AgentSession | null): void => {
+		// A runtime can attach after startup when model discovery finishes.
+		// Retain this run's advised state through teardown for settled badges.
+		if (!progress.advisor && session?.isAdvisorActive() === true) {
+			progress.advisor = true;
+			scheduleProgress(true);
+		}
+	};
+
 	const attach = (session: AgentSession): (() => void) => {
 		// The session owns attribution: it knows which model produced its output
 		// and withholds an armed-but-unproven fallback. Re-deriving that here from
@@ -2274,16 +1807,21 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			const isFallback = serving.isFallback;
 			if (
 				serving.selector === progress.resolvedModel &&
+				serving.modelIdentity === progress.resolvedModelIdentity &&
+				serving.thinkingLevel === progress.resolvedThinkingLevel &&
 				(progress.resolvedModelIsFallback ?? false) === isFallback
 			) {
 				return;
 			}
 			progress.resolvedModel = serving.selector;
+			progress.resolvedModelIdentity = serving.modelIdentity;
+			progress.resolvedThinkingLevel = serving.thinkingLevel;
 			progress.resolvedModelIsFallback = isFallback;
 			scheduleProgress(true);
 		};
 		return session.subscribe(event => {
 			emitSubagentEvent(event);
+			publishAdvisorState(session);
 			publishServingModel();
 			if (event.type === "auto_retry_start") {
 				progress.retryState = {
@@ -2399,6 +1937,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		resolveAbortReasonText,
 		setActiveSession: session => {
 			activeSession = session;
+			publishAdvisorState(session);
 		},
 		takeActiveSession: () => {
 			const session = activeSession;
@@ -2445,6 +1984,10 @@ async function driveSessionToYield(
 	session: AgentSession,
 	monitor: SubagentRunMonitor,
 	task: string,
+	// Invoked when the initial prompt loses a prompt race (AgentBusyError) before
+	// retrying. Lets the caller restore a safe contract and detach its monitor
+	// while backing off. Absent, the busy error keeps the old path.
+	onPromptBusy?: () => Promise<void>,
 ): Promise<DriveOutcome> {
 	using _keepalive = new EventLoopKeepalive();
 	const abortSignal = monitor.abortSignal;
@@ -2482,7 +2025,21 @@ async function driveSessionToYield(
 
 	try {
 		try {
-			await awaitAbortable(session.prompt(task, { attribution: "agent" }));
+			// An IRC wake may own the session when this turn dispatches. Its prompt
+			// wins the race and this prompt throws AgentBusyError; back off through
+			// the caller hook and retry. Bounded so a wedged worker still resolves
+			// instead of hanging the batch.
+			let promptAttempts = 0;
+			for (;;) {
+				try {
+					await awaitAbortable(session.prompt(task, { attribution: "agent" }));
+					break;
+				} catch (error) {
+					promptAttempts++;
+					if (!(error instanceof AgentBusyError) || promptAttempts >= 3 || !onPromptBusy) throw error;
+					await onPromptBusy();
+				}
+			}
 			await awaitAbortable(session.waitForIdle());
 		} catch (err) {
 			// A budget stop or a yield turn-stop (terminal yield parked behind
@@ -2907,7 +2464,10 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		modelOverride,
 		modelRole,
 		resolvedModel: progress.resolvedModel,
+		resolvedModelIdentity: progress.resolvedModelIdentity,
+		resolvedThinkingLevel: progress.resolvedThinkingLevel,
 		resolvedModelIsFallback: progress.resolvedModelIsFallback,
+		advisor: progress.advisor,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
 		aborted: wasAborted,
 		abortReason: finalAbortReason,
@@ -3319,8 +2879,49 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	const { id, agent, message, signal } = options;
 	const index = options.index ?? 0;
 	const startTime = Date.now();
-	const session = await AgentLifecycleManager.global().ensureLive(id);
-	session.setWorkPoolYieldItems(options.workPoolYieldItems ?? []);
+	let session = await AgentLifecycleManager.global().ensureLive(id);
+	// Acquire turn ownership before mutating the shared yield contract: installing
+	// pooled items under a running ordinary wake would reject its in-flight tool
+	// calls. The check-to-install section below has no await, so once idle is
+	// observed no wake dispatch can interleave before the synchronous mutation.
+	// Bounded: a worker that never settles fails its batch instead of installing
+	// under the active turn or hanging the pool.
+	let ownershipWaits = 0;
+	const acquireOwnership = async (): Promise<void> => {
+		while (session.isStreaming && ownershipWaits < 3) {
+			ownershipWaits++;
+			if (signal) {
+				await untilAborted(signal, () => session.waitForIdle());
+			} else {
+				await session.waitForIdle();
+			}
+		}
+		if (session.isStreaming) {
+			throw new Error(
+				`Subagent ${id} stayed busy through 3 ownership waits; refusing to install the pooled yield contract under an active turn`,
+			);
+		}
+	};
+	await acquireOwnership();
+	// Revalidate until the worker survives an install round-trip unchanged: the
+	// waits/rebuild above can outlast the idle TTL, letting park() detach this
+	// instance mid-install. Each observed replacement means another full park
+	// cycle, so reinstall on the fresh session (revivals start empty) and check
+	// again; genuine churn fails fast instead of driving a stale instance, and
+	// a released worker throws instead of driving a corpse. A replacement may
+	// already be streaming a wake, so ownership is reacquired every round.
+	for (let acquireAttempts = 0; ; acquireAttempts++) {
+		await session.setWorkPoolYieldItems(options.workPoolYieldItems ?? []);
+		const live = await AgentLifecycleManager.global().ensureLive(id);
+		if (live === session) break;
+		if (acquireAttempts >= 2) {
+			throw new Error(
+				`Subagent ${id} was replaced during every install attempt; refusing to drive a stale worker session`,
+			);
+		}
+		session = live;
+		await acquireOwnership();
+	}
 	const ref = AgentRegistry.global().get(id);
 	const sessionFile = ref?.sessionFile ?? undefined;
 
@@ -3357,17 +2958,37 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, startedPayload);
 
 	monitor.setActiveSession(session);
-	const unsubscribe = monitor.attach(session);
+	// The batch monitor attaches per attempt; the hook below detaches before each
+	// backoff and reattaches for the retry, so the teardown always releases the
+	// current attempt — including when the drive rejects and no winning attempt
+	// was ever assigned.
 	let outcome: DriveOutcome;
+	// An IRC wake may own the session when this turn dispatches. drive retries the
+	// initial prompt through this hook: detach first so the wake turn's `yield`
+	// neither marks this batch yielded nor leaks into its result, restore the
+	// ordinary contract so the wake cannot consume pooled items, wait it out,
+	// then reinstall and reattach for the retry.
+	let attemptUnsubscribe = monitor.attach(session);
 	try {
-		outcome = await driveSessionToYield(session, monitor, message);
+		outcome = await driveSessionToYield(session, monitor, message, async () => {
+			attemptUnsubscribe();
+			logger.debug("Subagent follow-up lost the prompt race to an IRC wake; backing off", { id });
+			await session.setWorkPoolYieldItems([]);
+			if (signal) {
+				await untilAborted(signal, () => session.waitForIdle());
+			} else {
+				await session.waitForIdle();
+			}
+			await session.setWorkPoolYieldItems(options.workPoolYieldItems ?? []);
+			attemptUnsubscribe = monitor.attach(session);
+		});
 	} finally {
 		try {
 			await untilAborted(AbortSignal.timeout(5000), () => monitor.waitForActiveSessionAbort());
 		} catch {
 			// Ignore abort cleanup timeouts; the session stays adopted either way.
 		}
-		unsubscribe();
+		attemptUnsubscribe();
 		const active = monitor.takeActiveSession();
 		if (active) monitor.captureSalvage(active);
 		monitor.finish();
@@ -3418,8 +3039,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	} = options;
 	const cleanupGraceMs = options.cleanupGraceMs ?? TASK_ABORT_CLEANUP_GRACE_MS;
 	const startTime = Date.now();
-	const requestedContextSource = options.contextSource ?? "fresh";
-	let usedContextSource: "fresh" | "fork" = "fresh";
 	// Set by the session's onFirstChatDispatch hook the first time the agent
 	// loop dispatches a chat request to the provider — the launch-complete boundary.
 	let firstChatDispatchAt: number | undefined;
@@ -3685,6 +3304,21 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					resolvedModel: model.id,
 				});
 			}
+			// The exact-name `task.agentServiceTierOverrides` entry dispatch resolved
+			// for this agent. The session evaluates it against its final model —
+			// including patterns only it can resolve — so a concrete tier lands on
+			// exactly that model's family, and persists the result (even empty) so
+			// hot and cold revival restore it instead of re-deriving `tier.subagent`.
+			const serviceTierOverride = options.serviceTierOverride;
+			const resolveServiceTierByFamily =
+				serviceTierOverride === undefined
+					? undefined
+					: (resolvedModel: Model | undefined) =>
+							resolveAgentServiceTierOverride(
+								serviceTierOverride,
+								resolvedModel,
+								inheritedSubagentServiceTiers(settings, options.parentServiceTier),
+							);
 			const retryFallbackRole = installSubagentRetryFallbackChain({
 				settings: subagentSettings,
 				id,
@@ -3715,10 +3349,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					: undefined;
 			if (model) {
 				const displayLevel = effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : undefined);
+				progress.resolvedModelIdentity = formatModelStringWithRouting(model);
+				progress.resolvedThinkingLevel = displayLevel;
 				progress.resolvedModel =
 					displayLevel !== undefined
-						? formatModelSelectorValue(formatModelStringWithRouting(model), displayLevel)
-						: formatModelStringWithRouting(model);
+						? formatModelSelectorValue(progress.resolvedModelIdentity, displayLevel)
+						: progress.resolvedModelIdentity;
 			}
 			// Precedence: caller `effort` > explicit `:level` suffix on the resolved
 			// model pattern > agent-definition default (e.g. task's `auto`) >
@@ -3727,55 +3363,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				effortLevel ?? (explicitThinkingLevel ? resolvedThinkingLevel : (thinkingLevel ?? resolvedThinkingLevel));
 			resolvedAt = performance.now();
 			const effectiveCwd = worktree ?? cwd;
-			const forkContext = options.forkContext;
-			const forkSnapshotUnavailable =
-				forkContext === undefined ||
-				forkContext.entries === undefined ||
-				forkContext.sourceFile === null ||
-				forkContext.sourceFile === undefined ||
-				// A fork must name the leaf it was scheduled from. A null/absent
-				// leaf means the parent had no work to hand off (or the snapshot
-				// is runtime-malformed) — never seed the child from it.
-				forkContext.sourceLeafId == null;
-			let preparedFork: PreparedForkContext | undefined;
-			if (
-				requestedContextSource === "fork" &&
-				forkContext !== undefined &&
-				!forkSnapshotUnavailable &&
-				sessionFile !== null
-			) {
-				if (!model) {
-					throw new Error(
-						'Cannot fork task context: child model could not be resolved for inherited-context validation. Retry with source:"fresh".',
-					);
-				}
-				preparedFork = prepareForkContext(forkContext, model, subagentSettings.getGroup("compaction"));
-			}
-			const sessionManagerPromise = (async () => {
-				if (requestedContextSource === "fork" && preparedFork === undefined) {
-					throw new Error(
-						forkSnapshotUnavailable
-							? "Cannot fork task context: parent session snapshot or transcript is unavailable"
-							: "Cannot fork task context: child transcript path is unavailable",
-					);
-				}
-				const manager = sessionFile
-					? await SessionManager.open(sessionFile, undefined, undefined, {
-							initialCwd: effectiveCwd,
-							suppressBreadcrumb: true,
-						})
-					: SessionManager.inMemory(effectiveCwd);
-				try {
-					if (preparedFork) {
-						for (const entry of preparedFork.entries) manager.ingestReplicatedEntry(entry);
-						usedContextSource = "fork";
-					}
-					return manager;
-				} catch (error) {
-					await manager.close();
-					throw error;
-				}
-			})();
+			const sessionManagerPromise = sessionFile
+				? SessionManager.open(sessionFile, undefined, undefined, {
+						initialCwd: effectiveCwd,
+						suppressBreadcrumb: true,
+					})
+				: Promise.resolve(SessionManager.inMemory(effectiveCwd));
 			// Setup below can fail before this promise's consumption boundary.
 			// Observe rejection immediately while preserving it for the later await.
 			sessionManagerPromise.catch(() => {});
@@ -3865,6 +3458,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const buildSubagentSessionOptions = (
 				sessionManagerForRun: SessionManager,
 				expectedAgentRef: CreateAgentSessionOptions["expectedAgentRef"],
+				// Parked workers always revive with an empty runtime yield set; a
+				// pooled follow-up reinstalls its items explicitly before turning.
+				// Without this, the registry lookup below misses (session === null
+				// while the replacement builds) and the revived prompt resurrects
+				// the launch-time pooled instructions against an ordinary runtime.
+				forRevive = false,
 			): CreateAgentSessionOptions => ({
 				cwd: worktree ?? cwd,
 				additionalDirectories: worktree !== undefined ? undefined : options.additionalDirectories,
@@ -3882,6 +3481,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					model || modelOverride === undefined ? undefined : inheritedRetryFallbackChain,
 				thinkingLevel: effectiveThinkingLevel,
 				thinkingLevelCeiling: spawnEffortCeiling,
+				// A revived session restores the tier history it persisted (including
+				// tiers a provider rejected or an extension changed since spawn); only
+				// the fresh spawn resolves the per-agent override.
+				resolveServiceTierByFamily: forRevive ? undefined : resolveServiceTierByFamily,
 				toolNames,
 				outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
@@ -3908,7 +3511,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						worktree: worktree ?? "",
 						outputSchema: normalizedOutputSchema,
 						outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
-						workPoolYieldItems: options.workPoolYieldItems ?? [],
+						// Read the live item set through the registry instead of capturing
+						// the session: this callback outlives the turn via the lifecycle
+						// reviver, and a captured session would pin its whole graph past
+						// TTL park disposal. Parked revivals build while the registry
+						// session is null, so render the cleared set rather than
+						// resurrecting the launch-time pooled instructions.
+						workPoolYieldItems:
+							AgentRegistry.global().get(id)?.session?.getWorkPoolYieldItems?.() ??
+							(forRevive ? [] : (options.workPoolYieldItems ?? [])),
 						ircPeers: ircRoster?.peers ?? [],
 						ircParkedCount: ircRoster?.parkedCount ?? 0,
 						ircOmittedCount: ircRoster?.omittedCount ?? 0,
@@ -3976,12 +3587,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				throw err;
 			}
 			sessionCreatedAt = performance.now();
-			if (usedContextSource === "fork") {
-				// The archive is evidence for this child, not live parent-owned control
-				// state. Drop runtime obligations reconstructed during session startup.
-				session.clearCheckpointRuntimeState();
-				session.setTodoPhases([]);
-			}
 
 			monitor.setActiveSession(session);
 			// Run-state notifications precede deferrable wire-level `agent_end`,
@@ -4009,7 +3614,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						);
 					}
 					const { session: revived } = await createAgentSession(
-						buildSubagentSessionOptions(reopened, expectedAgentRef),
+						buildSubagentSessionOptions(reopened, expectedAgentRef, true),
 					);
 					// Re-run the executor's extension wiring on the rebuilt session.
 					// Skipping it leaves the runner pre-init, so a `tool_call` handler
@@ -4050,7 +3655,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			if (filteredSubagentTools.length !== subagentToolNames.length) {
 				await awaitAbortable(session.setActiveToolsByName(filteredSubagentTools));
 			}
-			if (options.workPoolYieldItems) session.setWorkPoolYieldItems(options.workPoolYieldItems);
+			if (options.workPoolYieldItems) {
+				await awaitAbortable(session.setWorkPoolYieldItems(options.workPoolYieldItems));
+			}
 			const enabledSubagentTools = session.getEnabledToolNames();
 			// The enabled set includes the synthetic write transport injected for
 			// explicit tool lists that omitted write. `session_init.tools` is later
@@ -4075,6 +3682,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				outputSchema,
 				outputSchemaMode: options.outputSchemaMode,
 				restrictToolNames: restrictToolNames || undefined,
+				// Isolated runs are never revivable (worktree merged + cleaned):
+				// stamp the contract so cold revival leaves them transcript-only
+				// even when the workspace was retained for recovery.
+				isolated: worktree !== undefined || undefined,
 			});
 
 			abortSignal.addEventListener(

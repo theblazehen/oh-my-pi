@@ -80,14 +80,30 @@ const PAINT_BEGIN = `${HIDE_CURSOR}${SYNC_OUTPUT_BEGIN}${DISABLE_AUTOWRAP}`;
 const PAINT_END = `${ENABLE_AUTOWRAP}${SYNC_OUTPUT_END}`;
 const PAINT_BEGIN_NO_SYNC = `${HIDE_CURSOR}${DISABLE_AUTOWRAP}`;
 const PAINT_END_NO_SYNC = ENABLE_AUTOWRAP;
-// Mouse reporting is scoped to the top fullscreen overlay so the rest of the
-// app keeps native terminal selection. 1002 reports button press/drag/release;
-// 1003 additionally reports no-button hover motion. 1006 carries extended SGR
-// coordinates and button/modifier identity.
+// Mouse reporting is scoped to fullscreen overlays that opt into pointer
+// interaction, plus the opt-in normal-buffer click capture (`tui.mouse`).
+// 1000h = button click tracking, 1003h = any-motion tracking for hover
+// targets, and 1006h = SGR extended coordinates past column/row 223.
+// Selection-first surfaces leave these modes disabled so the terminal retains
+// native text selection.
+const MOUSE_TRACKING_ON = "\x1b[?1000h\x1b[?1003h\x1b[?1006h";
 const MOUSE_TRACKING_DRAG = "\x1b[?1002h\x1b[?1006h";
-const MOUSE_TRACKING_MOTION = "\x1b[?1003h\x1b[?1006h";
-const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1002l";
+const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
+type MouseTrackingState = "off" | "inline" | "full" | "drag";
+
+/**
+ * `PI_TUI_RESIZE_IN_PLACE=1|true` forces in-place resize (no alt-buffer borrow).
+ * `0|false` forces the alt-buffer path even on Warp. Unset defers to Warp detection:
+ * Warp re-reports its size on CSI ?1049h / CSI ?1049l, which the resize alt-borrow
+ * turns into a flicker loop.
+ */
+function resizeInPlaceOverride(): boolean | null {
+	const override = Bun.env.PI_TUI_RESIZE_IN_PLACE;
+	if (override === "1" || override === "true") return true;
+	if (override === "0" || override === "false") return false;
+	return null;
+}
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
 type StartListener = () => void;
@@ -654,6 +670,11 @@ export class TUI extends Container {
 	// Screen row where the provider's mutable viewport begins (0-based); rows
 	// above it hold history still visible on the physical screen.
 	#providerViewportTop = 0;
+	// Net composer-space offset of the published hit-test origin behind the
+	// painted top, from the last paint: replay-replaced rows minus viewport
+	// rows the paint prepended for a short viewport. Negative while prepended
+	// blanks outweigh replaced rows; zero on ordinary frames.
+	#providerViewportPadTop = 0;
 	// Viewport-relative row of the hardware cursor after the last normal paint
 	// (0 = parked at the viewport top). A resize reflows the normal buffer
 	// before the app hears about it; terminals keep the cursor attached to its
@@ -816,15 +837,29 @@ export class TUI extends Container {
 	// untouched, so exiting reconciles cleanly against the terminal-restored
 	// normal screen. #altPreviousLines is the last alt frame, for repaint-skip.
 	#altActive = false;
+	#mouseTracking: MouseTrackingState = "off";
+	/** Product-owned probe for opt-in normal-buffer click capture (`tui.mouse`). Read every frame. */
+	#inlineMouseProvider: (() => boolean) | undefined;
 	#altPreviousLines: string[] = [];
 	#altEnterWidth = 0;
 	#altEnterHeight = 0;
 	#resizeAltActive = false;
 	#resizeSettleTimer: RenderTimer | undefined;
 	#suppressResizeUntil = 0;
+	// Baseline geometry at the last alt-buffer toggle, plus whether its echo is
+	// still pending. A Warp-only echo is a height-only ±1 SIGWINCH against this
+	// baseline while the CPR probe is in flight. The expectation is single-shot:
+	// the first SIGWINCH after the toggle consumes it, so a real one-row resize
+	// back to the baseline can never be mistaken for the echo.
+	#altToggleColumns = 0;
+	#altToggleRows = 0;
+	#altToggleEchoPending = false;
+	// True while an in-place resize transaction (Warp) is inside its settle
+	// window: the normal-buffer anchor is stale until the settled CPR probe
+	// resolves, so ordinary paints are dropped until then.
+	#resizeInPlaceActive = false;
 	#resizeScrollbackMode: ResizeScrollbackMode = TUI.#initialResizeScrollbackMode();
 	#resizeReplaySize: string | undefined;
-	#altMouseTracking: "drag" | "motion" | undefined;
 	// Holds an alternate-screen exit until its replacement full paint can emit it
 	// atomically. It must survive a deferred Ghostty image frame.
 	#pendingAltExit = "";
@@ -1065,6 +1100,47 @@ export class TUI extends Container {
 		return this.overlayStack.some(o => this.#isOverlayVisible(o));
 	}
 
+	/**
+	 * Mutable normal-buffer viewport from the last provider frame: screen row
+	 * where it begins plus its row count. Inline click targets are indexed
+	 * into this window (`screenRow - top`). Empty while the alt screen owns
+	 * the display, while a resize transaction is settling, and while a Ghostty
+	 * image paint is deferred — the painted rows predate the latest spans in
+	 * all three cases, so hits would map to unrelated old rows.
+	 * The origin is in composer rows: a replay paint replaces leading composer
+	 * blanks with history rows and prepends blanks for a short viewport, so
+	 * the painted top is backed out by that net pad.
+	 */
+	getMutableViewport(): { top: number; length: number } {
+		if (
+			this.#altActive ||
+			this.#resizeAltActive ||
+			this.#resizeProbe !== undefined ||
+			this.#resizeInPlaceActive ||
+			this.#ghosttyInitialImageDelayTimer !== undefined
+		) {
+			return { top: 0, length: 0 };
+		}
+		return { top: this.#providerViewportTop - this.#providerViewportPadTop, length: this.#providerWindow.length };
+	}
+
+	/**
+	 * Probe for opt-in normal-buffer click capture. The provider is read every
+	 * frame; while it returns true (and no fullscreen overlay owns the
+	 * display) the terminal reports button clicks as SGR events for inline
+	 * click targets. Native text selection becomes Shift+drag while on.
+	 */
+	setInlineMouseTrackingProvider(provider: (() => boolean) | undefined): void {
+		this.#inlineMouseProvider = provider;
+	}
+
+	/** Transition mouse reporting, emitting only the sequences a change needs. */
+	#setMouseTracking(state: MouseTrackingState): void {
+		const sequence = this.#mouseTrackingTransition(state);
+		this.#mouseTracking = state;
+		if (sequence) this.terminal.write(sequence);
+	}
+
 	/** Check if an overlay entry is currently visible */
 	#isOverlayVisible(entry: (typeof this.overlayStack)[number]): boolean {
 		if (entry.hidden) return false;
@@ -1125,13 +1201,50 @@ export class TUI extends Container {
 			data => this.#handleInput(data),
 			() => {
 				if (this.#resizeProbe) {
-					// The anchor being probed is already stale; restart the transaction.
+					// Warp echoes a height-only ±1 SIGWINCH on CSI ?1049l. The echo
+					// must not restart the alt borrow (that is the flicker loop),
+					// but the terminal really did adopt the echoed size, so a CPR
+					// reply already in flight may predate it: retire the probe and
+					// reissue it at the new geometry. DSR-only, no toggle, so this
+					// terminates. A real geometry change restarts the transaction below.
+					if (this.#isWarpAltToggleEcho()) {
+						this.#cancelResizeProbe();
+						this.#trackResizeBurst();
+						this.#beginResizeAnchorProbe();
+						return;
+					}
 					this.#cancelResizeProbe();
-					this.#beginResizeAltPaint(true);
+					if (this.#resizeRepaintsInPlace()) this.#beginResizeInPlacePaint();
+					else this.#beginResizeAltPaint(true);
+					return;
+				}
+				if (this.#altActive) {
+					// A fullscreen overlay owns the alt buffer: repaint the modal at
+					// the new size. Never snapshot the normal window or probe its
+					// anchor against the alternate grid — not even for a toggle echo.
+					this.requestRender(true);
+					return;
+				}
+				if (!this.#resizeAltActive && this.#isWarpAltToggleEcho()) {
+					// Delayed echo that lost the signal-vs-pty race with its own
+					// probe's CPR reply: the probe already resolved, so re-probe at
+					// the echoed size instead of painting on a stale anchor or
+					// suppressing into a forced replay. DSR-only, no borrow.
+					// While the resize borrow is active the echo is swallowed
+					// without probing: a CPR issued now would snapshot the
+					// alternate grid and anchor the normal viewport to its row.
+					this.#resizeProbeWindow = this.#providerWindow;
+					this.#resizeProbeOffset = this.#parkedViewportOffset;
+					this.#trackResizeBurst();
+					this.#beginResizeAnchorProbe();
 					return;
 				}
 				if (this.#renderScheduler.now() < this.#suppressResizeUntil) {
 					this.requestRender(true);
+					return;
+				}
+				if (this.#resizeRepaintsInPlace()) {
+					this.#beginResizeInPlacePaint();
 					return;
 				}
 				this.#beginResizeAltPaint();
@@ -1158,6 +1271,129 @@ export class TUI extends Container {
 		this.requestRender(true, { clearScrollback: options?.clearScrollback === true });
 	}
 	/**
+	 * Whether a resize repaints the visible window in place — no alternate-screen
+	 * borrow. Warp-only: Warp re-reports its size on alt-buffer toggles, so borrowing
+	 * there self-sustains. Every other terminal keeps the alt-borrow path. Inside a
+	 * multiplexer the mux owns the grid and consumes the toggles itself, so an
+	 * inherited Warp marker must not divert the mux-tuned borrow path.
+	 */
+	#resizeRepaintsInPlace(): boolean {
+		const override = resizeInPlaceOverride();
+		if (override !== null) return override;
+		if (isInsideTerminalMultiplexer()) return false;
+		return Bun.env.TERM_PROGRAM?.toLowerCase() === "warpterminal";
+	}
+
+	#noteAltBufferToggle(): void {
+		this.#altToggleColumns = this.terminal.columns;
+		this.#altToggleRows = this.terminal.rows;
+		this.#altToggleEchoPending = true;
+	}
+
+	/**
+	 * Warp-only echo: height-only ±1 SIGWINCH against the pending alt-toggle
+	 * baseline. Single-shot: the first SIGWINCH after the toggle consumes the
+	 * expectation either way, so at most one signal is ever swallowed per toggle.
+	 * Never inside a multiplexer, which consumes the toggles itself.
+	 */
+	#isWarpAltToggleEcho(): boolean {
+		if (!this.#altToggleEchoPending) return false;
+		this.#altToggleEchoPending = false;
+		// Inside a multiplexer the mux consumes alt toggles itself, so no echo is
+		// possible: every ±1 resize is real and must restart the transaction.
+		if (isInsideTerminalMultiplexer()) return false;
+		if (Bun.env.TERM_PROGRAM?.toLowerCase() !== "warpterminal") return false;
+		return (
+			this.terminal.columns === this.#altToggleColumns && Math.abs(this.terminal.rows - this.#altToggleRows) <= 1
+		);
+	}
+
+	/**
+	 * Fold one SIGWINCH step into the coalesced resize-burst accounting shared by
+	 * both resize paths: any grow step poisons the multiplexer clip model, the
+	 * accumulated pull bounds CPR-less grow anchors, and the epoch retires the
+	 * in-flight CPR tag so a rewrap-invalidated reply cannot anchor a new geometry.
+	 */
+	#trackResizeBurst(): void {
+		const burstLastHeight = this.#resizeBurstLastHeight ?? this.#previousHeight;
+		if (this.terminal.rows > burstLastHeight) this.#resizeBurstGrew = true;
+		this.#resizeBurstLastHeight = this.terminal.rows;
+		this.#resizeBurstPull += Math.max(0, this.terminal.rows - burstLastHeight);
+		this.#geometryEpoch++;
+	}
+
+	/**
+	 * Coalesced in-place resize transaction for Warp-class terminals: never
+	 * borrows the alt buffer. Drag SIGWINCHes only re-arm the settle window, so a
+	 * drag emits no paints and no scrollback replay; once quiet, the transaction
+	 * snapshots the live window and runs the CPR anchor probe, and the single
+	 * settled repaint lands on the recovered anchor with no ED3 rewrap.
+	 */
+	#beginResizeInPlacePaint(): void {
+		if (this.#altActive) {
+			this.requestRender(true);
+			return;
+		}
+		this.#trackResizeBurst();
+		this.#resizeInPlaceActive = true;
+		this.#resizeSettleTimer?.cancel();
+		this.#forgetHardwareCursorState();
+		this.#recordHardwareCursorHidden();
+		if (this.#eraseLiveViewportForResize()) {
+			// The erase parked the hardware cursor on the viewport's top row;
+			// snapshot the parked offset so the settled probe anchors there.
+			this.#parkedViewportOffset = 0;
+		}
+		this.#resizeSettleTimer = this.#renderScheduler.scheduleRender(() => {
+			this.#resizeSettleTimer = undefined;
+			if (this.#stopped) return;
+			this.#resizeProbeWindow = this.#providerWindow;
+			this.#resizeProbeOffset = this.#parkedViewportOffset;
+			this.#beginResizeAnchorProbe();
+		}, TUI.#RESIZE_VIEWPORT_SETTLE_MS);
+	}
+
+	/**
+	 * Blank the mutable live viewport on the normal screen before a resize
+	 * transaction waits out the drag. The terminal keeps reflowing the normal
+	 * buffer during the drag, and a height shrink pushes its top rows into
+	 * scrollback; with the live region blanked, only committed history rows
+	 * (correct to push) or blanks can leave the screen — never live placeholder
+	 * rows such as compact tool dots, whose real blocks must enter scrollback
+	 * through the ordered history path. Addressing depends on the resize
+	 * direction. Terminals keep the parked cursor attached to its logical line
+	 * through width rewrap and height-grow scrollback pull-down, so
+	 * cursor-relative movement lands on the viewport's top row. On height shrink
+	 * kitty clamps the cursor instead of moving it with pushed rows, so
+	 * cursor-relative addressing would start rows late; fall back to the same
+	 * bottom-preserving bound as resize-anchor recovery.
+	 *
+	 * Both erase paths leave the cursor on the viewport's top row. Returns true
+	 * when it erased (multiplexers skip it: an immediate erase races the pane
+	 * re-layout and blanks pulled-back committed rows).
+	 */
+	#eraseLiveViewportForResize(): boolean {
+		if (!this.#hasEverRendered || this.#providerWindow.length === 0 || isInsideTerminalMultiplexer()) {
+			return false;
+		}
+		if (this.terminal.rows < this.#previousHeight) {
+			const staleRows = this.#reflowedRowCount(
+				this.#providerWindow,
+				0,
+				this.#providerWindow.length,
+				this.terminal.columns,
+			);
+			const top = Math.max(0, Math.min(this.#providerViewportTop, this.terminal.rows - staleRows));
+			this.terminal.write(`\x1b[?25l${this.#eraseBelowRow(top, this.terminal.rows)}`);
+		} else {
+			const up = this.#reflowedRowCount(this.#providerWindow, 0, this.#parkedViewportOffset, this.terminal.columns);
+			const eraseBelow = this.#eraseBelowCursorRow(this.terminal.columns, this.terminal.rows);
+			this.terminal.write(`\x1b[?25l${up > 0 ? `\x1b[${up}A` : ""}${eraseBelow}`);
+		}
+		return true;
+	}
+
+	/**
 	 * Borrow the alternate buffer for stable, history-free resize repainting.
 	 * `restartingProbe` marks a transaction restarted by a SIGWINCH that
 	 * arrived while the settled anchor probe was in flight: the live window
@@ -1169,62 +1405,26 @@ export class TUI extends Container {
 			this.requestRender(true);
 			return;
 		}
-		const burstLastHeight = this.#resizeBurstLastHeight ?? this.#previousHeight;
-		if (this.terminal.rows > burstLastHeight) this.#resizeBurstGrew = true;
-		this.#resizeBurstLastHeight = this.terminal.rows;
-		this.#resizeBurstPull += Math.max(0, this.terminal.rows - burstLastHeight);
-		this.#geometryEpoch++;
+		this.#trackResizeBurst();
 		if (!this.#resizeAltActive) {
 			this.#resizeAltActive = true;
 			setAltScreenActive(true);
 			this.#altPreviousLines = [];
 			this.#forgetHardwareCursorState();
 			this.#recordHardwareCursorHidden();
-			// Erase the mutable live viewport from the normal screen before borrowing
-			// the alt buffer. The terminal keeps reflowing the normal buffer during
-			// the drag, and a height shrink pushes its top rows into scrollback;
-			// with the live region blanked, only committed history rows (correct to
-			// push) or blanks can leave the screen — never live placeholder rows
-			// such as compact tool dots, whose real blocks must enter scrollback
-			// through the ordered history path. Addressing depends on the resize
-			// direction. Terminals keep the parked cursor attached to its logical
-			// line through width rewrap and height-grow scrollback pull-down, so
-			// cursor-relative movement lands on the viewport's top row. On height
-			// shrink kitty clamps the cursor instead of moving it with pushed rows,
-			// so cursor-relative addressing would start rows late; fall back to the
-			// same bottom-preserving bound as resize-anchor recovery. The pre-erase
-			// window is stashed for the settled CPR probe: its reflowed row count
-			// bounds the anchor to `height - staleRows`, so a mis-parked cursor (a
-			// single-step tmux zoom re-lays the pane before SIGWINCH delivery,
-			// moving the park target under us) cannot anchor the settled repaint
-			// over pulled-back history rows or scroll-push the frame into
-			// scrollback again.
-			let erase = "";
+			// Blank the live region up front so a reflow-driven scroll can only push
+			// committed rows into scrollback. The pre-erase window is stashed for
+			// the settled CPR probe: its reflowed row count bounds the anchor to
+			// `height - staleRows`, so a mis-parked cursor (a single-step tmux zoom
+			// re-lays the pane before SIGWINCH delivery, moving the park target
+			// under us) cannot anchor the settled repaint over pulled-back history
+			// rows or scroll-push the frame into scrollback again.
 			if (!restartingProbe) {
 				this.#resizeProbeWindow = this.#providerWindow;
 				this.#resizeProbeOffset = this.#parkedViewportOffset;
 			}
-			if (this.#hasEverRendered && this.#providerWindow.length > 0 && !isInsideTerminalMultiplexer()) {
-				if (this.terminal.rows < this.#previousHeight) {
-					const staleRows = this.#reflowedRowCount(
-						this.#providerWindow,
-						0,
-						this.#providerWindow.length,
-						this.terminal.columns,
-					);
-					const top = Math.max(0, Math.min(this.#providerViewportTop, this.terminal.rows - staleRows));
-					erase = `\x1b[?25l${this.#eraseBelowRow(top, this.terminal.rows)}`;
-				} else {
-					const up = this.#reflowedRowCount(
-						this.#providerWindow,
-						0,
-						this.#parkedViewportOffset,
-						this.terminal.columns,
-					);
-					const eraseBelow = this.#eraseBelowCursorRow(this.terminal.columns, this.terminal.rows);
-					erase = `\x1b[?25l${up > 0 ? `\x1b[${up}A` : ""}${eraseBelow}`;
-				}
-				// Both erase paths leave the cursor on the viewport's top row, so the
+			if (this.#eraseLiveViewportForResize()) {
+				// The erase parked the cursor on the viewport's top row, so the
 				// parked offset no longer applies; carrying a stale nonzero offset
 				// into the probe would anchor the settled repaint above the real
 				// viewport top and overwrite visible committed rows.
@@ -1243,7 +1443,8 @@ export class TUI extends Container {
 				this.#providerWindow = [];
 				this.#parkedViewportOffset = 0;
 			}
-			this.terminal.write(`${erase}\x1b[?1049h${this.#keyboardEnhancementEnter()}`);
+			this.#noteAltBufferToggle();
+			this.terminal.write(`\x1b[?1049h${this.#keyboardEnhancementEnter()}`);
 		}
 		this.#resizeSettleTimer?.cancel();
 		this.#resizeSettleTimer = this.#renderScheduler.scheduleRender(() => {
@@ -1251,6 +1452,7 @@ export class TUI extends Container {
 			if (this.#stopped || !this.#resizeAltActive) return;
 			this.#resizeAltActive = false;
 			this.#suppressResizeUntil = this.#renderScheduler.now() + 100;
+			this.#noteAltBufferToggle();
 			this.terminal.write(`${this.#keyboardEnhancementExit()}\x1b[?1049l`);
 			setAltScreenActive(false);
 			this.#altPreviousLines = [];
@@ -1259,8 +1461,8 @@ export class TUI extends Container {
 		this.requestRender(true);
 	}
 	/**
-	 * Recover the reflowed viewport anchor after the resize alt-buffer borrow
-	 * ends. The terminal reflowed the restored normal buffer during the drag, so
+	 * Recover the reflowed viewport anchor after the resize settle window ends.
+	 * The terminal reflowed the restored normal buffer during the drag, so
 	 * `#providerViewportTop` is in stale grid coordinates; a DSR (CSI 6n) round
 	 * trip against the parked cursor reports where the viewport's logical line
 	 * landed. The settled repaint waits for the reply (or a short timeout).
@@ -1346,6 +1548,7 @@ export class TUI extends Container {
 		if (!probe) return;
 		probe.timer.cancel();
 		this.#resizeProbe = undefined;
+		this.#resizeInPlaceActive = false;
 		// Column tags stay live across resolves: their replies are
 		// self-identifying and discarded by tag whenever they arrive.
 		const width = this.terminal.columns;
@@ -1412,6 +1615,9 @@ export class TUI extends Container {
 			fs.appendFileSync(getDebugLogPath(), msg);
 		}
 		this.#providerViewportTop = Math.min(top, Math.max(0, height - 1));
+		// Resolved geometry invalidates the replay offset with the old anchor;
+		// the forced repaint recomputes it (usually zero).
+		this.#providerViewportPadTop = 0;
 		this.#forceViewportRepaintOnNextRender = true;
 		this.requestRender(true);
 	}
@@ -1641,6 +1847,16 @@ export class TUI extends Container {
 		this.#debugServer = undefined;
 		this.#resizeSettleTimer?.cancel();
 		this.#resizeSettleTimer = undefined;
+		if (this.#resizeInPlaceActive && this.terminal.rows > 0) {
+			// The hardware cursor sits wherever the drag left it, but tracking still
+			// describes the pre-resize row (no alt-buffer restore replays it back).
+			// The shell handoff below moves relatively from the tracked row, so park
+			// absolutely on the bottom row and record it first.
+			this.terminal.write(`\x1b[${this.terminal.rows};1H`);
+			this.#hardwareCursorRow = this.terminal.rows - 1;
+		}
+		this.#resizeInPlaceActive = false;
+		this.#altToggleEchoPending = false;
 		this.#cancelResizeProbe();
 		if (this.#resizeAltActive) {
 			this.#resizeAltActive = false;
@@ -1648,14 +1864,27 @@ export class TUI extends Container {
 			setAltScreenActive(false);
 		}
 		if (this.#altActive || this.#pendingAltExit) {
-			const mouseExit = this.#altMouseTracking ? MOUSE_TRACKING_OFF : "";
-			const exitSequence = this.#pendingAltExit || `${mouseExit}${this.#keyboardEnhancementExit()}\x1b[?1049l`;
+			// A pending fused exit may have been built without an OFF write to
+			// keep inline capture alive across the restore — at process quit
+			// nothing continues, so release unconditionally. The pending
+			// sequence itself can re-enable tracking (overlay-close restore),
+			// so the final OFF goes last or the shell keeps reporting.
+			const mouseExit = this.#mouseTracking !== "off" ? MOUSE_TRACKING_OFF : "";
+			const exitSequence = this.#pendingAltExit
+				? `${this.#pendingAltExit}${mouseExit}`
+				: `${mouseExit}${this.#keyboardEnhancementExit()}\x1b[?1049l`;
 			this.terminal.write(exitSequence);
 			setAltScreenActive(false);
 			this.#altActive = false;
-			this.#altMouseTracking = undefined;
+			this.#mouseTracking = "off";
 			this.#altPreviousLines = [];
 			this.#pendingAltExit = "";
+		} else if (this.#mouseTracking !== "off") {
+			// Inline capture with no overlay: still owned by us at quit, so
+			// release it — otherwise the parent shell keeps mouse reporting
+			// and loses native selection until a manual reset.
+			this.terminal.write(MOUSE_TRACKING_OFF);
+			this.#mouseTracking = "off";
 		}
 		// A latched destructive reset (settled rebuild-mode resize, /clear) pairs
 		// ED3 with a complete-ledger replay. Running that pair during stop would
@@ -2323,7 +2552,11 @@ export class TUI extends Container {
 			!this.#hasEverRendered ||
 			(this.#previousWidth === width && this.#previousHeight === height) ||
 			this.#resizeReplaySize === size ||
-			this.#resizeScrollbackMode === "preserve"
+			this.#resizeScrollbackMode === "preserve" ||
+			// In-place resizes (Warp) repaint the settled viewport once the drag
+			// goes quiet: no alt borrow, and no ED3 rewrap or history replay, so a
+			// drag can neither loop on its own echo nor flash destructive repaints.
+			this.#resizeRepaintsInPlace()
 		) {
 			return;
 		}
@@ -2406,9 +2639,11 @@ export class TUI extends Container {
 
 		let historyRows = history?.rows ?? [];
 		let replayViewportRows = 0;
+		let replayPrependedBlanks = 0;
 		if (history?.kind === "replay") {
 			// Providers may omit unused leading rows from a short viewport. Make
 			// that logical space explicit before the bottom-first replay split.
+			replayPrependedBlanks = Math.max(0, height - viewport.length);
 			while (viewport.length < height) viewport.unshift("");
 			let leadingBlankRows = 0;
 			while (leadingBlankRows < viewport.length && !/\S/.test(viewport[leadingBlankRows]!)) {
@@ -2549,6 +2784,7 @@ export class TUI extends Container {
 			...(target === null ? {} : { cursor: { x: target.col, y: target.row, visible: target.visible } }),
 		};
 		if (pendingAltExit) {
+			this.#noteAltBufferToggle();
 			this.#pendingAltExit = "";
 			setAltScreenActive(false);
 		}
@@ -2556,6 +2792,7 @@ export class TUI extends Container {
 		else this.#recordHardwareCursorHidden();
 		this.#providerWindow = mutablePrepared;
 		this.#providerViewportTop = mutableTop;
+		this.#providerViewportPadTop = replayViewportRows - replayPrependedBlanks;
 		this.#previousWidth = width;
 		this.#previousHeight = height;
 		this.#resizeBurstGrew = false;
@@ -2589,28 +2826,36 @@ export class TUI extends Container {
 			// use the stale pre-resize anchor.
 			return;
 		}
+		if (this.#resizeInPlaceActive && !this.#altActive) {
+			// In-place resize settling (Warp): the normal-buffer anchor is stale until
+			// the settled CPR probe resolves. Painting now would overwrite retained
+			// history and record the new geometry over the pending recovery, so drop
+			// the frame — the resolve repaints. Fullscreen overlay paints are
+			// buffer-isolated and still allowed.
+			return;
+		}
 
 		// Fullscreen alt-screen short-circuit. While the topmost visible overlay
 		// requests it, borrow the terminal's alternate buffer and paint only the
 		// modal there; the normal screen and all accounting stay untouched.
 		const topOverlay = this.#getTopmostVisibleOverlay();
 		const wantAlt = topOverlay?.options?.fullscreen === true;
-		const requestedMouseTracking = topOverlay?.options?.mouseTracking;
-		const wantMouseTracking = wantAlt
-			? requestedMouseTracking === false
-				? undefined
-				: requestedMouseTracking === "drag"
-					? "drag"
-					: "motion"
-			: undefined;
+		const wantMouse: MouseTrackingState =
+			topOverlay === undefined
+				? this.#inlineMouseProvider?.() === true
+					? "inline"
+					: "off"
+				: wantAlt && topOverlay.options?.mouseTracking !== false
+					? topOverlay.options?.mouseTracking === "drag" ? "drag" : "full"
+					: "off";
 		if (wantAlt && !this.#altActive) {
 			// Enhanced keyboard modes can be buffer-local: re-push the active
 			// modified-key reporting sequence on the freshly entered alternate
 			// screen, or Esc/modified keys revert to legacy encoding inside
 			// fullscreen overlays (Ghostty/kitty/iTerm2).
-			this.terminal.write(
-				`\x1b[?1049h${this.#keyboardEnhancementEnter()}${this.#mouseTrackingSequence(wantMouseTracking)}`,
-			);
+			this.#noteAltBufferToggle();
+			this.terminal.write(`\x1b[?1049h${this.#keyboardEnhancementEnter()}`);
+			this.#setMouseTracking(wantMouse);
 			setAltScreenActive(true);
 			this.terminal.hideCursor();
 			this.#forgetHardwareCursorState();
@@ -2619,23 +2864,25 @@ export class TUI extends Container {
 			this.#altPreviousLines = [];
 			this.#altEnterWidth = width;
 			this.#altEnterHeight = height;
-			this.#altMouseTracking = wantMouseTracking;
 		} else if (!wantAlt && this.#altActive) {
-			const mouseExit = this.#altMouseTracking ? MOUSE_TRACKING_OFF : "";
+			// Restore the normal buffer's reporting in the fused exit, including
+			// transitions from a drag-only or selection-first fullscreen overlay.
+			const mouseTransition = this.#mouseTrackingTransition(wantMouse);
 			const enhancementExit = this.#keyboardEnhancementExit();
-			const exitSequence = `${mouseExit}${enhancementExit}\x1b[?1049l`;
+			const exitSequence = `${mouseTransition}${enhancementExit}\x1b[?1049l`;
 			// Session replacement finishes while its fullscreen selector still
 			// covers the old normal buffer. Fuse the restore into the destructive
 			// repaint so no stale frame can become visible between writes.
 			if (this.#clearScrollbackOnNextRender) {
 				this.#pendingAltExit = exitSequence;
 			} else {
+				this.#noteAltBufferToggle();
 				this.terminal.write(exitSequence);
 				setAltScreenActive(false);
 			}
 			this.#forgetHardwareCursorState();
 			this.#altActive = false;
-			this.#altMouseTracking = undefined;
+			this.#mouseTracking = wantMouse;
 			this.#altPreviousLines = [];
 			// The alt-buffer restore put the pre-overlay normal screen back. If
 			// that buffer resized while covered, its cursor moved with width
@@ -2649,9 +2896,8 @@ export class TUI extends Container {
 				}
 				this.#forceViewportRepaintOnNextRender = true;
 			}
-		} else if (wantAlt && this.#altActive && wantMouseTracking !== this.#altMouseTracking) {
-			this.terminal.write(`${MOUSE_TRACKING_OFF}${this.#mouseTrackingSequence(wantMouseTracking)}`);
-			this.#altMouseTracking = wantMouseTracking;
+		} else if (wantMouse !== this.#mouseTracking) {
+			this.#setMouseTracking(wantMouse);
 		}
 		if (this.#altActive) {
 			this.#renderAltFrame(width, height);
@@ -2966,10 +3212,13 @@ export class TUI extends Container {
 		return this.terminal.kittyEnableSequence ? "\x1b[<u" : "";
 	}
 
-	#mouseTrackingSequence(mode: "drag" | "motion" | undefined): string {
-		if (mode === "drag") return MOUSE_TRACKING_DRAG;
-		if (mode === "motion") return MOUSE_TRACKING_MOTION;
-		return "";
+	#mouseTrackingTransition(state: MouseTrackingState): string {
+		const previous = this.#mouseTracking;
+		if (previous === state) return "";
+		if (state === "off") return MOUSE_TRACKING_OFF;
+		if (previous !== "off" && previous !== "drag" && state !== "drag") return "";
+		return (previous === "off" ? "" : MOUSE_TRACKING_OFF) +
+			(state === "drag" ? MOUSE_TRACKING_DRAG : MOUSE_TRACKING_ON);
 	}
 	/**
 	 * Compose and paint a single fullscreen overlay frame on the alt buffer.
