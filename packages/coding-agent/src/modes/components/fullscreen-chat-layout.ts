@@ -136,7 +136,6 @@ interface PinnedHitRange {
 	componentLineOffset: number;
 }
 
-
 interface ResidentTranscriptBlock extends FullscreenTranscriptBlockRender {
 	ordinal: number;
 	/** First resident row, including this block's separator when present. */
@@ -632,7 +631,6 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 		return Math.max(32, this.#transcriptHeight * 4);
 	}
 
-
 	#handleSelectionMouse(event: SgrMouseEvent): boolean {
 		const point = this.#transcriptPoint(event);
 		if (event.leftClick) {
@@ -667,9 +665,11 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 			if (this.#selectionDragged && this.#selectionFocus) {
 				const text = this.#selectedText(this.#selectionAnchor, this.#selectionFocus);
 				if (text.length > 0) this.#copyText(text);
-			}
-			else if (point && this.#onClickCandidates) {
-				const block = this.#residentBlocks.find(block => point.row >= block.startRow + block.separatorRows && point.row < block.startRow + block.rowCount);
+			} else if (point && this.#onClickCandidates) {
+				const block = this.#residentBlocks.find(
+					block =>
+						point.row >= block.startRow + block.separatorRows && point.row < block.startRow + block.rowCount,
+				);
 				const target = block?.identity as Partial<{ getClickFocusAgentIds(): string[] }> | undefined;
 				const candidates = target?.getClickFocusAgentIds?.();
 				if (candidates?.length) this.#onClickCandidates(candidates);
@@ -751,15 +751,21 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 		const screenBase = Math.max(0, terminalRows - pinnedRows);
 		this.#pinnedClickSpans = [
 			...before.spans,
-			...after.spans.map(span => ({ ...span, start: span.start + before.lines.length + editorRows, end: span.end + before.lines.length + editorRows })),
-		].filter(span => span.end > clipped).map(span => {
-			const visibleStart = Math.max(span.start, clipped);
-			return {
-				start: screenBase + visibleStart - clipped,
-				end: screenBase + span.end - clipped,
-				candidates: local => span.candidates(local + visibleStart - span.start),
-			};
-		});
+			...after.spans.map(span => ({
+				...span,
+				start: span.start + before.lines.length + editorRows,
+				end: span.end + before.lines.length + editorRows,
+			})),
+		]
+			.filter(span => span.end > clipped)
+			.map(span => {
+				const visibleStart = Math.max(span.start, clipped);
+				return {
+					start: screenBase + visibleStart - clipped,
+					end: screenBase + span.end - clipped,
+					candidates: local => span.candidates(local + visibleStart - span.start),
+				};
+			});
 		const ranges: PinnedHitRange[] = [];
 		let aggregateStart = 0;
 		for (let index = 0; index < components.length; index++) {

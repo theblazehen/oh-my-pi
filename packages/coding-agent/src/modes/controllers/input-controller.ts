@@ -727,7 +727,6 @@ export class InputController {
 		this.#lastHoverClickId = undefined;
 	}
 
-
 	/** Resolve clicks from either the inline composer or fullscreen viewport. */
 	focusClickCandidates(candidates: string[]): void {
 		if (candidates.length === 0) return;

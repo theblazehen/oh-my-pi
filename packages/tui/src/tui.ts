@@ -2846,7 +2846,9 @@ export class TUI extends Container {
 					? "inline"
 					: "off"
 				: wantAlt && topOverlay.options?.mouseTracking !== false
-					? topOverlay.options?.mouseTracking === "drag" ? "drag" : "full"
+					? topOverlay.options?.mouseTracking === "drag"
+						? "drag"
+						: "full"
 					: "off";
 		if (wantAlt && !this.#altActive) {
 			// Enhanced keyboard modes can be buffer-local: re-push the active
@@ -3217,8 +3219,9 @@ export class TUI extends Container {
 		if (previous === state) return "";
 		if (state === "off") return MOUSE_TRACKING_OFF;
 		if (previous !== "off" && previous !== "drag" && state !== "drag") return "";
-		return (previous === "off" ? "" : MOUSE_TRACKING_OFF) +
-			(state === "drag" ? MOUSE_TRACKING_DRAG : MOUSE_TRACKING_ON);
+		return (
+			(previous === "off" ? "" : MOUSE_TRACKING_OFF) + (state === "drag" ? MOUSE_TRACKING_DRAG : MOUSE_TRACKING_ON)
+		);
 	}
 	/**
 	 * Compose and paint a single fullscreen overlay frame on the alt buffer.

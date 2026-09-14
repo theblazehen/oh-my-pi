@@ -16,7 +16,12 @@ describe("shared fullscreen subagent click routing", () => {
 	it("uses the upstream physical row map for wrapped HUD rows", () => {
 		const focused: string[][] = [];
 		const hud = new Container();
-		hud.addChild(new SubagentHudComponent(["", "Subagents", "First lengthy description continued", "Second"], ["First", "Second"]));
+		hud.addChild(
+			new SubagentHudComponent(
+				["", "Subagents", "First lengthy description continued", "Second"],
+				["First", "Second"],
+			),
+		);
 		const layout = new FullscreenChatLayout({
 			transcript: new Text("history"),
 			editor: new Text("editor"),

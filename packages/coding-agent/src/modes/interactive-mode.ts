@@ -229,7 +229,11 @@ import { OAuthManualInputManager } from "./oauth-manual-input";
 import { getRunningSubagentBadgeAgentIds, getRunningSubagentBadgeRegistry } from "./running-subagent-badge";
 import { labelEchoesHandle } from "../task/label";
 import { agentTypeBadge, formatTaskId } from "../task/render";
-import { type ObservableSession, type SessionObserverChangeKind, SessionObserverRegistry } from "./session-observer-registry";
+import {
+	type ObservableSession,
+	type SessionObserverChangeKind,
+	SessionObserverRegistry,
+} from "./session-observer-registry";
 import { createSessionTeardown, type SessionTeardown } from "./session-teardown";
 import { runProviderSetupWizard } from "./setup-wizard/lazy";
 import { sanitizeStatusText } from "./shared";
@@ -2087,7 +2091,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#submitLoopPromptWhenReady(prompt: string, version: number): void {
-		if (version !== this.#loopCommandVersion || this.loopModePaused || !this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
+		if (
+			version !== this.#loopCommandVersion ||
+			this.loopModePaused ||
+			!this.loopModeEnabled ||
+			this.loopPrompt !== prompt ||
+			!this.onInputCallback
+		)
+			return;
 		if (this.#isAutoSubmitBlocked()) {
 			this.#deferLoopAutoSubmit(() => this.#submitLoopPromptWhenReady(prompt, version));
 			return;
@@ -2100,8 +2111,19 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.onInputCallback(this.startPendingSubmission({ text: prompt }));
 	}
 
-	async #runLoopIteration(action: "prompt" | "compact" | "reset", prompt: string, version = this.#loopCommandVersion): Promise<void> {
-		if (version !== this.#loopCommandVersion || this.loopModePaused || !this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
+	async #runLoopIteration(
+		action: "prompt" | "compact" | "reset",
+		prompt: string,
+		version = this.#loopCommandVersion,
+	): Promise<void> {
+		if (
+			version !== this.#loopCommandVersion ||
+			this.loopModePaused ||
+			!this.loopModeEnabled ||
+			this.loopPrompt !== prompt ||
+			!this.onInputCallback
+		)
+			return;
 		if (this.#isAutoSubmitBlocked()) {
 			this.#deferLoopAutoSubmit(() => {
 				void this.#runLoopIteration(action, prompt, version);
@@ -2169,7 +2191,14 @@ export class InteractiveMode implements InteractiveModeContext {
 				}
 			}
 		}
-		if (version !== this.#loopCommandVersion || this.loopModePaused || !this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
+		if (
+			version !== this.#loopCommandVersion ||
+			this.loopModePaused ||
+			!this.loopModeEnabled ||
+			this.loopPrompt !== prompt ||
+			!this.onInputCallback
+		)
+			return;
 		this.#submitLoopPromptWhenReady(prompt, version);
 	}
 
@@ -2206,7 +2235,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Running the condition is an await point: Esc (pauseLoop) or a second
 		// /loop (disableLoopMode) can land mid-command, so re-check the same
 		// guards the method entry used before acting on a now-stale verdict.
-		if (controller.signal.aborted || version !== this.#loopCommandVersion || this.loopModePaused || !this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return false;
+		if (
+			controller.signal.aborted ||
+			version !== this.#loopCommandVersion ||
+			this.loopModePaused ||
+			!this.loopModeEnabled ||
+			this.loopPrompt !== prompt ||
+			!this.onInputCallback
+		)
+			return false;
 		if (verdict.kind === "continue") return true;
 		if (verdict.kind === "aborted") return false;
 		this.disableLoopMode(verdict.message);
@@ -2220,7 +2257,9 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#syncLoopModeStatus(): void {
 		const state: "running" | "paused" = this.loopModePaused ? "paused" : "running";
-		this.statusLine.setLoopModeStatus(this.loopModeEnabled ? { state, limit: this.loopLimit, condition: this.loopCondition } : undefined);
+		this.statusLine.setLoopModeStatus(
+			this.loopModeEnabled ? { state, limit: this.loopLimit, condition: this.loopCondition } : undefined,
+		);
 		this.ui.requestRender();
 	}
 
@@ -2343,7 +2382,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#syncLoopModeStatus();
 		const limitSuffix = parsed.limit ? ` Limited to ${describeLoopLimit(parsed.limit)}.` : " Unbounded.";
 		const conditionSuffix = parsed.condition ? ` ${describeLoopCondition(parsed.condition)}.` : "";
-		this.showStatus(`Loop ${wasEnabled ? "restarted" : "started"}.${limitSuffix}${conditionSuffix} Esc pauses; bare /loop stops.`);
+		this.showStatus(
+			`Loop ${wasEnabled ? "restarted" : "started"}.${limitSuffix}${conditionSuffix} Esc pauses; bare /loop stops.`,
+		);
 		// Hand the captured prompt back to the dispatcher so the first iteration
 		// follows the normal submission path. Only explicit loop commands assign it.
 		return parsed.prompt;

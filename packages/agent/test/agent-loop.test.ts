@@ -6437,7 +6437,11 @@ describe("speculative tool execution", () => {
 			parameters: schema,
 			prepareSteeringYield() {
 				calls.push("reserve");
-				return { release: () => { calls.push("release"); } };
+				return {
+					release: () => {
+						calls.push("release");
+					},
+				};
 			},
 			speculation: {
 				stream: {

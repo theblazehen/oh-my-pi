@@ -3039,7 +3039,9 @@ async function executeToolCalls(
 					if (record.transformError !== undefined) throw record.transformError;
 					const executionArgs =
 						record.executionArgs ??
-						(transformToolCallArguments ? transformToolCallArguments(effectiveArgs, toolCall.name) : effectiveArgs);
+						(transformToolCallArguments
+							? transformToolCallArguments(effectiveArgs, toolCall.name)
+							: effectiveArgs);
 					record.args = executionArgs;
 
 					const speculativeOutcome = speculationCoordinator
