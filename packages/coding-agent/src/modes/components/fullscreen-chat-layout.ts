@@ -11,8 +11,13 @@ import {
 	sliceWithWidth,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
-import { renderClickTargets, type RenderedClickTargets, routeViewportClick, type ViewportClickSpan } from "../composer";
-import type { TranscriptBlockSource } from "./transcript-container";
+import {
+	renderClickTargets,
+	routeViewportClick,
+	type RenderedClickTargets,
+	type ViewportClickSpan,
+} from "@oh-my-pi/pi-tui/prompt/composer";
+import type { TranscriptBlockSource } from "@oh-my-pi/pi-tui/chrome/transcript-container";
 
 export interface FullscreenChatLayoutOptions {
 	/** Aggregate containing the welcome/transcript and transient upper HUD rows. */

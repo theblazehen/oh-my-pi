@@ -10,39 +10,10 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { resetSessionTitleIndexForTests } from "@oh-my-pi/pi-coding-agent/session/title-index";
-import { FileSessionStorage, type WriteTextAtomicOptions } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import type { SessionTitleUpdate } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
+import { resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { getConfigRootDir, removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 
 import { makeAssistantMessage } from "./helpers";
-
-class CountingTitleSlotStorage extends FileSessionStorage {
-	titleUpdates = 0;
-	syncWrites = 0;
-	atomicWrites = 0;
-
-	override async updateSessionTitle(filePath: string, title: SessionTitleUpdate): Promise<void> {
-		this.titleUpdates++;
-		await super.updateSessionTitle(filePath, title);
-	}
-
-	override writeTextSync(filePath: string, content: string): void {
-		this.syncWrites++;
-		super.writeTextSync(filePath, content);
-	}
-
-	override async writeTextAtomic(filePath: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
-		this.atomicWrites++;
-		await super.writeTextAtomic(filePath, content, options);
-	}
-
-	resetCounts(): void {
-		this.titleUpdates = 0;
-		this.syncWrites = 0;
-		this.atomicWrites = 0;
-	}
-}
 
 function parseJsonLine(line: string): Record<string, unknown> {
 	return JSON.parse(line) as Record<string, unknown>;
@@ -79,7 +50,7 @@ describe("session title source persistence", () => {
 
 	afterEach(async () => {
 		for (const manager of managers.splice(0).reverse()) await manager.close();
-		resetSessionTitleIndexForTests();
+		resetSessionIndexForTests();
 		if (originalAgentDir) {
 			setAgentDir(originalAgentDir);
 		} else {
@@ -157,9 +128,8 @@ describe("session title source persistence", () => {
 		expect(reopened.titleSource).toBe("user");
 	});
 
-	it("renames slotted sessions by updating the fixed title slot and appending an audit entry", async () => {
-		const storage = new CountingTitleSlotStorage();
-		const session = track(SessionManager.create(cwd, undefined, storage));
+	it("renames slotted sessions and persists the title slot and audit entry", async () => {
+		const session = track(SessionManager.create(cwd));
 		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
 		await session.setSessionName("Auto title", "auto", "initial");
 		session.appendMessage(makeAssistantMessage());
@@ -167,14 +137,9 @@ describe("session title source persistence", () => {
 
 		const sessionFile = session.getSessionFile();
 		expect(sessionFile).toBeDefined();
-		storage.resetCounts();
 
 		await session.setSessionName("Manual title", "user", "rename");
 		await session.flush();
-
-		expect(storage.titleUpdates).toBe(1);
-		expect(storage.syncWrites).toBe(0);
-		expect(storage.atomicWrites).toBe(0);
 
 		const rawLines = readRawLines(sessionFile!);
 		expect(parseJsonLine(rawLines[0])).toMatchObject({
@@ -189,6 +154,10 @@ describe("session title source persistence", () => {
 		const titleChanges = entries.filter(entry => entry.type === TITLE_CHANGE_ENTRY_TYPE);
 		expect(titleChanges.map(entry => entry.title)).toEqual(["Auto title", "Manual title"]);
 		expect(titleChanges.map(entry => entry.trigger)).toEqual(["initial", "rename"]);
+
+		const reopened = track(await SessionManager.open(sessionFile!));
+		expect(reopened.getSessionName()).toBe("Manual title");
+		expect(reopened.titleSource).toBe("user");
 	});
 
 	it("notifies name-change subscribers only after successful applied names", async () => {

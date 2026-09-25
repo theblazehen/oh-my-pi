@@ -14,7 +14,8 @@ import {
 	EPHEMERAL_MODEL_CHANGE_ROLE,
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
+import { cfgDefaultThinkingLevel, cfgTierAnthropic } from "@oh-my-pi/pi-coding-agent/session/settings";
+import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 describe("AgentSession model persistence", () => {
@@ -31,7 +32,7 @@ describe("AgentSession model persistence", () => {
 	beforeAll(async () => {
 		sharedDir = TempDir.createSync("@pi-model-persistence-shared-");
 		sharedAuthStorage = await AuthStorage.create(path.join(sharedDir.path(), "auth.db"));
-		sharedAuthStorage.setRuntimeApiKey("anthropic", "test-key");
+		sharedAuthStorage.keys.setRuntime("anthropic", "test-key");
 		sharedModelRegistry = new ModelRegistry(sharedAuthStorage, path.join(sharedDir.path(), "models.yml"));
 	});
 
@@ -412,8 +413,8 @@ describe("AgentSession model persistence", () => {
 		session = undefined;
 
 		const current = await createSession({ initialModel: model, persist: true });
-		current.settings.set("defaultThinkingLevel", Effort.High);
-		current.settings.set("tier.anthropic", "none");
+		cfgDefaultThinkingLevel.set(current.settings, Effort.High);
+		cfgTierAnthropic.set(current.settings, "none");
 
 		await expect(current.session.switchSession(targetSessionFile)).resolves.toBe(true);
 		expect(current.session.sessionManager.hasColdHistory()).toBe(true);

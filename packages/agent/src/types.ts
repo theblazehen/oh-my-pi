@@ -24,12 +24,25 @@ import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { AgentRunCoverage, AgentRunSummary } from "./run-collector";
+import type { SentToolDefinitions } from "./sent-tool-definitions";
 import type { AgentTelemetryConfig } from "./telemetry";
 
 /** Stream function - can return sync or Promise for async config lookup */
 export type StreamFn = (
 	...args: Parameters<typeof streamSimple>
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
+
+/** Staged queue preparation; commit synchronously only while the batch is still owned. */
+export interface QueuedMessagePreparation {
+	/** Append context after the originals; undefined stops this attempt, retaining originals unless explicitly removed. */
+	commit(): readonly AgentMessage[] | undefined;
+}
+
+/** Prepare an exclusively claimed batch. Undefined delivers unchanged; the signal also aborts when the claim is cancelled. */
+export type PrepareQueuedMessages = (
+	messages: readonly AgentMessage[],
+	signal: AbortSignal,
+) => QueuedMessagePreparation | undefined | Promise<QueuedMessagePreparation | undefined>;
 
 /** Called once an aside has been inserted into the agent's live context. */
 export const ASIDE_MESSAGE_COMMIT = Symbol("aside-message-commit");
@@ -56,6 +69,12 @@ export interface AgentTurnEndContext {
 	message: AgentMessage;
 	/** Tool results produced by this turn, already paired with `message` in the live context. */
 	toolResults: ToolResultMessage[];
+	/**
+	 * Passive model-visible messages appended after the tool results at this
+	 * boundary. The agent loop always sends an array (possibly empty);
+	 * absent is equivalent to empty for hosts that construct the context.
+	 */
+	additionalMessages?: AgentMessage[];
 	/** True when the current tool-loop batch is continuing without yielding to post-turn steering. */
 	willContinue: boolean;
 }
@@ -231,6 +250,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
 
+	/** Remembers sent tool definitions to fill {@link Context.inactiveTools}. */
+	sentToolDefinitions?: SentToolDefinitions;
+
 	/**
 	 * Resolves the API key or resolver for the current model before each LLM call.
 	 *
@@ -283,12 +305,24 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Peeks whether IRC messages should interrupt a watched tool batch.
 	 *
-	 * Uses the same delivery rules as steering: the poll is non-consuming, only
-	 * runs for batches selected by {@link interruptMode}, and is ignored when
-	 * `interruptMode` is `"wait"`. The host owns message injection at the next
-	 * boundary.
+	 * Non-consuming and checked only in watched batches: every `immediate` batch,
+	 * eligible `blocking` batches, and batches with an interruptible call. IRC
+	 * hard-aborts interruptible calls even in `interruptMode: "wait"`; when soft
+	 * interrupts are enabled it also raises the cooperative signal for work that
+	 * can safely yield. The host injects the message at the next boundary.
 	 */
 	hasIrcInterrupts?: () => boolean | Promise<boolean>;
+	/**
+	 * Peeks whether a background completion (finished job, exited supervised
+	 * process) is queued for aside injection at the next boundary.
+	 *
+	 * Non-consuming; checked under the same watched-batch criteria as
+	 * {@link hasIrcInterrupts}. It hard-aborts *interruptible* waits in every
+	 * interruptMode, without raising {@link ToolCallContext.steeringSignal}; a
+	 * queued completion must not push ordinary foreground work (auto-background
+	 * bash/eval) into the background.
+	 */
+	hasBackgroundCompletions?: () => boolean | Promise<boolean>;
 
 	/**
 	 * Returns follow-up messages to process after the agent would otherwise stop.
@@ -319,7 +353,11 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 
 	/**
 	 * Provides tool execution context, resolved per tool call.
-	 * Use for late-bound UI or session state access.
+	 * Use for late-bound UI or session state access. The loop passes the tool
+	 * call's {@link ToolCallContext}; hosts that support passive tool context
+	 * surface its `addAdditionalContext` sink as
+	 * {@link AgentToolContext.addAdditionalContext}. The returned object is
+	 * handed to the tool as-is.
 	 */
 	getToolContext?: (toolCall?: ToolCallContext) => AgentToolContext | undefined;
 
@@ -397,6 +435,12 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * model's text output back into canonical `toolCall` blocks.
 	 */
 	dialect?: Dialect;
+	/**
+	 * Per-call owned-dialect resolver, read once per LLM call with the model
+	 * being requested. Authoritative when set: its return value (including
+	 * `undefined` = native tool calling) replaces the static {@link dialect}.
+	 */
+	getDialect?: (model: Model) => Dialect | undefined;
 	/**
 	 * When owned (in-band) tool calling is active and the model starts
 	 * fabricating a tool result inside its own turn, control how the loop reacts:
@@ -604,6 +648,13 @@ export interface ToolCallContext {
 	 * always safe (the message injects at the next batch boundary).
 	 */
 	steeringSignal?: AbortSignal;
+	/**
+	 * Loop-owned sink for passive context reported while this call executes.
+	 * Values join the call's context at the batch boundary and are injected
+	 * after the batch's tool results, in assistant tool-call order, before the
+	 * next provider request. Blank values are ignored.
+	 */
+	addAdditionalContext?: (context: string) => void;
 }
 
 /** A single tool-call content block emitted by an assistant message. */
@@ -806,11 +857,19 @@ export interface SpeculativeToolExecutionConfig {
  * written back to the tool-call block on the assistant message, and seen by
  * history, scheduling, execution events, and `tool.execute` alike. It is
  * ignored when `block` is true.
+ *
+ * Set `additionalContext` to attach passive model-visible context to this call.
+ * Non-empty values from a tool batch are injected in assistant tool-call order
+ * after every result settles and before the next provider request. It is
+ * dropped when the call is blocked or skipped, or when its final result is an
+ * error (including an approval denial raised by the tool's own gate). Within a
+ * call it follows any context the tool reported during execution.
  */
 export interface BeforeToolCallResult {
 	block?: boolean;
 	reason?: string;
 	args?: Record<string, unknown>;
+	additionalContext?: string;
 }
 
 /**
@@ -981,6 +1040,16 @@ export interface AgentToolContext {
 	/** Loop-owned metadata for the tool call currently being executed. */
 	toolCall?: ToolCallContext;
 	// Apps extend with their own fields via declaration merging.
+	/**
+	 * Attach trusted, agent-authored instructions to the next provider request.
+	 * The host emits them after tool results with developer/system priority where
+	 * the selected transport supports it. Do not use this channel for raw tool
+	 * output, retrieved documents, web content, or other untrusted data; return
+	 * those through the ordinary tool result instead. Hosts populate it from
+	 * {@link ToolCallContext.addAdditionalContext} (or their own collector for
+	 * calls dispatched outside the loop); absent when the host has no sink.
+	 */
+	addAdditionalContext?(context: string): void;
 	/** Present only while the matching outer tool owns its finalized stream session. */
 	[SPECULATIVE_STREAM_SESSION]?: ToolSpeculationStreamSession;
 }
@@ -1025,14 +1094,21 @@ export interface AgentTool<
 	 * Called at `toolcall_start`, before any argument delta. Return `undefined` to opt out.
 	 */
 	openArgStream?: (init: AgentToolArgStreamInit) => AgentToolArgStream | undefined;
-	/** If true, tool is excluded unless explicitly listed in --tools or agent's tools field */
 	hidden?: boolean;
+	/** If true, the tool can read `skill://<name>` instruction content; prompt builders gate skill guidance on it. */
+	readsSkillUris?: boolean;
 	/** If true, tool can stage a pending action that requires explicit resolution via the resolve tool. */
 	deferrable?: boolean;
 	/** How an enabled tool is presented. See {@link ToolLoadMode}. Omitted is treated as `"essential"` for built-ins; custom-tool adapters normalize omission to `"discoverable"`. */
 	loadMode?: ToolLoadMode;
 	/** Short one-line summary used for tool discovery indexes. */
 	summary?: string;
+	/**
+	 * On-demand documentation topics (`topic → markdown`), readable as
+	 * `xd://<tool>/<topic>`. Lets a tool keep large sub-surfaces out of its
+	 * description and advertise only a one-line pointer per topic.
+	 */
+	docTopics?(): Readonly<Record<string, string>>;
 	/**
 	 * Concurrency mode for tool scheduling when multiple calls are in one turn.
 	 * - "shared": can run alongside other shared tools (default)

@@ -1,8 +1,8 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { FullscreenChatLayout } from "@oh-my-pi/pi-coding-agent/modes/components/fullscreen-chat-layout";
 import { SubagentHudComponent } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
-import { PINNED_HUD_TOGGLE_ID } from "@oh-my-pi/pi-coding-agent/modes/composer";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { PINNED_HUD_TOGGLE_ID } from "@oh-my-pi/pi-tui/prompt/composer";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { Container, Text } from "@oh-my-pi/pi-tui";
 
 function click(layout: FullscreenChatLayout, row: number): void {

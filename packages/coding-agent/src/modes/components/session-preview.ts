@@ -2,7 +2,7 @@ import { type Component, Markdown, replaceTabs, ScrollView, Text, truncateToWidt
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type { SessionInfo } from "../../session/session-listing";
 import { type SessionPreviewMessage, streamSessionPreview } from "../../session/session-preview";
-import { getMarkdownTheme, theme } from "../theme/theme";
+import { getMarkdownTheme, theme } from "@oh-my-pi/pi-tui/theme/theme";
 
 /** Selected rollout preview; owns its reader and an independent viewport. */
 export class SessionPreviewComponent implements Component {

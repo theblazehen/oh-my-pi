@@ -15,7 +15,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
-import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 import type { CompactionQueuedMessage, InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -62,6 +62,7 @@ function createStubInputControllerContext(opts: {
 	skillCommands: Map<string, Skill>;
 	isStreaming: boolean;
 	isCompacting?: boolean;
+	loopModeEnabled?: boolean;
 }) {
 	let editorText = "";
 	const editor: StubEditor = {
@@ -99,6 +100,7 @@ function createStubInputControllerContext(opts: {
 	const reconcileOptimisticSkillMessage = vi.fn();
 	const clearOptimisticSkillMessage = vi.fn();
 	const queueCompactionMessage = vi.fn((_text: string, _mode: "steer" | "followUp", _images?: ImageContent[]) => {});
+	const armLoopAutoSubmit = vi.fn();
 	const ctx = {
 		editor,
 		ui: { requestRender },
@@ -121,7 +123,8 @@ function createStubInputControllerContext(opts: {
 		updatePendingMessagesDisplay,
 		isBashMode: false,
 		isPythonMode: false,
-		loopModeEnabled: false,
+		loopModeEnabled: opts.loopModeEnabled ?? false,
+		armLoopAutoSubmit,
 		compactionQueuedMessages: [],
 		locallySubmittedUserSignatures: new Set<string>(),
 		withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
@@ -145,6 +148,7 @@ function createStubInputControllerContext(opts: {
 		renderOptimisticSkillMessage,
 		reconcileOptimisticSkillMessage,
 		clearOptimisticSkillMessage,
+		armLoopAutoSubmit,
 	};
 }
 
@@ -196,6 +200,22 @@ describe("InputController skill queue chip metadata", () => {
 
 		expect(queueCompactionMessage).toHaveBeenCalledWith("/skill:test-skill arg1 arg2", "steer", undefined);
 		expect(promptCustomMessage).not.toHaveBeenCalled();
+	});
+
+	it("arms an already-owned loop after a skill turn", async () => {
+		const { ctx, editor, promptCustomMessage, armLoopAutoSubmit } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: false,
+			loopModeEnabled: true,
+		});
+		const controller = new InputController(ctx);
+
+		controller.setupEditorSubmitHandler();
+		editor.setText("/skill:test-skill arg1 arg2");
+		await editor.onSubmit?.("/skill:test-skill arg1 arg2");
+
+		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+		expect(armLoopAutoSubmit).toHaveBeenCalledTimes(1);
 	});
 
 	it("passes slash-form queueChipText for streaming skill follow-ups", async () => {
@@ -365,7 +385,7 @@ describe("compaction skill re-invocation", () => {
 		return call;
 	}
 
-	function createCompactionDrainContext(queuedMessages: CompactionQueuedMessage[]) {
+	function createCompactionDrainContext(queuedMessages: CompactionQueuedMessage[], loopModeEnabled = false) {
 		const promptCustomMessageCalled = Promise.withResolvers<void>();
 		const promptCustomMessage: PromptCustomMessage = vi.fn(async () => {
 			promptCustomMessageCalled.resolve();
@@ -373,9 +393,12 @@ describe("compaction skill re-invocation", () => {
 		const prompt = vi.fn(async (_text: string, _options?: { streamingBehavior?: "steer" | "followUp" }) => {});
 		const steer = vi.fn(async (_text: string, _images?: ImageContent[]) => {});
 		const followUp = vi.fn(async (_text: string, _images?: ImageContent[]) => {});
+		const armLoopAutoSubmit = vi.fn();
 		const ctx = {
 			skillCommands,
 			compactionQueuedMessages: queuedMessages,
+			loopModeEnabled,
+			armLoopAutoSubmit,
 			updatePendingMessagesDisplay: vi.fn(),
 			showError: vi.fn(),
 			isKnownSlashCommand: vi.fn(() => false),
@@ -389,7 +412,7 @@ describe("compaction skill re-invocation", () => {
 				clearQueue: vi.fn(),
 			},
 		} as unknown as InteractiveModeContext;
-		return { ctx, promptCustomMessage, promptCustomMessageCalled, prompt, steer, followUp };
+		return { ctx, promptCustomMessage, promptCustomMessageCalled, prompt, steer, followUp, armLoopAutoSubmit };
 	}
 
 	beforeEach(async () => {
@@ -401,6 +424,19 @@ describe("compaction skill re-invocation", () => {
 	afterEach(() => {
 		tempDir.removeSync();
 		vi.restoreAllMocks();
+	});
+
+	it("arms the loop after re-invoking a queued skill (regression: /loop never resubmitted after compaction)", async () => {
+		const { ctx, promptCustomMessageCalled, armLoopAutoSubmit } = createCompactionDrainContext(
+			[{ text: "/skill:test-skill arg1 arg2", mode: "steer" }],
+			true,
+		);
+		const uiHelpers = new UiHelpers(ctx);
+
+		await uiHelpers.flushCompactionQueue({ willRetry: false });
+		await promptCustomMessageCalled;
+
+		expect(armLoopAutoSubmit).toHaveBeenCalledTimes(1);
 	});
 
 	it("re-invokes a queued skill as a user-attributed skill prompt", async () => {
@@ -475,7 +511,7 @@ interface SessionFixture {
 async function createRealSession(): Promise<SessionFixture> {
 	const tempDir = TempDir.createSync("@pi-skill-queue-real-");
 	const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	authStorage.keys.setRuntime("anthropic", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage);
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected built-in anthropic model to exist");

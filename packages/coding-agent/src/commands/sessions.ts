@@ -1,8 +1,8 @@
 import * as path from "node:path";
 import { directoryExists, filterChildShellEnv, getAgentDir, normalizePathForComparison } from "@oh-my-pi/pi-utils";
 import { CliUsageError, Command } from "@oh-my-pi/pi-utils/cli";
-import { selectSession } from "../cli/session-picker";
-import { initTheme } from "../modes/theme/theme";
+import { selectSession } from "../session/session-picker";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { SessionManager } from "../session/session-manager";
 import { resolveWorkerSpawnCmd, workerEnvFromParent } from "../subprocess/worker-client";
 

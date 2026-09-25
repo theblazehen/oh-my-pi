@@ -2,10 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import * as picker from "@oh-my-pi/pi-coding-agent/cli/session-picker";
+import * as picker from "@oh-my-pi/pi-tui/apps/session-picker";
 import { isSubcommand, resolveCliArgv } from "@oh-my-pi/pi-coding-agent/cli-commands";
 import Sessions from "@oh-my-pi/pi-coding-agent/commands/sessions";
-import * as theme from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import * as theme from "@oh-my-pi/pi-tui/theme";
 import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as workers from "@oh-my-pi/pi-coding-agent/subprocess/worker-client";
@@ -112,6 +112,13 @@ describe("omp sessions command", () => {
 				initialScope: "all",
 				preview: true,
 				allSessions: [expect.objectContaining({ id: "local-session" }), selected],
+			}),
+			expect.objectContaining({
+				loadPinnedIds: expect.any(Function),
+				loadHistoryMatcher: expect.any(Function),
+				deleteSession: expect.any(Function),
+				loadAllSessions: expect.any(Function),
+				createPreview: expect.any(Function),
 			}),
 		);
 		expect(Bun.spawn).not.toHaveBeenCalled();

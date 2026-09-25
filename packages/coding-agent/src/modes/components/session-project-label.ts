@@ -1,7 +1,7 @@
+import { shortenPath } from "@oh-my-pi/pi-tui/render";
 import { replaceTabs } from "@oh-my-pi/pi-tui";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type { SessionInfo } from "../../session/session-listing";
-import { shortenPath } from "../../tools/render-utils";
 import { normalizePromptPath } from "../../utils/prompt-path";
 
 /** Shortest unique path suffixes, derived only from recorded working directories. */
