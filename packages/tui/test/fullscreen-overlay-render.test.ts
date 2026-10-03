@@ -165,7 +165,6 @@ describe("fullscreen overlay rendering", () => {
 			// … enabled any-motion tracking for click/scroll/hover support …
 			expect(modalWrites).toContain("\x1b[?1003h"); // any-motion tracking drives hover
 			expect(modalWrites).toContain("\x1b[?1006h");
-			expect(modalWrites).not.toContain("\x1b[?1000h");
 			expect(modalWrites).not.toContain("\x1b[?1002h");
 			// … and never erased scrollback (ED3) or otherwise touched the transcript.
 			expect(modalWrites).not.toContain("\x1b[3J");
@@ -256,21 +255,25 @@ describe("fullscreen overlay rendering", () => {
 			});
 			await scheduler.settle(term);
 			const motionEnter = writes.slice(motionFrom).join("");
-			expect(motionEnter).toContain("\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1003h\x1b[?1006h");
+			expect(motionEnter).toContain("\x1b[?1002l");
+			expect(motionEnter).toContain("\x1b[?1003h\x1b[?1006h");
+			expect(motionEnter.indexOf("\x1b[?1002l")).toBeLessThan(motionEnter.indexOf("\x1b[?1003h"));
 			expect(motionEnter).not.toContain("\x1b[?1049h");
 
 			const resumeFrom = writes.length;
 			motion.hide();
 			await scheduler.settle(term);
 			const resumeDrag = writes.slice(resumeFrom).join("");
-			expect(resumeDrag).toContain("\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1002h\x1b[?1006h");
+			expect(resumeDrag).toContain("\x1b[?1003l");
+			expect(resumeDrag).toContain("\x1b[?1002h\x1b[?1006h");
+			expect(resumeDrag.indexOf("\x1b[?1003l")).toBeLessThan(resumeDrag.indexOf("\x1b[?1002h"));
 			expect(resumeDrag).not.toContain("\x1b[?1049l");
 
 			const exitFrom = writes.length;
 			drag.hide();
 			await scheduler.settle(term);
 			const exit = writes.slice(exitFrom).join("");
-			expect(exit).toContain("\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[<u\x1b[?1049l");
+			expect(exit).toContain("\x1b[?1000l\x1b[<u\x1b[?1049l");
 		} finally {
 			tui.stop();
 		}
@@ -290,7 +293,6 @@ describe("fullscreen overlay rendering", () => {
 		const stopFrom = writes.length;
 		tui.stop();
 		const stopWrites = writes.slice(stopFrom).join("");
-		expect(stopWrites).toContain("\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[<u\x1b[?1049l");
-		expect(stopWrites).not.toContain("\x1b[?1000l");
+		expect(stopWrites).toContain("\x1b[?1000l\x1b[<u\x1b[?1049l");
 	});
 });

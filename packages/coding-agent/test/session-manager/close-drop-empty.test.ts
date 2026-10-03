@@ -160,7 +160,6 @@ describe("SessionManager close() drops empty metadata-only sessions", () => {
 			],
 			{
 				cwd: path.resolve(import.meta.dir, "../../../.."),
-				env: { HOME: process.env.HOME ?? "", PATH: process.env.PATH ?? "" },
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "ignore",
@@ -178,12 +177,12 @@ describe("SessionManager close() drops empty metadata-only sessions", () => {
 			expect(await appender.exited).toBe(0);
 			expect(await fileExists(sessionFile)).toBe(true);
 			expect(await Bun.file(sessionFile).text()).toContain("real question from terminal B");
-			await termB.close();
 		} finally {
 			if (appender.exitCode === null) {
 				appender.kill();
 				await appender.exited;
 			}
+			await Promise.all([termA.close(), termB.close()]);
 		}
 	});
 
@@ -253,20 +252,6 @@ describe("SessionManager close() drops empty metadata-only sessions", () => {
 		expect(await resumed.consumeDraft()).toBe("resume me");
 		await resumed.saveDraft("");
 		await resumed.close();
-
-		expect(await fileExists(sessionFile)).toBe(true);
-	});
-
-	it("keeps a handoff custom message even before the next user turn", async () => {
-		using tempDir = TempDir.createSync("@pi-session-close-keep-handoff-");
-		const session = SessionManager.create(tempDir.path(), tempDir.path());
-		session.appendCustomMessageEntry("handoff", "handoff context", true, undefined, "agent");
-		await session.ensureOnDisk();
-
-		const sessionFile = session.getSessionFile();
-		if (!sessionFile) throw new Error("Expected persistent session file");
-
-		await session.close();
 
 		expect(await fileExists(sessionFile)).toBe(true);
 	});

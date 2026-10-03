@@ -186,12 +186,12 @@ describe("read-only session blob hydration", () => {
 	});
 
 	it("bounds simultaneous blob reads inside one large message", async () => {
-		using dir = TempDir.createSync("@message-hydration-limit-");
-		const store = new BlobStore(path.join(dir.path(), "blobs"));
-		const blob = await store.put(Buffer.from("image"));
+		// Isolate the concurrency limit from 48 filesystem reads on the temp volume.
+		const store = new BlobStore("unused");
+		const blobRef = `blob:sha256:${"0".repeat(64)}`;
 		const images = Array.from({ length: 48 }, () => ({
 			type: "image" as const,
-			data: blob.ref,
+			data: blobRef,
 			mimeType: "image/png",
 		}));
 		const entry: SessionMessageEntry = {
@@ -201,15 +201,15 @@ describe("read-only session blob hydration", () => {
 			timestamp,
 			message: { role: "user", content: images, timestamp: 0 },
 		};
-		const get = store.get.bind(store);
+		const image = Buffer.from("image");
 		let active = 0;
 		let peak = 0;
-		const readSpy = spyOn(store, "get").mockImplementation(async hash => {
+		const readSpy = spyOn(store, "get").mockImplementation(async () => {
 			active++;
 			peak = Math.max(peak, active);
 			try {
-				await Bun.sleep(1);
-				return await get(hash);
+				await Promise.resolve();
+				return image;
 			} finally {
 				active--;
 			}
@@ -217,7 +217,7 @@ describe("read-only session blob hydration", () => {
 		try {
 			await resolveBlobRefsInEntries([entry], store);
 			expect(peak).toBeLessThanOrEqual(8);
-			expect(images.map(image => image.data)).toEqual(Array(48).fill(Buffer.from("image").toString("base64")));
+			expect(images.map(image => image.data)).toEqual(Array(48).fill(image.toString("base64")));
 		} finally {
 			readSpy.mockRestore();
 		}

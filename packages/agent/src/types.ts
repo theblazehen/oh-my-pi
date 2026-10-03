@@ -172,11 +172,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model;
 
 	/**
-	 * When to interrupt tool execution for steering messages.
-	 * - "immediate" = watch every tool batch (default)
-	 * - "blocking" = watch only batches containing a hard-interruptible or
-	 *   cooperatively yieldable call; skip only passive waits, preserving work
-	 * - "wait" = defer steering until the current turn completes
+	 * When queued steering may interrupt tool execution.
+	 * - "immediate" = watch every batch; hard-abort only interruptible waits,
+	 *   while other tools receive a cooperative signal.
+	 * - "blocking" = watch batches with an interruptible wait or a
+	 *   `steeringYieldable`/reserved-yield call; leave unrelated work running.
+	 * - "wait" = watch batches with interruptible waits; queued steering aborts
+	 *   only those waits, with no cooperative signal for ordinary work.
 	 */
 	interruptMode?: ToolInterruptMode;
 
@@ -264,10 +266,10 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Returns steering messages to inject into the conversation mid-run.
 	 *
-	 * Called at injection boundaries only (loop start and after a tool batch
-	 * fully settles), so dequeued messages are immediately injected. The
-	 * mid-batch interrupt poll uses {@link hasSteeringMessages} instead and
-	 * never consumes the queue.
+	 * Called at injection boundaries (loop start and after tool batches settle) when
+	 * the loop itself drains the queue. Providers that support live steering may
+	 * also take messages during a response. Mid-batch interrupt polls use
+	 * {@link hasSteeringMessages} and never consume the queue.
 	 */
 	getSteeringMessages?: (signal?: AbortSignal) => Promise<AgentMessage[]>;
 
@@ -279,7 +281,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * `"blocking"` watches only batches with an `interruptible`, statically or
 	 * dynamically `steeringYieldable`, or successfully reserved cooperative-yield
 	 * call and skips only not-yet-started passive waits, preserving ordinary and
-	 * cooperative work; `"wait"` watches none. The queue keeps
+	 * cooperative work; `"wait"` watches only batches with interruptible calls
+	 * and aborts those waits without signaling ordinary work. The queue keeps
 	 * owning its messages until the loop reaches the next injection boundary and
 	 * dequeues via {@link getSteeringMessages} — so callers can still cancel or
 	 * restore queued messages while in-flight tools settle, and an external
@@ -301,6 +304,14 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * {@link getSteeringMessages}.
 	 */
 	waitForSteeringMessages?: (signal?: AbortSignal) => Promise<void>;
+
+	/**
+	 * Called when live steering dequeues messages via {@link getSteeringMessages}
+	 * for the response being streamed. The loop records them in the transcript
+	 * after that response (or its tool batch); an abort before then leaves them
+	 * unrecorded for the host to requeue.
+	 */
+	onLiveSteeringTaken?: (messages: AgentMessage[]) => void;
 
 	/**
 	 * Peeks whether IRC messages should interrupt a watched tool batch.
@@ -356,8 +367,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Use for late-bound UI or session state access. The loop passes the tool
 	 * call's {@link ToolCallContext}; hosts that support passive tool context
 	 * surface its `addAdditionalContext` sink as
-	 * {@link AgentToolContext.addAdditionalContext}. The returned object is
-	 * handed to the tool as-is.
+	 * {@link AgentToolContext.addAdditionalContext}. The returned object is passed
+	 * without cloning; loop-owned `toolCall` metadata is attached in place.
 	 */
 	getToolContext?: (toolCall?: ToolCallContext) => AgentToolContext | undefined;
 
@@ -591,6 +602,14 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	transformAssistantMessage?: (message: AssistantMessage, signal?: AbortSignal) => Promise<void> | void;
 
 	/**
+	 * Declares that {@link transformAssistantMessage} never rewrites or removes a
+	 * tool call the model streamed (it may edit text or append new calls). Stream
+	 * speculation sessions and direct speculative candidates plan from streamed
+	 * calls, so they stay disabled under a transform unless this is set.
+	 */
+	transformAssistantMessagePreservesToolCalls?: boolean;
+
+	/**
 	 * Called after a tool finishes executing, before `tool_execution_end` and the
 	 * tool-result message are emitted.
 	 *
@@ -640,9 +659,9 @@ export interface ToolCallContext {
 	/** Provider-native metadata for the current call, when present. */
 	providerMetadata?: ToolCallProviderMetadata;
 	/**
-	 * Cooperative steering signal: aborted when a queued user/steering message
-	 * (or an interrupting peer IRC) is detected while this tool batch runs.
-	 * Unlike the hard abort signal it NEVER kills the tool — long-running
+	 * Cooperative steering signal: when the interrupt mode enables soft
+	 * interrupts, this aborts if queued steering (or an interrupting peer IRC)
+	 * is detected while the batch runs. It NEVER kills the tool — long-running
 	 * tools MAY observe it (via `ctx.toolCall.steeringSignal`) to finish early
 	 * or background themselves so the message injects promptly; ignoring it is
 	 * always safe (the message injects at the next batch boundary).
@@ -749,7 +768,22 @@ export interface SpeculativeExecutionHost {
 		commitDefault: () => Promise<AgentToolResult<unknown>>,
 	): Promise<SpeculativeCommitDecision>;
 	discard?(context: SpeculativeDiscardContext): void | Promise<void>;
+	/**
+	 * Authorize a stream session to start effectful work (e.g. subagents) from
+	 * partially streamed arguments. The session owns that work and must abort it
+	 * when the finalized call is invalid, blocked, or changed. Hosts without this
+	 * hook deny every launch.
+	 */
+	authorizeLaunch?(context: SpeculativeLaunchContext): SpeculativeAuthorization | Promise<SpeculativeAuthorization>;
 	close?(reason: string): void | Promise<void>;
+}
+
+/** Effectful work a tool-owned stream session asks to start before its outer call dispatches. */
+export interface SpeculativeLaunchContext {
+	tool: SpeculativeToolReference;
+	toolCall: AgentToolCall;
+	/** Arguments the launch was planned from: the streamed prefix of the outer call. */
+	args: Readonly<Record<string, unknown>>;
 }
 
 export interface ToolSpeculationStreamContext {
@@ -798,6 +832,8 @@ export interface ToolSpeculationStreamSession {
 export interface SpeculativeOperationSink {
 	readonly maxInFlight: number;
 	admit(definition: SpeculativeChildDefinition): Promise<SpeculativeChildHandle | undefined>;
+	/** Host-gated permission for effectful stream work; see {@link SpeculativeExecutionHost.authorizeLaunch}. */
+	authorizeLaunch?(context: SpeculativeLaunchContext): Promise<SpeculativeAuthorization>;
 	discardChildren?(parentToolCallId: string, reason: string): void | Promise<void>;
 	close(reason: string): void | Promise<void>;
 }
@@ -859,7 +895,8 @@ export interface SpeculativeToolExecutionConfig {
  * ignored when `block` is true.
  *
  * Set `additionalContext` to attach passive model-visible context to this call.
- * Non-empty values from a tool batch are injected in assistant tool-call order
+ * Non-empty values from a tool batch are injected in assistant tool-call order,
+ * a value identical to an earlier one in the batch only once,
  * after every result settles and before the next provider request. It is
  * dropped when the call is blocked or skipped, or when its final result is an
  * error (including an approval denial raised by the tool's own gate). Within a
@@ -889,6 +926,13 @@ export interface AfterToolCallResult {
 	isError?: boolean;
 	/** If provided, replaces the contextually-useless flag carried with the tool result. */
 	useless?: boolean;
+	/**
+	 * Trusted post-tool instructions for the next provider request. Delivered
+	 * outside the tool result, after all calls in the batch settle. Unlike
+	 * `BeforeToolCallResult.additionalContext`, this is retained for error
+	 * results because the callback receives the finalized outcome.
+	 */
+	additionalContext?: string;
 }
 
 /** Context passed to `beforeToolCall`. */
@@ -1122,7 +1166,7 @@ export interface AgentTool<
 	 * before ordinary dispatch commits its result.
 	 */
 	speculation?: ToolSpeculationPolicy;
-	/** If true, argument validation errors are non-fatal: raw args are passed to execute() instead of returning an error to the LLM. */
+	/** If true, schema validation errors are non-fatal: raw args are passed to execute() instead of returning an error to the LLM. Malformed argument JSON still returns the parse error. */
 	lenientArgValidation?: boolean;
 	/**
 	 * Whether the agent loop may hard-abort this tool mid-execution or skip it

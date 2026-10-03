@@ -39,6 +39,7 @@ import {
 	getStreamingPartialJson,
 	kCursorExecResolved,
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import { schemaDefinesProperty } from "@oh-my-pi/pi-ai/utils/schema/json-schema-validator";
 import { stamp } from "@oh-my-pi/pi-ai/utils/schema/stamps";
 import {
 	createHarmonyAuditEvent,
@@ -50,7 +51,7 @@ import {
 	recoverHarmonyToolCall,
 	signalListLabel,
 } from "@oh-my-pi/pi-ai/utils/harmony-leak";
-import { logger, sanitizeText, structuredCloneJSON } from "@oh-my-pi/pi-utils";
+import { cloneJsonTree, logger, sanitizeText, structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { LiveSteeringChannel } from "./live-steering";
 import { agentPauseGate } from "./pause";
@@ -63,7 +64,7 @@ import {
 	finishExecuteToolSpan,
 	finishInvokeAgentSpan,
 	fireOnRunEnd,
-	PiGenAIAttr,
+	OmpGenAIAttr,
 	recordSkippedTool,
 	resolveTelemetry,
 	runInActiveSpan,
@@ -379,13 +380,17 @@ function snapshotAssistantContentBlock(block: AssistantContentBlock): AssistantC
 		case "redactedThinking":
 			return { ...block };
 		case "anthropicServerTool":
-			return { ...block, block: structuredCloneJSON(block.block) };
+			return { ...block, block: cloneJsonTree(block.block) };
 		case "fallback":
 			return { ...block, from: { ...block.from }, to: { ...block.to } };
 		case "toolCall": {
 			const snap = {
 				...block,
-				arguments: structuredCloneJSON(block.arguments),
+				// Providers mutate streaming arguments in place (owned-stream, GLM)
+				// as well as replacing them, so containers are always copied; the
+				// strings inside are immutable and shared, keeping the per-delta
+				// cost independent of the argument payload size.
+				arguments: cloneJsonTree(block.arguments),
 				providerMetadata: snapshotToolCallProviderMetadata(block.providerMetadata),
 			};
 			// Object spread copies enumerable symbols in Bun, but the Cursor
@@ -1025,6 +1030,13 @@ function resolveIntentMode(intent: AgentTool["intent"]): "require" | "optional" 
 	return "require";
 }
 
+/**
+ * Longest `i` value accepted as an intent. The injected field is described as
+ * a "concise intent" (INTENT_FIELD_DESCRIPTION); anything past this is a tool
+ * payload the model put in the wrong field, not a label.
+ */
+const MAX_INTENT_LENGTH = 200;
+
 function extractIntent(args: Record<string, unknown>): { intent?: string; strippedArgs: Record<string, unknown> } {
 	const { [INTENT_FIELD]: intent, ...strippedArgs } = args;
 	if (typeof intent !== "string") {
@@ -1242,6 +1254,7 @@ async function runLoopBody(
 				config,
 				telemetry,
 				invokeAgentSpan,
+				[],
 			);
 			for (const result of executionResult.toolResults) {
 				currentContext.messages.push(result);
@@ -1614,6 +1627,7 @@ async function runLoopBody(
 						config,
 						telemetry,
 						invokeAgentSpan,
+						[...liveAccepted, ...liveDeferred],
 					);
 					toolResults.push(...executionResult.toolResults);
 
@@ -1796,6 +1810,27 @@ interface PreparedProviderCall {
 }
 
 /**
+ * Classify the first `count` steering messages for a tool-batch interrupt:
+ * any user-authored message wins, then agent-attributed user messages, else
+ * system steering (advisor cards, hidden directives). Shared by the agent's
+ * queue peek and the loop's live-taken steering.
+ */
+export function steeringQueueState(messages: readonly AgentMessage[], count = messages.length): SteeringQueueState {
+	if (count === 0) return { queued: false };
+	let hasAgentSteering = false;
+	for (let i = 0; i < count; i++) {
+		const message = messages[i];
+		const role = "role" in message ? message.role : undefined;
+		const attribution = "attribution" in message ? message.attribution : undefined;
+		if (attribution === "user") return { queued: true, source: "user" };
+		if (role !== "user") continue;
+		if (attribution !== "agent") return { queued: true, source: "user" };
+		hasAgentSteering = true;
+	}
+	return { queued: true, source: hasAgentSteering ? "agent" : "system" };
+}
+
+/**
  * Offer queued steering to a provider that can deliver it into the response it
  * is streaming. Latency decides whether steering lands before the model commits
  * to its next output, so claims convert only the steering batch — message-level
@@ -1813,7 +1848,11 @@ function openLiveSteering(
 	const bound = (signal: AbortSignal): AbortSignal => (loopSignal ? AbortSignal.any([signal, loopSignal]) : signal);
 	return new LiveSteeringChannel({
 		wait: signal => waitForSteeringMessages(bound(signal)),
-		take: signal => getSteeringMessages(bound(signal)),
+		take: async signal => {
+			const messages = await getSteeringMessages(bound(signal));
+			if (messages.length > 0) config.onLiveSteeringTaken?.(messages);
+			return messages;
+		},
 		toProvider: async (messages, signal) => {
 			const transformed = config.transformContext
 				? await config.transformContext(messages, bound(signal))
@@ -2062,6 +2101,8 @@ async function streamAssistantResponse(
 						signal: requestSignal,
 					})
 				: undefined;
+			const speculationPlansFromStream =
+				!config.transformAssistantMessage || config.transformAssistantMessagePreservesToolCalls === true;
 
 			let providerStreamSettled = false;
 			let speculationSettled = false;
@@ -2291,15 +2332,11 @@ async function streamAssistantResponse(
 						case "toolcall_delta":
 						case "toolcall_end":
 							if (partialMessage) {
-								if (
-									event.type === "toolcall_start" &&
-									speculationCoordinator &&
-									!config.transformAssistantMessage
-								) {
+								if (event.type === "toolcall_start" && speculationCoordinator && speculationPlansFromStream) {
 									// Stream sessions plan from pre-transform arguments, exactly like
 									// direct candidates (see admitFinalized below): with a transformer
-									// installed the authoritative call may differ, so any speculative
-									// work started from the original would be phantom I/O.
+									// that may rewrite calls, the authoritative call may differ, so any
+									// speculative work started from the original would be phantom I/O.
 									speculationCoordinator.register(event.contentIndex);
 									const toolCall = event.partial.content[event.contentIndex];
 									if (toolCall?.type === "toolCall") {
@@ -2396,7 +2433,7 @@ async function streamAssistantResponse(
 								event.type === "toolcall_end" &&
 								speculationCoordinator &&
 								speculationConfig &&
-								!config.transformAssistantMessage
+								speculationPlansFromStream
 							) {
 								speculationCoordinator.admitFinalized(context, event.toolCall, config, requestSignal);
 							}
@@ -2827,12 +2864,32 @@ async function prepareToolCallDispatch(
 		if (toolCall.type !== "toolCall") continue;
 		if ((toolCall as CursorExecResolvedCarrier)[kCursorExecResolved] === true) continue;
 		const tool = resolveToolForCall(context.tools, toolCall, resolveFallbackTool);
+		// A host fallback accepts aliases (`xd://recall`, a mis-separated MCP
+		// name) that providers reject when replayed as a function-call name.
+		// Record the call under the resolved tool's canonical name so history,
+		// persistence, and replay agree; custom-wire calls keep their wire name.
+		if (tool && toolCall.name !== tool.name && toolCall.name !== tool.customWireName) {
+			toolCall.name = tool.name;
+		}
 		const entry: PreparedToolCall = { tool, args: toolCall.arguments as Record<string, unknown> };
 		prepared.set(toolCall.id, entry);
 		let argsForExecution = toolCall.arguments as Record<string, unknown>;
 		if (intentTracing) {
 			const { intent, strippedArgs } = extractIntent(toolCall.arguments);
 			argsForExecution = strippedArgs;
+			// A payload in `i` would be stripped and the tool run with the leftover
+			// args. Unknown tools fall through to the not-found error; a tool that
+			// owns `i` as a real parameter has nowhere else to put the value.
+			if (
+				intent !== undefined &&
+				intent.length > MAX_INTENT_LENGTH &&
+				tool &&
+				!schemaDefinesProperty(toolWireSchema(tool), INTENT_FIELD)
+			) {
+				entry.args = strippedArgs;
+				entry.validationErrorMessage = `\`${INTENT_FIELD}\` is a short intent label (at most ${MAX_INTENT_LENGTH} chars); the value you sent is ${intent.length} chars. The tool was not run. Put that content in the tool's own parameters and retry with a brief \`${INTENT_FIELD}\`.`;
+				continue;
+			}
 			if (intent) {
 				toolCall.intent = intent;
 			} else if (typeof tool?.intent === "function") {
@@ -2853,13 +2910,14 @@ async function prepareToolCallDispatch(
 				}
 				return validateToolArguments(tool, { ...toolCall, arguments: args });
 			} catch (validationError) {
-				if (tool?.lenientArgValidation) {
+				// Lenience covers schema mismatches; a parse failure has no args to hand over.
+				const parseFailed = "__parseError" in args;
+				if (tool?.lenientArgValidation && !parseFailed) {
 					const fallback = { ...args };
-					delete fallback.__parseError;
 					delete fallback.__rawJson;
 					return fallback;
 				}
-				entry.args = "__parseError" in args ? { __parseError: args.__parseError } : args;
+				entry.args = parseFailed ? { __parseError: args.__parseError } : args;
 				entry.validationErrorMessage =
 					validationError instanceof Error ? validationError.message : String(validationError);
 				return undefined;
@@ -2975,6 +3033,11 @@ async function speculativeFinalCalls(
 /**
  * Execute tool calls from an assistant message. Returns model-visible context
  * only after every result has settled, preserving assistant call order.
+ *
+ * `tool_execution_end` fires as each call settles so live UI updates promptly;
+ * result `message_start`/`message_end` events (which append to agent state and
+ * the persisted session) are held until every earlier call has a result, so
+ * history always pairs results in call order regardless of completion order.
  */
 async function executeToolCalls(
 	currentContext: AgentContext,
@@ -2984,6 +3047,9 @@ async function executeToolCalls(
 	config: AgentLoopConfig,
 	telemetry: AgentTelemetry | undefined,
 	invokeAgentSpan: Span | undefined,
+	// Steering the provider took off the queue during the response that emitted
+	// this batch; it injects at this batch's boundary like queued steering.
+	liveSteering: readonly AgentMessage[],
 ): Promise<{ toolResults: ToolResultMessage[]; additionalContext?: string }> {
 	const tools = currentContext.tools;
 	const {
@@ -3110,6 +3176,10 @@ async function executeToolCalls(
 	);
 	const watchBatchForInterrupts =
 		interruptMode === "immediate" || (interruptMode === "blocking" && batchCanYieldSafely);
+	// Wait mode still cuts short passive waits; it never soft-signals ordinary
+	// work or prepares cooperative-yield leases.
+	const watchQueuedSteering =
+		watchBatchForInterrupts || (interruptMode === "wait" && records.some(record => record.interruptible));
 
 	const checkAsideInterrupts = async (): Promise<void> => {
 		// Asides only fire once: an interrupt already recorded on interruptState
@@ -3153,7 +3223,10 @@ async function executeToolCalls(
 		// injection boundary below; polling it here would strand or drop messages.
 		let steeringQueued = false;
 		let steeringSource: SteeringInterruptSource | undefined;
-		if (watchBatchForInterrupts && hasSteeringMessages) {
+		if (watchBatchForInterrupts && liveSteering.length > 0) {
+			steeringQueued = true;
+			steeringSource = steeringQueueState(liveSteering).source;
+		} else if (watchQueuedSteering && hasSteeringMessages) {
 			const queuedState = await hasSteeringMessages();
 			if (typeof queuedState === "boolean") {
 				steeringQueued = queuedState;
@@ -3181,6 +3254,18 @@ async function executeToolCalls(
 			return;
 		}
 		await checkAsideInterrupts();
+	};
+
+	// Index of the first record whose result message has not been emitted yet.
+	let nextResultIndex = 0;
+	const flushResultMessages = (): void => {
+		for (; nextResultIndex < records.length; nextResultIndex++) {
+			const message = records[nextResultIndex].toolResultMessage;
+			if (!message) return;
+			emittedToolResults.push(message);
+			stream.push({ type: "message_start", message });
+			stream.push({ type: "message_end", message });
+		}
 	};
 
 	const emitToolResult = (record: (typeof records)[number], result: AgentToolResult<any>, isError: boolean): void => {
@@ -3218,10 +3303,7 @@ async function executeToolCalls(
 		record.isError = isError;
 		record.toolResultMessage = toolResultMessage;
 		record.resultEmitted = true;
-		emittedToolResults.push(toolResultMessage);
-
-		stream.push({ type: "message_start", message: toolResultMessage });
-		stream.push({ type: "message_end", message: toolResultMessage });
+		flushResultMessages();
 	};
 
 	const releaseSteeringYieldLease = (record: (typeof records)[number]): void => {
@@ -3299,7 +3381,7 @@ async function executeToolCalls(
 				parent: invokeAgentSpan,
 			});
 			if (toolSpan && toolCall.intent) {
-				toolSpan.setAttribute(PiGenAIAttr.ToolCallIntent, toolCall.intent);
+				toolSpan.setAttribute(OmpGenAIAttr.ToolCallIntent, toolCall.intent);
 			}
 
 			let result: AgentToolResult<any> = { content: [], details: {} };
@@ -3358,10 +3440,28 @@ async function executeToolCalls(
 							},
 						};
 						const appToolContext = getToolContext?.(loopToolCallContext);
-						const toolContext: AgentToolContext =
-							appToolContext?.toolCall === loopToolCallContext
+						// Reuse complete host contexts; a per-call facade keeps inherited
+						// methods and getters on their original branded instance.
+						const toolContext =
+							appToolContext?.toolCall === loopToolCallContext && !streamSession
 								? appToolContext
-								: ({ ...appToolContext, toolCall: loopToolCallContext } as AgentToolContext);
+								: appToolContext
+									? new Proxy({ ...appToolContext, toolCall: loopToolCallContext } as AgentToolContext, {
+											get(target, property, receiver) {
+												if (Object.hasOwn(target, property)) return Reflect.get(target, property, receiver);
+												const value = Reflect.get(appToolContext, property, appToolContext);
+												if (typeof value !== "function") return value;
+												const bound = value.bind(appToolContext);
+												Object.defineProperty(target, property, {
+													value: bound,
+													configurable: true,
+													writable: true,
+												});
+												return bound;
+											},
+											getPrototypeOf: () => Object.getPrototypeOf(appToolContext),
+										})
+									: ({ toolCall: loopToolCallContext } as AgentToolContext);
 						if (streamSession) toolContext[SPECULATIVE_STREAM_SESSION] = streamSession;
 						executionStarted = true;
 						let rawResult: unknown;
@@ -3425,6 +3525,9 @@ async function executeToolCalls(
 							});
 							result = coerced.result;
 							isError = coerced.malformed || (after.isError ?? isError);
+							if (isNonBlankContext(after.additionalContext)) {
+								record.reportedContext.push(after.additionalContext);
+							}
 						}
 					} catch (e) {
 						caughtError = e;
@@ -3491,10 +3594,12 @@ async function executeToolCalls(
 	const hasAsidePeek = hasIrcInterrupts !== undefined || hasBackgroundCompletions !== undefined;
 	const watchAsideInterrupts = watchBatchForInterrupts || records.some(record => record.interruptible);
 	const watchInterruptsWhileRunning =
-		(watchBatchForInterrupts && (hasSteeringMessages !== undefined || hasIrcInterrupts !== undefined)) ||
-		(watchAsideInterrupts && hasAsidePeek);
+		(watchQueuedSteering && hasSteeringMessages !== undefined) || (watchAsideInterrupts && hasAsidePeek);
+	// Live-taken steering is already pending: interrupt before any call starts
+	// so not-yet-started interruptible waits are skipped outright.
+	if (watchBatchForInterrupts && liveSteering.length > 0) await checkSteering();
 	const eventDrivenSteeringWatch =
-		watchBatchForInterrupts && config.waitForSteeringMessages !== undefined && hasSteeringMessages !== undefined;
+		watchQueuedSteering && config.waitForSteeringMessages !== undefined && hasSteeringMessages !== undefined;
 	const steeringWatchAbortController = new AbortController();
 	const steeringWatchSignal = signal
 		? AbortSignal.any([signal, steeringWatchAbortController.signal])

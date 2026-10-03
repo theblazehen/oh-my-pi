@@ -8,12 +8,11 @@ if (!sessionPath || !deleteAttemptPath) throw new Error("Expected session and de
 const fd = fs.openSync(sessionPath, "a");
 try {
 	withFileLockSync(sessionPath, () => {
-		process.stdout.write("ready\n");
+		fs.writeSync(1, "ready\n");
 		const deadline = Date.now() + 10_000;
 		while (!fs.existsSync(deleteAttemptPath)) {
 			if (Date.now() >= deadline) throw new Error("Timed out waiting for conditional delete attempt");
-			// Cross-process lock integration requires the child to hold ownership until
-			// the parent reaches the competing critical section.
+			// Hold ownership until the parent reaches the competing critical section.
 			Bun.sleepSync(1);
 		}
 		fs.writeSync(

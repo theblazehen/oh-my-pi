@@ -314,7 +314,11 @@ export function buildSessionHistoryHotWindow(
 	let compactionCount = 0;
 	let hasAssistantHistory = false;
 	for (const entry of entries) {
-		addUsage(fullUsage, entryUsage(entry));
+		const usage = entryUsage(entry);
+		addUsage(fullUsage, usage);
+		if (usage && entry.type === "message" && entry.message.role === "toolResult") {
+			fullUsage.subagentCost += usage.cost.total;
+		}
 		if (entry.type === "compaction") compactionCount++;
 		if (entry.type === "message" && entry.message.role === "assistant") hasAssistantHistory = true;
 	}

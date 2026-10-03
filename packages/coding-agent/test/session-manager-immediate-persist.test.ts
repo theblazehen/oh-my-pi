@@ -6,6 +6,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { MemorySessionStorage, type WriteTextAtomicOptions } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { parseJsonlLenient, TempDir } from "@oh-my-pi/pi-utils";
 
+const sessionManagers: SessionManager[] = [];
 const tempDirs: TempDir[] = [];
 
 function makeTempDir(prefix: string): string {
@@ -14,8 +15,23 @@ function makeTempDir(prefix: string): string {
 	return dir.path();
 }
 
+function trackSessionManager(manager: SessionManager): SessionManager {
+	sessionManagers.push(manager);
+	return manager;
+}
+
+// Release held writers and session leases before removing NFS-backed temp dirs.
 afterEach(async () => {
+	const managers = sessionManagers.splice(0);
+	const results = await Promise.allSettled(managers.map(manager => manager.close()));
 	await Promise.all(tempDirs.splice(0).map(dir => dir.remove()));
+	const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+	if (failures.length > 0) {
+		throw new AggregateError(
+			failures.map(result => result.reason),
+			"Failed to close test session managers",
+		);
+	}
 });
 
 function assistantMessage(text: string) {
@@ -87,7 +103,7 @@ describe("SessionManager JSONL software-crash durability", () => {
 	it("makes completed entries visible on disk without a microtask or flush", () => {
 		const cwd = makeTempDir("@pi-immediate-cwd-");
 		const sessionDir = path.join(cwd, "sessions");
-		const manager = SessionManager.create(cwd, sessionDir);
+		const manager = trackSessionManager(SessionManager.create(cwd, sessionDir));
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected a persisted session file path");
 
@@ -135,7 +151,7 @@ describe("SessionManager JSONL software-crash durability", () => {
 	it("reopens post-checkpoint user/assistant/tool events after a crash-equivalent snapshot", async () => {
 		const cwd = makeTempDir("@pi-crash-reopen-cwd-");
 		const sessionDir = path.join(cwd, "sessions");
-		const manager = SessionManager.create(cwd, sessionDir);
+		const manager = trackSessionManager(SessionManager.create(cwd, sessionDir));
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected a persisted session file path");
 
@@ -163,7 +179,7 @@ describe("SessionManager JSONL software-crash durability", () => {
 		const crashPath = path.join(cwd, "crashed-session.jsonl");
 		fs.writeFileSync(crashPath, fs.readFileSync(sessionFile));
 
-		const reopened = await SessionManager.open(crashPath);
+		const reopened = trackSessionManager(await SessionManager.open(crashPath));
 		const reopenedKinds = reopened.getEntries().map(entry => {
 			if (entry.type === "message") return entry.message.role;
 			if (entry.type === "custom") return `custom:${entry.customType}`;
@@ -200,14 +216,14 @@ describe("SessionManager JSONL software-crash durability", () => {
 
 	it("rewrites a malformed resumed tail before appending another entry", async () => {
 		const cwd = makeTempDir("@pi-malformed-tail-cwd-");
-		const manager = SessionManager.create(cwd, path.join(cwd, "sessions"));
+		const manager = trackSessionManager(SessionManager.create(cwd, path.join(cwd, "sessions")));
 		manager.appendMessage(assistantMessage("seed"));
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected session file");
 		await manager.close();
 
 		fs.appendFileSync(sessionFile, '{"type":"message","id":"torn","message":{"role":"user","content":"lost');
-		const resumed = await SessionManager.open(sessionFile);
+		const resumed = trackSessionManager(await SessionManager.open(sessionFile));
 		resumed.appendMessage({ role: "user", content: "after resume", timestamp: Date.now() });
 
 		const entries = readJsonl(sessionFile);
@@ -242,7 +258,7 @@ describe("SessionManager JSONL software-crash durability", () => {
 	it("keeps pre-assistant sessions out of history during shutdown", async () => {
 		const cwd = makeTempDir("@pi-empty-session-cwd-");
 		const sessionDir = path.join(cwd, "sessions");
-		const manager = SessionManager.create(cwd, sessionDir);
+		const manager = trackSessionManager(SessionManager.create(cwd, sessionDir));
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected a persisted session file path");
 
@@ -262,7 +278,7 @@ describe("SessionManager JSONL software-crash durability", () => {
 	it("lets explicit rewrites materialize pre-assistant entries", async () => {
 		const cwd = makeTempDir("@pi-explicit-rewrite-cwd-");
 		const sessionDir = path.join(cwd, "sessions");
-		const manager = SessionManager.create(cwd, sessionDir);
+		const manager = trackSessionManager(SessionManager.create(cwd, sessionDir));
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected a persisted session file path");
 
@@ -302,7 +318,7 @@ describe("SessionManager JSONL software-crash durability", () => {
 		}
 
 		const storage = new PausedRewriteStorage();
-		const manager = SessionManager.create("/cwd", "/sessions", storage);
+		const manager = trackSessionManager(SessionManager.create("/cwd", "/sessions", storage));
 		manager.appendMessage(assistantMessage("seed"));
 		await manager.flush();
 		manager.appendMessage({ role: "user", content: "checkpoint", timestamp: Date.now() });
@@ -351,7 +367,7 @@ describe("SessionManager JSONL software-crash durability", () => {
 	it("alerts once and retries all in-memory entries after a transient write failure", () => {
 		const cwd = makeTempDir("@pi-write-fail-cwd-");
 		const sessionDir = path.join(cwd, "sessions");
-		const manager = SessionManager.create(cwd, sessionDir);
+		const manager = trackSessionManager(SessionManager.create(cwd, sessionDir));
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected session file");
 
@@ -392,7 +408,7 @@ describe("SessionManager JSONL software-crash durability", () => {
 	it("reparents metadata children when durably discarding an entry", async () => {
 		const cwd = makeTempDir("@pi-discard-metadata-cwd-");
 		const sessionDir = path.join(cwd, "sessions");
-		const manager = SessionManager.create(cwd, sessionDir);
+		const manager = trackSessionManager(SessionManager.create(cwd, sessionDir));
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected a persisted session file path");
 
@@ -402,7 +418,7 @@ describe("SessionManager JSONL software-crash durability", () => {
 		await manager.discardEntryDurably(discardedId);
 		await manager.close();
 
-		const reloaded = await SessionManager.open(sessionFile, sessionDir);
+		const reloaded = trackSessionManager(await SessionManager.open(sessionFile, sessionDir));
 		const branch = reloaded.getBranch();
 		expect(branch.some(entry => entry.id === discardedId)).toBe(false);
 		expect(branch).toContainEqual(expect.objectContaining({ id: serviceTierId, parentId: priorId }));
@@ -418,7 +434,7 @@ describe("SessionManager JSONL software-crash durability", () => {
 	it("persists a branch marker when a discarded entry has content children", async () => {
 		const cwd = makeTempDir("@pi-discard-content-cwd-");
 		const sessionDir = path.join(cwd, "sessions");
-		const manager = SessionManager.create(cwd, sessionDir);
+		const manager = trackSessionManager(SessionManager.create(cwd, sessionDir));
 		const sessionFile = manager.getSessionFile();
 		if (!sessionFile) throw new Error("Expected a persisted session file path");
 
@@ -432,7 +448,7 @@ describe("SessionManager JSONL software-crash durability", () => {
 		await manager.discardEntryDurably(discardedId);
 		await manager.close();
 
-		const reloaded = await SessionManager.open(sessionFile, sessionDir);
+		const reloaded = trackSessionManager(await SessionManager.open(sessionFile, sessionDir));
 		const branch = reloaded.getBranch();
 		expect(reloaded.getEntries()).toContainEqual(expect.objectContaining({ id: discardedId }));
 		expect(reloaded.getEntries()).toContainEqual(expect.objectContaining({ id: contentChildId }));

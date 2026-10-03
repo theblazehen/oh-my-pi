@@ -74,6 +74,7 @@ export async function selectSession<T extends SessionSelectorEntry>(
 					preview: options.preview ? host.createPreview?.() : undefined,
 					getTerminalRows: () => ui.terminal.rows,
 					fillHeight: true,
+					standalone: true,
 					title: options.title,
 					scopeLabel: options.scopeLabel,
 					showCwd: options.showCwd,

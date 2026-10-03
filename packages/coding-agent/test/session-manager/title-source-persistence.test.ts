@@ -8,9 +8,9 @@ import {
 	type SessionHeader,
 	TITLE_CHANGE_ENTRY_TYPE,
 } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { getConfigRootDir, removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 
 import { makeAssistantMessage } from "./helpers";
@@ -49,6 +49,7 @@ describe("session title source persistence", () => {
 	});
 
 	afterEach(async () => {
+		// Title changes open history.db under testAgentDir; Windows cannot delete an open file.
 		for (const manager of managers.splice(0).reverse()) await manager.close();
 		resetSessionIndexForTests();
 		if (originalAgentDir) {

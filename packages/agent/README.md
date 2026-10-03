@@ -257,6 +257,10 @@ only not-yet-started passive waits are skipped: ordinary, yieldable, and reserve
 mixed batch. In `"immediate"` mode, all not-yet-started calls are skipped. Messages are injected after the batch settles. A
 `prepareSteeringYield` lease must make `release()` idempotent so cleanup remains safe after the tool consumes it.
 
+Hosts can use `setQueuedMessageGrouping((previous, next) => boolean)` to keep adjacent companion
+records and their prompt together in `one-at-a-time` mode. Without a grouping predicate, records
+remain separate. `replaceQueue("steering" | "followUp", messages)` replaces only the selected queue.
+
 ## Custom Message Types
 
 Extend `AgentMessage` via declaration merging:
@@ -468,7 +472,7 @@ const runCoverage = aggregateAgentRunCoverage(coverages);
 
 ### Tool status reporting
 
-`execute_tool` spans carry `pi.gen_ai.tool.status` ∈
+`execute_tool` spans carry `omp.gen_ai.tool.status` ∈
 `"ok" | "error" | "skipped" | "blocked" | "timeout" | "aborted"`.
 `beforeToolCall` blocks throw a distinguishable `ToolCallBlockedError`
 internally; the catch path reports `status: "blocked"` instead of conflating
