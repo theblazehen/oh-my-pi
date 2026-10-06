@@ -256,9 +256,10 @@ pub fn levenshtein_distance(a: &str, b: &str) -> usize {
 	levenshtein_chars(&a_chars, &b_chars)
 }
 
-/// [`levenshtein_distance`] over pre-collected chars when it is at most
-/// `max`, else `None`. Only the `2·max + 1` diagonals that can stay within
-/// `max` are computed, so the cost is O(len·max) instead of O(len²).
+/// [`levenshtein_distance`] over pre-collected chars, or `None` above `max`.
+///
+/// Only the `2·max + 1` diagonals that can stay within `max` are computed,
+/// so the cost is O(len·max) instead of O(len²).
 pub fn levenshtein_within(a: &[char], b: &[char], max: usize) -> Option<usize> {
 	if a == b {
 		return Some(0);
@@ -490,7 +491,8 @@ fn find_exact_match_outcome(
 			let line_number = content[..index]
 				.bytes()
 				.filter(|byte| *byte == b'\n')
-				.count() + 1;
+				.count()
+				+ 1;
 			occurrence_lines.push(line_number as u32);
 			occurrence_previews.push(format_preview_window(&content_lines, line_number - 1));
 		}
