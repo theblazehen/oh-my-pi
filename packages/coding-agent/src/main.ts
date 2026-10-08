@@ -2455,6 +2455,10 @@ export async function runRootCommand(
 			}
 
 			const modelRegistryError = modelRegistry.getError();
+			for (const warning of modelRegistry.drainConfigWarnings()) {
+				if (isInteractive) notifs.push({ kind: "warn", message: warning });
+				else process.stderr.write(`${chalk.yellow(`Warning: ${warning}`)}\n`);
+			}
 			if (modelRegistryError) {
 				notifs.push({ kind: "error", message: modelRegistryError.message });
 			}
