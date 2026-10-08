@@ -498,7 +498,7 @@ export class Agent {
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
 	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
-	#onModelCallSystemPrompt?: (systemPrompt: string[]) => void;
+	#onModelCallSystemPrompt?: (systemPrompt: string[]) => void | Promise<void>;
 	#beforeModelCall?: AgentBeforeModelCall;
 	#additionalBeforeModelCalls = new Set<AgentBeforeModelCall>();
 	#asideMessageProvider?: () => AsideMessage[] | Promise<AsideMessage[]>;
@@ -1146,8 +1146,8 @@ export class Agent {
 		this.#onTurnEnd = fn;
 	}
 
-	/** Called with the exact system prompt each model call is built from, after before-model-call hooks. */
-	setOnModelCallSystemPrompt(fn: ((systemPrompt: string[]) => void) | undefined): void {
+	/** Called with the exact prompt after before-model-call hooks; async callbacks are awaited before the request. */
+	setOnModelCallSystemPrompt(fn: ((systemPrompt: string[]) => void | Promise<void>) | undefined): void {
 		this.#onModelCallSystemPrompt = fn;
 	}
 
@@ -1850,7 +1850,7 @@ export class Agent {
 					await Bun.sleep(0);
 				}
 				context.systemPrompt = this.#state.systemPrompt;
-				this.#onModelCallSystemPrompt?.(context.systemPrompt);
+				await this.#onModelCallSystemPrompt?.(context.systemPrompt);
 				context.tools = this.#toolsForModel(this.#state.model ?? model);
 			},
 			beforeModelCall:
@@ -2120,8 +2120,19 @@ export class Agent {
 				turnOpen = false;
 				this.#emit({ type: "agent_end", messages: agentEndMessages });
 			} else {
+				// Context hooks can reject on abort before provider streaming starts.
+				// Publish the boundary just like a streaming abort so subscribers can
+				// persist it and recover the interrupted turn after a reload.
+				if (!turnOpen) this.#emit({ type: "turn_start" });
+				if (!hadAssistantStart) {
+					this.#state.streamMessage = errorMsg;
+					this.#emit({ type: "message_start", message: errorMsg });
+				}
+				this.#state.streamMessage = null;
 				this.appendMessage(errorMsg);
 				this.#state.error = errorMessage;
+				this.#emit({ type: "message_end", message: errorMsg });
+				this.#emit({ type: "turn_end", message: errorMsg, toolResults: [] });
 				this.#emit({ type: "agent_end", messages: [errorMsg] });
 			}
 		} finally {

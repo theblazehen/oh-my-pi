@@ -5,10 +5,23 @@
 ### Changed
 
 - Integrated blocking and wait steering policies with protected non-interruptible tool execution and cooperative yield reservations.
+- Agent.setOnModelCallSystemPrompt now awaits asynchronous callbacks before building the model call.
 
 ### Fixed
 
 - Preserved configurable native-compaction timeouts and conservative custom/developer-message accounting when preparing forked context.
+## [18.8.0] - 2026-10-07
+
+### Changed
+
+- Improved performance when pruning tool output and capturing telemetry messages during long-running sessions.
+
+## [18.7.0] - 2026-10-06
+
+### Fixed
+
+- Fixed interrupted runs so assistant message boundaries are emitted reliably, allowing subscribers to persist and recover the interrupted turn.
+
 ## [18.6.3] - 2026-10-06
 
 ### Breaking Changes

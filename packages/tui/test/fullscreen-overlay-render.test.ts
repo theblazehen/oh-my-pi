@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import {
 	type Component,
+	type Focusable,
 	CURSOR_MARKER,
 	ImageProtocol,
 	renderKittyPlaceholderLines,
@@ -11,12 +12,15 @@ import {
 import { VirtualTerminal } from "./virtual-terminal";
 import { VirtualRenderScheduler } from "./virtual-render-scheduler";
 
-class MutableLinesComponent implements Component {
+class MutableLinesComponent implements Component, Focusable {
 	#lines: string[];
+	focused = false;
 
 	constructor(lines: string[]) {
 		this.#lines = [...lines];
 	}
+
+	setUseTerminalCursor(_useTerminalCursor: boolean): void {}
 
 	setLines(lines: string[]): void {
 		this.#lines = [...lines];

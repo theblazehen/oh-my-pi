@@ -279,6 +279,8 @@ describe("AgentTranscriptViewer", () => {
 	});
 
 	afterEach(() => {
+		// A leaked fs spy would make the next test's sync first load recurse and fail.
+		vi.restoreAllMocks();
 		vi.useRealTimers();
 		if (rowsDesc) {
 			Object.defineProperty(process.stdout, "rows", rowsDesc);
@@ -628,6 +630,35 @@ describe("AgentTranscriptViewer", () => {
 		} finally {
 			openSpy.mockRestore();
 			vi.useRealTimers();
+			viewer.dispose();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("reloads a rewrite that keeps the file size and mtime within a few idle polls", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "adv-view-"));
+		const file = path.join(dir, "__advisor.jsonl");
+		fs.writeFileSync(file, `${buildJsonl()}${messageLine("same", "OLDMARKER")}\n`);
+		const original = fs.statSync(file);
+		let reloadComplete: { resolve: () => void } | undefined;
+		const viewer = makeViewer(file, undefined, undefined, () => reloadComplete?.resolve());
+		try {
+			const body = () =>
+				viewer
+					.render(80)
+					.map(l => Bun.stripANSI(l))
+					.join("\n");
+			expect(body()).toContain("OLDMARKER");
+			fs.writeFileSync(file, `${buildJsonl()}${messageLine("same", "NEWMARKER")}\n`);
+			fs.utimesSync(file, original.atime, original.mtime);
+			const open = vi.spyOn(fs.promises, "open");
+			const reloaded = Promise.withResolvers<void>();
+			reloadComplete = { resolve: reloaded.resolve };
+			vi.advanceTimersByTime(250 * 5);
+			expect(open).toHaveBeenCalled();
+			await reloaded.promise;
+			expect(body()).toContain("NEWMARKER");
+		} finally {
 			viewer.dispose();
 			fs.rmSync(dir, { recursive: true, force: true });
 		}

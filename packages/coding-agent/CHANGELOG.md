@@ -12,15 +12,87 @@
 ### Removed
 
 - Removed forked task contexts and the task `source` option; subagents start fresh while ordinary session forks remain available.
+## [18.8.0] - 2026-10-07
+
 ### Added
 
-- RPC clients can log out like `/logout`: `get_logout_accounts` lists a provider's stored credentials and `logout` removes one; the TypeScript client and the generated Python, Go, and Rust SDKs gain matching methods ([#14588](https://github.com/can1357/oh-my-pi/pull/14588) by [@andrebrait](https://github.com/andrebrait))
+- Write-tool previews now render as files stream: SVG files appear as images, and Mermaid files (`.mmd` and `.mermaid`) appear as diagrams. Tern also previews supported 3D model formats (`.obj`, `.ply`, `.wrl`, `.x3dv`, `.stl`, `.gltf`, and `.usda`) and renders SVG writes as SVG figures.
+- Added the `title.icons` setting to show session title cards with a Nerd Font glyph and emoji fallback (`nf+emoji`, default), always the emoji (`emoji`), or as plain titles (`boring`).
+- Added the `title.generator` setting to name sessions from a fork of the reply (`fork`, default) or with the title model only (`tiny`).
+
+### Changed
+
+- Session titles are generated using the session's model when possible, with a fallback to the lightweight title model; `TITLE_SYSTEM.md` continues to override the title prompt.
+- Session titles now include a card index, icon, and short code, with appropriate Nerd Font rendering in Tern panes.
+- When Nerd Font symbols are unavailable, session titling requests only an emoji.
+- Subagent completion indicators now advance to 99% when the subagent submits its result.
+- In Tern panes, headed and headless browser opens are shown in Tern picture-in-picture by default; set `app.tern: false`, `browser.tern`, or `PI_BROWSER_TERN=0` to open Chromium instead.
+- In Tern panes, `/fork` opens the fork in a neighboring pane while preserving the original session.
+- Tern's empty composer now shows the session title, or “What are we cooking?” when no title is available.
+- Tern todo cards now display their checklist by default and can be collapsed by clicking the card header.
+- Improved performance across browser extraction, web and document fetching, file tools, search, session handling, LSP/DAP, MCP, subagents, SSH file operations, image processing, voice and dictation, collaboration, and large-output or large-file workflows.
+- Prompt history search now updates shortly after typing stops while Enter and mouse selections use the latest query.
+- Improved responsiveness and reduced resource usage for long sessions, large files and documents, streaming evaluations, terminal graphics, live voice calls, and other high-volume workflows.
+- Hosts that are not supported Mastodon, Lemmy, or Discourse instances are no longer repeatedly probed for those services, improving URL-fetch performance.
 
 ### Fixed
 
-- Fixed `/logout` for an alias login such as `openai-codex-device` reporting no stored credentials; it now lists and removes the accounts stored under the provider it logs in to ([#14588](https://github.com/can1357/oh-my-pi/pull/14588) by [@andrebrait](https://github.com/andrebrait))
-- Fixed logging in through an alias login such as `openai-codex-device` (`/login` or RPC `login`) not refreshing the logged-in provider's models, and RPC `get_login_providers` reporting alias logins as unauthenticated ([#14588](https://github.com/can1357/oh-my-pi/pull/14588) by [@andrebrait](https://github.com/andrebrait))
-- Fixed model speed aggregates blending an OpenAI or Codex fast service tier's throughput into the standard average; turns served on a non-default tier keep their own row, and `/models` shows that tier's numbers, labeled, for the tier the live session would send ([#14471](https://github.com/can1357/oh-my-pi/pull/14471) by [@eggpeat](https://github.com/eggpeat)).
+- Fixed a message sent while an earlier title request was still running never getting its own try at naming the session when that request came back empty.
+- Fixed `/new` incorrectly carrying plan mode, its plan-specific model, or goal mode into the new session.
+- Fixed todo lists failing to auto-clear while subagents streamed progress.
+- Fixed memory growth during ACP client-terminal commands.
+- Fixed freezes after large pastes containing unclosed tags.
+- Fixed slowdowns when processing long evaluation output, large Python kernel results, compiler/linter output, and ephemeral side-channel replies.
+- Fixed documents served as `application/octet-stream` being downloaded twice.
+- Fixed collaboration guests rebuilding the transcript excessively during streaming.
+
+## [18.7.0] - 2026-10-06
+
+### Added
+
+- Added last-chance consumption of eligible banked Codex and Claude resets expiring within five minutes when auto-redeem is enabled, even with low usage or reserved credits.
+- Added inline rendering of agent-generated SVG diagrams, charts, and mockups, with theme-aware colors and a `tui.renderSvg` setting to disable it.
+- Added automatic chart generation for numeric tables, configurable with `tui.autoGraph` (`always`, `smart`, or `off`). The agent now chooses suitable visual formats—including charts, Mermaid, SVG, tables, or prose—based on the content. Charts and this guidance apply to the main TUI session only, not to subagents, print, RPC, or ACP.
+- Added first-class JSON and JSONL querying to the `read` tool with `?q=<jq-filter>`, including in-process filtering, raw or compact output, and offset/limit pagination for efficient large-file access.
+- Added `/prewalk off` to cancel a pending model handoff without changing the active model, saved prewalk setting, or continuation history.
+- Added logout support to RPC clients through `get_logout_accounts` and `logout`, with matching methods in the TypeScript, Python, Go, and Rust SDKs.
+- Added custom model-kind declarations for providers and extensions, allowing image, speech, embedding, judge, and other supported model roles to be registered and routed correctly.
+- Added working-directory reporting for Tern terminal sessions so the native composer bar can display the current folder.
+
+### Changed
+
+- Improved JSON and JSONL query streaming and pagination to reduce resource usage, support partial results, and provide clearer continuation between result pages.
+- Clarified the `read` tool documentation with complete examples for requesting line ranges.
+
+### Fixed
+
+- Fixed model-preset tests failing when provider credentials are configured in the environment.
+- Fixed unauthenticated Macs auto-selecting the on-device Apple model when the default prompt exceeds its context window; Apple remains selectable explicitly.
+- Fixed replay and compaction tests failing after bundled model roster changes.
+- Fixed standalone builds failing when the native addon archive could not be resolved.
+- Fixed JSON query parsing and parameter decoding for filters beginning with hyphens and other encoded query values.
+- Fixed task execution after settings could not be saved; subagents now use the current in-memory settings while the save failure is reported as a warning.
+- Fixed prewalk and model-recovery state across `/new`, handoffs, cancellations, and automatic recovery.
+- Fixed login, logout, model refresh, and provider-status reporting for aliased providers such as `openai-codex-device`.
+- Fixed model speed statistics mixing fast service-tier results into standard-tier averages; `/models` now reports the applicable tier separately.
+- Fixed the `write` and `edit` tools hanging or consuming excessive resources when given FIFOs, terminals, device files, or other non-regular targets; unsupported targets are now rejected safely.
+- Fixed long conversations losing user or tool-result images because assistant-generated images were counted against provider image limits.
+- Fixed local session paths for special session IDs such as `.` and `..` so they cannot escape the intended storage directory.
+- Fixed `omp gc --archive --apply` leaving orphaned session-title records behind.
+- Fixed `/retry` after an interrupted process exit while an extension-driven prompt was reopening.
+- Fixed browser relay sessions failing to discover or interact with cross-origin iframe content that loaded before the tab was opened.
+- Fixed browser clicks on visually styled radios and checkboxes whose underlying inputs are hidden.
+- Fixed `/model` failing to switch when selecting the model already assigned to a project's default role.
+- Fixed `wait` returning early when a background completion had already been consumed by another operation.
+- Fixed symlinked routing configurations failing to reload after their target links were replaced.
+- Fixed repeated coding-plan fallback confirmations in cases involving changing thinking settings, unavailable quota information, or account recovery.
+- Fixed Python evaluation failing when a shared runner temporary directory was created by another user.
+- Fixed RPC clients being unable to complete multi-select questions in multi-question `ask` prompts.
+- Corrected inaccurate tool and setting descriptions, including `read` ranges, background `bash` behavior, Python evaluation capabilities, edit replacement guidance, goal removal behavior, and `advisor.immuneTurns`.
+- Fixed custom glob backends hanging indefinitely; scans now honor tool deadlines and cancellation.
+- Fixed `--resume <path>` silently creating a new session when the specified path did not exist; it now reports the missing path.
+- Fixed `/settings` opening duplicate menus when invoked while the settings menu was already open.
+- Fixed native Git operations resolving repositories incorrectly when run through symbolic links.
 
 ## [18.6.3] - 2026-10-06
 
@@ -43,7 +115,6 @@
 - RPC `remove_queued_message` now returns the removed message's images, so clients can put an edited queued message back in the editor with its attachments ([#14179](https://github.com/can1357/oh-my-pi/pull/14179) by [@andrebrait](https://github.com/andrebrait))
 - Added `/btw` side questions for RPC hosts: `btw` asks one (or a follow-up in an earlier topic) while the main turn keeps running, the answer streams as `btw_delta` / `btw_record` frames, `btw_cancel` stops it, and `get_btw_history` lists the session's BTW history shared with the TUI ([#14110](https://github.com/can1357/oh-my-pi/pull/14110) by [@andrebrait](https://github.com/andrebrait))
 - Added the `providers.muse-code.storeResponses` setting (off by default; `PI_MUSE_STORE_RESPONSES` overrides it) to store Muse Code results on Meta's servers, so a turn whose connection drops is recovered instead of re-run ([#14534](https://github.com/can1357/oh-my-pi/pull/14534) by [@abilliontokens](https://github.com/abilliontokens)).
-- In Tern (`TERM_PROGRAM=tern`), omp reports its working directory (OSC 7) at start and whenever it changes, so Tern names the session's folder in the native composer bar
 
 ### Changed
 
@@ -60,7 +131,6 @@
 
 ### Fixed
 
-- Fixed `/settings` stacking a second settings menu over the first when run again while it was open or still opening; it focuses the open menu instead
 - Fixed Tern tooltips naming keys with Nerd Font icons Tern's UI font lacks (a box after "Thinking effort"); they show keycaps (`⇧⇥`) whatever the symbol preset
 - Fixed `/new`, session switches, and Esc aborts hanging for up to 30 seconds while an extension's `message_end` hook was still running; they now wait only for end-of-turn maintenance.
 - Fixed Tern's per-turn usage row showing a 24-hour time while the user message above it showed a 12-hour time; both now follow the terminal's clock ([#14565](https://github.com/can1357/oh-my-pi/pull/14565) by [@wolfiesch](https://github.com/wolfiesch))
@@ -122,7 +192,6 @@
 - Budget-stopped subagents no longer issue automatic retry requests after being reported cancelled; they remain available for explicit resumption ([#13892](https://github.com/can1357/oh-my-pi/issues/13892)).
 - Fixed switching models mid-session keeping the previous model's `inlineToolDescriptors: auto` decision, which sent empty tool descriptions to the new model and failed with `function.description is required` ([#14200](https://github.com/can1357/oh-my-pi/issues/14200))
 - Fixed advisors staying quota-paused when another account's temporary auth block ends at the retry wait limit ([#14551](https://github.com/can1357/oh-my-pi/issues/14551)).
-- Fixed native git operations started in a directory reached through a symbolic link finding no repository, or the one the link sits in, instead of the checkout the link leads into, as git does
 - Fixed `omp worktree add` and other git operations failing with `git open: … does not appear to be a git repository` when the checkout directory name ends in `.git` ([#14553](https://github.com/can1357/oh-my-pi/issues/14553))
 - Fixed Mnemopi embedding workers (and other local-model workers) staying alive and holding gigabytes of RAM after the omp process that started them exited mid-embedding ([#14340](https://github.com/can1357/oh-my-pi/issues/14340))
 - Fixed a supervised PTY service on Windows hanging when it asks the terminal for the cursor position; the launch broker now answers the query as it does on Linux and macOS
@@ -18062,3 +18131,4 @@ Older entries are archived in [packages/coding-agent/CHANGELOG.md@d95ba9ea5e83](
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@47b1156699bb](https://github.com/can1357/oh-my-pi/blob/47b1156699bb852a157216acec52ff743d992dca/packages/coding-agent/CHANGELOG.md).
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@bac7e83b5b0e](https://github.com/can1357/oh-my-pi/blob/bac7e83b5b0eb86c909c17830a6666efc359578b/packages/coding-agent/CHANGELOG.md).
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@5ae2ef3569ca](https://github.com/can1357/oh-my-pi/blob/5ae2ef3569ca9299b7eb101ad7ef0d316d30f551/packages/coding-agent/CHANGELOG.md).
+Older entries are archived in [packages/coding-agent/CHANGELOG.md@1e3cc3ab94d0](https://github.com/can1357/oh-my-pi/blob/1e3cc3ab94d05617e79fb12d95711d58161747d3/packages/coding-agent/CHANGELOG.md).

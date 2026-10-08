@@ -106,7 +106,7 @@ export function createPersistedSubagentReviverFactory(
 				suppressBreadcrumb: true,
 				throwIfMissing: true,
 			});
-			const entries = reopened.getEntries();
+			const entries = await reopened.getAllEntries();
 			const init = extractSessionInit(entries);
 			if (!init) {
 				await reopened.close();

@@ -50,6 +50,10 @@ export type AgentTranscriptEntry = SessionMessageEntryLike | { type: "model_chan
 
 /** Local filesystem and session parsing capabilities supplied by the host. */
 export interface AgentTranscriptSource {
+	/**
+	 * Sync primitives drive first paint and incremental tail checks. Async opens
+	 * handle paged reads and later bounded tail reloads without blocking the UI.
+	 */
 	fs: Pick<typeof fs, "openSync" | "closeSync" | "readSync" | "readFileSync" | "statSync"> & {
 		promises: Pick<typeof fs.promises, "open">;
 	};
@@ -89,6 +93,8 @@ export interface AgentTranscriptViewerDeps {
 
 /** How often to re-stat a file-backed transcript for growth (advisor/live tail). */
 const POLL_MS = 250;
+/** Every Nth idle poll re-verifies sentinels, catching same-size/mtime rewrites. */
+const IDLE_SENTINEL_CHECK_EVERY = 5;
 
 const SENTINEL_BYTES = 4096;
 /** One disk page. A single oversized JSONL record may exceed this soft target. */
@@ -221,6 +227,41 @@ function readLocalTail(fs: AgentTranscriptSource["fs"], file: string, size: numb
 	};
 }
 
+/** Async counterpart used by poll-triggered bounded-tail reloads. */
+async function readLocalTailAsync(
+	fs: AgentTranscriptSource["fs"],
+	file: string,
+	size: number,
+): Promise<LocalTranscriptTail> {
+	if (size <= 0) return { page: undefined, completeEnd: 0, pending: Buffer.alloc(0) };
+	let start = Math.max(0, size - LOCAL_PAGE_BYTES);
+	let bytes = await readFileRange(fs, file, start, size - start);
+	let aligned = start === 0 || (await readFileRange(fs, file, start - 1, 1))[0] === 0x0a;
+	while (start > 0 && !aligned) {
+		const { first, last } = firstAndLastNewline(bytes);
+		if (first >= 0 && last > first) break;
+		const previousStart = Math.max(0, start - LOCAL_PAGE_BYTES);
+		bytes = Buffer.concat([await readFileRange(fs, file, previousStart, start - previousStart), bytes]);
+		start = previousStart;
+		aligned = start === 0 || (await readFileRange(fs, file, start - 1, 1))[0] === 0x0a;
+	}
+	if (!aligned) {
+		const firstNewline = bytes.indexOf(0x0a);
+		if (firstNewline < 0) return { page: undefined, completeEnd: size, pending: Buffer.alloc(0) };
+		start += firstNewline + 1;
+		bytes = bytes.subarray(firstNewline + 1);
+	}
+	const lastNewline = bytes.lastIndexOf(0x0a);
+	if (lastNewline < 0) return { page: undefined, completeEnd: start, pending: Buffer.from(bytes) };
+	const completeEnd = start + lastNewline + 1;
+	const pageBytes = Buffer.from(bytes.subarray(0, lastNewline + 1));
+	return {
+		page: pageBytes.byteLength > 0 ? { start, end: completeEnd, bytes: pageBytes } : undefined,
+		completeEnd,
+		pending: Buffer.from(bytes.subarray(lastNewline + 1)),
+	};
+}
+
 /** Read the complete-line page immediately preceding an aligned byte offset. */
 async function readPreviousLocalPage(
 	fs: AgentTranscriptSource["fs"],
@@ -310,6 +351,20 @@ function sentinelsFromFile(fs: AgentTranscriptSource["fs"], file: string, size: 
 	return sentinelOffsets(size).map(offset => ({ offset, bytes: readFileRangeSync(fs, file, offset, length) }));
 }
 
+async function sentinelsFromFileAsync(
+	fs: AgentTranscriptSource["fs"],
+	file: string,
+	size: number,
+): Promise<LocalTranscriptSentinel[]> {
+	const length = Math.min(SENTINEL_BYTES, size);
+	return Promise.all(
+		sentinelOffsets(size).map(async offset => ({
+			offset,
+			bytes: await readFileRange(fs, file, offset, length),
+		})),
+	);
+}
+
 /**
  * `sanitizeErrorLine` width for described text, which the terminal truncates
  * itself: effectively unbounded, but within the native truncate's i32 range.
@@ -364,6 +419,10 @@ export class AgentTranscriptViewer implements Component {
 	#model: string | undefined;
 	#pollTimer: NodeJS.Timeout | undefined;
 	#disposed = false;
+	/** Async bounded local reload in flight; polls are skipped until it lands. */
+	#localLoadInFlight = false;
+	/** Idle polls since the sentinels were last verified. */
+	#idlePolls = 0;
 	#initialEntryId: string | undefined;
 	/** Last described node and the visible inputs it was built from. */
 	#nativeCache: { signature: string; node: NativeNode } | undefined;
@@ -382,6 +441,8 @@ export class AgentTranscriptViewer implements Component {
 			hideThinkingBlock: deps.hideThinkingBlock,
 			proseOnlyThinking: deps.proseOnlyThinking,
 			expandThinkingBlocks: deps.expandThinkingBlocks,
+			// Charts are for the main session's answers, not parked subagent, advisor, or guest transcripts.
+			tableCharts: false,
 			requestRender: deps.requestRender,
 		});
 		this.#browser = new TranscriptBrowser({
@@ -394,8 +455,10 @@ export class AgentTranscriptViewer implements Component {
 			this.#editor.setMaxHeight(4);
 			this.#editor.onSubmit = text => this.#submit(text);
 		}
-		this.#refresh();
-		this.#pollTimer = setInterval(() => this.#refresh(), POLL_MS);
+		// First paint loads synchronously so the initial entry can be revealed
+		// immediately; later bounded-tail reloads from the poll may go async.
+		this.#refresh(false);
+		this.#pollTimer = setInterval(() => this.#refresh(true), POLL_MS);
 		this.#pollTimer.unref?.();
 	}
 
@@ -426,12 +489,13 @@ export class AgentTranscriptViewer implements Component {
 	// ========================================================================
 
 	/** Refresh the transcript from a local file or remote host. */
-	#refresh(): void {
+	#refresh(allowAsync: boolean): void {
 		if (this.#disposed) return;
 		if (this.#deps.remote) {
 			this.#fetchRemote();
 			return;
 		}
+		if (this.#localLoadInFlight) return;
 		const sessionFile = this.#deps.registry.get(this.#deps.agentId)?.sessionFile;
 		if (!sessionFile) {
 			this.#clearLocal("none");
@@ -445,20 +509,36 @@ export class AgentTranscriptViewer implements Component {
 			return;
 		}
 		const state = this.#localState;
-		if (state && this.#canAppendLocal(sessionFile, stat, state)) {
-			if (stat.size === state.size && stat.mtimeMs === state.mtimeMs) return;
-			if (stat.size > state.size) {
-				this.#appendLocal(sessionFile, stat, state);
+		if (state) {
+			// Idle fast path: an unchanged identity/size/mtime costs one stat;
+			// sentinels are re-read only every Nth idle poll so a rewrite that
+			// keeps size and mtime is still noticed.
+			if (
+				state.path === sessionFile &&
+				state.dev === stat.dev &&
+				state.ino === stat.ino &&
+				stat.size === state.size &&
+				stat.mtimeMs === state.mtimeMs
+			) {
+				if (++this.#idlePolls < IDLE_SENTINEL_CHECK_EVERY) return;
+				this.#idlePolls = 0;
+				if (this.#canAppendLocal(sessionFile, stat, state)) return;
+				this.#loadLocalTail(sessionFile, stat, allowAsync);
+				return;
+			}
+			if (stat.size > state.size && this.#canAppendLocal(sessionFile, stat, state)) {
+				this.#appendLocal(sessionFile, stat, state, allowAsync);
 				return;
 			}
 		}
-		this.#loadLocalTail(sessionFile, stat);
+		this.#loadLocalTail(sessionFile, stat, allowAsync);
 	}
 
 	#clearLocal(reason: string): void {
 		if (!this.#localState && this.#localUnavailable === reason) return;
 		this.#localPageToken++;
 		this.#localPageLoadInFlight = false;
+		this.#localLoadInFlight = false;
 		this.#rowsAddedAbove = 0;
 		this.#localState = undefined;
 		this.#localUnavailable = reason;
@@ -490,17 +570,47 @@ export class AgentTranscriptViewer implements Component {
 		return true;
 	}
 
-	#loadLocalTail(sessionFile: string, stat: fs.Stats): void {
+	#loadLocalTail(sessionFile: string, stat: fs.Stats, allowAsync = false): void {
+		const fs = this.#deps.transcript.fs;
+		if (allowAsync) {
+			const token = ++this.#localPageToken;
+			this.#localPageLoadInFlight = false;
+			this.#localLoadInFlight = true;
+			void Promise.all([
+				readLocalTailAsync(fs, sessionFile, stat.size),
+				sentinelsFromFileAsync(fs, sessionFile, stat.size),
+			])
+				.then(([tail, sentinels]) => {
+					if (token !== this.#localPageToken || this.#disposed) return;
+					this.#localLoadInFlight = false;
+					this.#applyLocalTail(sessionFile, stat, tail, sentinels);
+				})
+				.catch((err: unknown) => {
+					if (token !== this.#localPageToken) return;
+					this.#localLoadInFlight = false;
+					logger.debug("transcript viewer: tail read failed", { err: String(err) });
+				});
+			return;
+		}
 		let tail: LocalTranscriptTail;
 		let sentinels: LocalTranscriptSentinel[];
 		try {
-			tail = readLocalTail(this.#deps.transcript.fs, sessionFile, stat.size);
-			sentinels = sentinelsFromFile(this.#deps.transcript.fs, sessionFile, stat.size);
+			tail = readLocalTail(fs, sessionFile, stat.size);
+			sentinels = sentinelsFromFile(fs, sessionFile, stat.size);
 		} catch (err) {
 			// Leave #localState unchanged so a transient read error retries next poll.
 			logger.debug("transcript viewer: tail read failed", { err: String(err) });
 			return;
 		}
+		this.#applyLocalTail(sessionFile, stat, tail, sentinels);
+	}
+
+	#applyLocalTail(
+		sessionFile: string,
+		stat: fs.Stats,
+		tail: LocalTranscriptTail,
+		sentinels: LocalTranscriptSentinel[],
+	): void {
 		// Every byte up to the sampled stat must be represented by either the
 		// complete-line cursor or its trailing pending fragment. A short read means
 		// the file changed underneath us; keep the previous window and retry.
@@ -521,6 +631,7 @@ export class AgentTranscriptViewer implements Component {
 
 		this.#localPageToken++;
 		this.#localPageLoadInFlight = false;
+		this.#localLoadInFlight = false;
 		this.#rowsAddedAbove = 0;
 		this.#localUnavailable = "";
 		this.#localState = {
@@ -538,11 +649,11 @@ export class AgentTranscriptViewer implements Component {
 		this.#rebuildLocalWindow();
 	}
 
-	#appendLocal(sessionFile: string, stat: fs.Stats, state: LocalTranscriptState): void {
+	#appendLocal(sessionFile: string, stat: fs.Stats, state: LocalTranscriptState, allowAsync: boolean): void {
 		const growth = stat.size - state.size;
 		if (growth > LOCAL_PAGE_BYTES) {
-			if (this.#followBottom) this.#loadLocalTail(sessionFile, stat);
-			else this.#advanceParkedLocalTail(sessionFile, stat, state);
+			if (this.#followBottom) this.#loadLocalTail(sessionFile, stat, allowAsync);
+			else this.#advanceParkedLocalTail(sessionFile, stat, state, allowAsync);
 			return;
 		}
 		let chunk: Buffer;
@@ -550,11 +661,11 @@ export class AgentTranscriptViewer implements Component {
 			chunk = readFileRangeSync(this.#deps.transcript.fs, sessionFile, state.size, growth);
 		} catch (err) {
 			logger.debug("transcript viewer: tail read failed", { err: String(err) });
-			this.#loadLocalTail(sessionFile, stat);
+			this.#loadLocalTail(sessionFile, stat, allowAsync);
 			return;
 		}
 		if (chunk.byteLength !== growth) {
-			this.#loadLocalTail(sessionFile, stat);
+			this.#loadLocalTail(sessionFile, stat, allowAsync);
 			return;
 		}
 		const combined = Buffer.concat([state.pending, chunk]);
@@ -570,7 +681,7 @@ export class AgentTranscriptViewer implements Component {
 			// File unlinked/rotated mid-poll: fall back to a guarded tail reload
 			// instead of letting the open escape the poll timer.
 			logger.debug("transcript viewer: sentinel recompute failed", { err: String(err) });
-			this.#loadLocalTail(sessionFile, stat);
+			this.#loadLocalTail(sessionFile, stat, allowAsync);
 			return;
 		}
 		let post: fs.Stats;
@@ -585,7 +696,7 @@ export class AgentTranscriptViewer implements Component {
 			post.size < stat.size ||
 			(post.size === stat.size && post.mtimeMs !== stat.mtimeMs)
 		) {
-			this.#loadLocalTail(sessionFile, post);
+			this.#loadLocalTail(sessionFile, post, allowAsync);
 			return;
 		}
 		const windowAtTail = this.#localWindowEnd(state) === oldCompleteEnd;
@@ -640,18 +751,54 @@ export class AgentTranscriptViewer implements Component {
 	 * viewport) stay intact, while the new complete-line boundary lets ordinary
 	 * downward paging traverse the cold appended range later.
 	 */
-	#advanceParkedLocalTail(sessionFile: string, stat: fs.Stats, state: LocalTranscriptState): void {
+	#advanceParkedLocalTail(
+		sessionFile: string,
+		stat: fs.Stats,
+		state: LocalTranscriptState,
+		allowAsync: boolean,
+	): void {
+		const fs = this.#deps.transcript.fs;
+		if (allowAsync) {
+			const token = ++this.#localPageToken;
+			this.#localPageLoadInFlight = false;
+			this.#localLoadInFlight = true;
+			void Promise.all([
+				readLocalTailAsync(fs, sessionFile, stat.size),
+				sentinelsFromFileAsync(fs, sessionFile, stat.size),
+			])
+				.then(([tail, sentinels]) => {
+					if (token !== this.#localPageToken || this.#disposed) return;
+					this.#localLoadInFlight = false;
+					this.#applyParkedLocalTail(sessionFile, stat, state, tail, sentinels, allowAsync);
+				})
+				.catch((err: unknown) => {
+					if (token !== this.#localPageToken) return;
+					this.#localLoadInFlight = false;
+					logger.debug("transcript viewer: bounded tail probe failed", { err: String(err) });
+				});
+			return;
+		}
 		let tail: LocalTranscriptTail;
 		let sentinels: LocalTranscriptSentinel[];
 		try {
-			tail = readLocalTail(this.#deps.transcript.fs, sessionFile, stat.size);
-			sentinels = sentinelsFromFile(this.#deps.transcript.fs, sessionFile, stat.size);
+			tail = readLocalTail(fs, sessionFile, stat.size);
+			sentinels = sentinelsFromFile(fs, sessionFile, stat.size);
 		} catch (err) {
 			logger.debug("transcript viewer: bounded tail probe failed", { err: String(err) });
 			return;
 		}
-		if (tail.completeEnd + tail.pending.byteLength !== stat.size) return;
+		this.#applyParkedLocalTail(sessionFile, stat, state, tail, sentinels, allowAsync);
+	}
 
+	#applyParkedLocalTail(
+		sessionFile: string,
+		stat: fs.Stats,
+		state: LocalTranscriptState,
+		tail: LocalTranscriptTail,
+		sentinels: LocalTranscriptSentinel[],
+		allowAsync: boolean,
+	): void {
+		if (tail.completeEnd + tail.pending.byteLength !== stat.size) return;
 		let post: fs.Stats;
 		try {
 			post = this.#deps.transcript.fs.statSync(sessionFile);
@@ -664,10 +811,10 @@ export class AgentTranscriptViewer implements Component {
 			post.size < stat.size ||
 			(post.size === stat.size && post.mtimeMs !== stat.mtimeMs)
 		) {
-			this.#loadLocalTail(sessionFile, post);
+			this.#loadLocalTail(sessionFile, post, allowAsync);
 			return;
 		}
-
+		if (this.#localState !== state) return;
 		this.#localUnavailable = "";
 		this.#localState = {
 			...state,
@@ -798,7 +945,7 @@ export class AgentTranscriptViewer implements Component {
 	}
 
 	#maybeLoadLocalPage(direction: -1 | 1): void {
-		if (this.#disposed || this.#deps.remote || this.#localPageLoadInFlight) return;
+		if (this.#disposed || this.#deps.remote || this.#localLoadInFlight || this.#localPageLoadInFlight) return;
 		const state = this.#localState;
 		if (!state) return;
 		const offset = this.#browser.getScrollOffset();
@@ -834,7 +981,7 @@ export class AgentTranscriptViewer implements Component {
 					return;
 				}
 				if (!this.#canAppendLocal(current.path, post, current)) {
-					this.#loadLocalTail(current.path, post);
+					this.#loadLocalTail(current.path, post, true);
 					return;
 				}
 

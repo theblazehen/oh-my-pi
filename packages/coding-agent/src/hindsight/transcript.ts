@@ -49,6 +49,21 @@ export async function extractMessages(sessionManager: ReadonlySessionManagerLike
 	return messages;
 }
 
+/**
+ * Count user turns exactly as `extractMessages(sessionManager).filter(m => m.role === "user").length`,
+ * over the full history like `extractMessages`, without extracting assistant text or allocating the
+ * message list. Not memoized: messages may be rewritten in place (e.g. image stripping), so each call
+ * re-inspects current content.
+ */
+export async function countUserTurns(sessionManager: ReadonlySessionManagerLike): Promise<number> {
+	let count = 0;
+	for (const entry of await sessionManager.getAllEntries()) {
+		if (entry.type !== "message" || entry.message.role !== "user") continue;
+		if (hasSubstantiveContent(extractUserText(entry.message))) count++;
+	}
+	return count;
+}
+
 function extractUserText(msg: { content: unknown }): string {
 	const content = msg.content;
 	if (typeof content === "string") return content;

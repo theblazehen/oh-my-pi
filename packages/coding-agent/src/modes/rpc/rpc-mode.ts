@@ -2106,7 +2106,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						id,
 						"get_entries",
 						selectRpcEntries(
-							session.sessionManager.getEntries(),
+							await session.sessionManager.getAllEntries(),
 							session.sessionManager.getLeafId(),
 							command.since,
 						),
@@ -2118,7 +2118,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 			case "get_tree": {
 				return success(id, "get_tree", {
-					tree: session.sessionManager.getTree(),
+					tree: await session.sessionManager.getFullTree(),
 					leafId: session.sessionManager.getLeafId(),
 				});
 			}

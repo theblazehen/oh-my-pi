@@ -370,13 +370,13 @@ describe("hindsightBackend first-turn injection", () => {
 		// settles when the forwarded signal aborts, mirroring a fetch honouring
 		// AbortSignal. Pre-fix the signal was dropped, so this pended for the full
 		// recall timeout and Esc could not cancel it.
-		let received: AbortSignal | undefined;
+		const { promise: recallStarted, resolve: markRecallStarted } = Promise.withResolvers<AbortSignal | undefined>();
 		vi.spyOn(HindsightApi.prototype, "recall").mockImplementation(((
 			_bankId: string,
 			_query: string,
 			options?: { signal?: AbortSignal },
 		) => {
-			received = options?.signal;
+			markRecallStarted(options?.signal);
 			const { promise, reject } = Promise.withResolvers<never>();
 			if (options?.signal?.aborted) reject(new DOMException("Aborted", "AbortError"));
 			else {
@@ -393,7 +393,7 @@ describe("hindsightBackend first-turn injection", () => {
 			"What do I know about this user?",
 			controller.signal,
 		);
-		await Promise.resolve();
+		const received = await recallStarted;
 		expect(received).toBe(controller.signal);
 
 		controller.abort();

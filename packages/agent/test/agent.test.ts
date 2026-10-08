@@ -16,6 +16,29 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { createAssistantMessage, createUserMessage } from "./helpers";
 
 describe("Agent", () => {
+	it("awaits asynchronous system-prompt persistence before starting a model call", async () => {
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		const callbackStarted = Promise.withResolvers<void>();
+		const releaseCallback = Promise.withResolvers<void>();
+		agent.setOnModelCallSystemPrompt(async () => {
+			callbackStarted.resolve();
+			await releaseCallback.promise;
+		});
+
+		const run = agent.prompt("start");
+		await callbackStarted.promise;
+		const callsBeforeCallbackCompletes = mock.calls.length;
+		releaseCallback.resolve();
+		await run;
+
+		expect(callsBeforeCallbackCompletes).toBe(0);
+		expect(mock.calls).toHaveLength(1);
+	});
+
 	it("classifies agent-authored steering as a parent steering message", async () => {
 		const toolSchema = type({ value: type("string") });
 		const executed: string[] = [];
@@ -500,6 +523,66 @@ describe("Agent", () => {
 		if (finalMessage?.role !== "assistant") throw new Error("Expected aborted assistant message");
 		expect(finalMessage.stopReason).toBe("aborted");
 		expect(finalMessage.errorMessage).toBe("caller cancelled");
+	});
+
+	it("emits an aborted assistant boundary when context transformation rejects after tool cancellation", async () => {
+		const toolStarted = Promise.withResolvers<void>();
+		const parameters = type({ question: "string" });
+		const tool: AgentTool<typeof parameters> = {
+			name: "ask",
+			label: "Ask",
+			description: "Interactive question",
+			parameters,
+			async execute(_toolCallId, _params, signal) {
+				if (!signal) throw new Error("Expected tool abort signal");
+				toolStarted.resolve();
+				await new Promise<void>(resolve => {
+					if (signal.aborted) resolve();
+					else signal.addEventListener("abort", () => resolve(), { once: true });
+				});
+				throw new Error("Ask input was cancelled");
+			},
+		};
+		const mock = createMockModel({ responses: [] });
+		const agent = new Agent({
+			initialState: { model: mock.model, tools: [tool] },
+			streamFn: mock.stream,
+			transformContext: async (messages, signal) => {
+				signal?.throwIfAborted();
+				return messages;
+			},
+		});
+		agent.replaceMessages([
+			createUserMessage("ask a question"),
+			createAssistantMessage(
+				[{ type: "toolCall", id: "ask_1", name: "ask", arguments: { question: "Deploy?" } }],
+				"toolUse",
+			),
+		]);
+		const events: AgentEvent[] = [];
+		agent.subscribe(event => events.push(event));
+
+		const running = agent.continue();
+		await toolStarted.promise;
+		agent.abort("Interrupted by user");
+		await running;
+
+		const boundaryIndex = events.findIndex(
+			event =>
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.stopReason === "aborted",
+		);
+		expect(boundaryIndex).toBeGreaterThanOrEqual(0);
+		const boundary = events[boundaryIndex];
+		if (boundary.type !== "message_end") throw new Error("Expected persisted assistant boundary");
+		expect(boundary.message).toMatchObject({ role: "assistant", errorMessage: "Interrupted by user" });
+		expect(events.slice(boundaryIndex + 1).map(event => event.type)).toEqual(["turn_end", "agent_end"]);
+		expect(agent.state.messages.at(-1)).toEqual(boundary.message);
+		expect(
+			agent.state.messages.filter(message => message.role === "assistant" && message.stopReason === "aborted"),
+		).toHaveLength(1);
+		expect(mock.calls).toHaveLength(0);
 	});
 
 	it("continue() should process queued follow-up messages after an assistant turn", async () => {
