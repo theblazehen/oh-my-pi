@@ -215,6 +215,7 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 	 */
 	#frameRows = new Map<TranscriptEntry, readonly string[]>();
 	#frameRowsWidth = 0;
+	#releaseFailures = new WeakSet<Component>();
 	/** The `children` array `#entries` last mirrored; see {@link #syncEntries}. */
 	#syncedChildren: Component[] | undefined;
 	/** Forces the next {@link #syncEntries} to compare every entry, not just the live tail. */
@@ -613,7 +614,10 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 			popLoopPhase();
 		}
 		this.#replayPending = false;
-		if (rows.length === 0) return undefined;
+		if (rows.length === 0) {
+			this.#releaseCommittedRenderCaches();
+			return undefined;
+		}
 		const batch: HistoryBatch = { id: this.#nextBatchId++, rows, kind: "replay" };
 		this.#offered = { batch, kind: "replay" };
 		return batch;
@@ -777,6 +781,8 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 				this.#retireEntry(this.#entries[index]!);
 			}
 			this.#frontier = offered.end;
+		} else {
+			this.#releaseCommittedRenderCaches();
 		}
 		this.#offered = undefined;
 		if (this.#replayRequested) this.#startReplay();
@@ -796,6 +802,7 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 			const entry = this.#entries[index]!;
 			this.#setAllocation(entry.component, Number.MAX_SAFE_INTEGER, this.#lastFrame);
 			const block = trimBlankEdges(entry.component.render(width));
+			if (entry.state === "committed") this.#releaseRenderCaches(entry);
 			if (block.length === 0) continue;
 			if (rows.length > 0) rows.unshift("");
 			rows.unshift(...block);
@@ -843,6 +850,7 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 		for (const entry of this.#entries) {
 			this.#setAllocation(entry.component, Number.MAX_SAFE_INTEGER, this.#lastFrame);
 			const block = this.#renderEntry(entry, width);
+			if (entry.state === "committed") this.#releaseRenderCaches(entry);
 			if (block.length === 0) continue;
 			if (rows.length > 0) rows.push("");
 			this.#childStartRows.set(entry.component, rows.length);
@@ -1084,6 +1092,29 @@ export class TranscriptContainer extends Container implements TranscriptBlockSou
 		entry.stableRows = EMPTY_STABLE_ROWS;
 		entry.renderedStableByWidth = new Map();
 		entry.stableRowCountByWidth = new Map();
+		this.#frameRows.delete(entry);
+		this.#releaseRenderCaches(entry);
+	}
+
+	#releaseCommittedRenderCaches(): void {
+		for (let index = 0; index < this.#frontier; index++) {
+			this.#releaseRenderCaches(this.#entries[index]!);
+		}
+	}
+
+	#releaseRenderCaches(entry: TranscriptEntry): void {
+		const release = entry.component.releaseRenderCaches;
+		if (release === undefined) return;
+		try {
+			release.call(entry.component);
+		} catch (err) {
+			if (this.#releaseFailures.has(entry.component)) return;
+			this.#releaseFailures.add(entry.component);
+			logger.warn("Transcript block failed to release render caches", {
+				component: entry.component.constructor.name,
+				error: String(err),
+			});
+		}
 	}
 
 	#startReplay(): void {
