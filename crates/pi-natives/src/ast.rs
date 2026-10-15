@@ -6,7 +6,12 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use ast_grep_core::{MatchStrictness, matcher::Pattern, source::Edit, tree_sitter::LanguageExt};
+use ast_grep_core::{
+	AstGrep, MatchStrictness,
+	matcher::Pattern,
+	source::Edit,
+	tree_sitter::{LanguageExt, StrDoc},
+};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use pi_ast::{
@@ -459,7 +464,7 @@ fn collect_candidates(
 		pi_walker::WalkFilter::files_only().node_modules_unless_mentioned(mentions_node_modules);
 	if let Some(glob) = glob.map(str::trim).filter(|value| !value.is_empty()) {
 		let pattern = glob_util::build_glob_pattern(glob, false);
-		let compiled = pi_walker::CompiledWalkGlob::new([pattern])
+		let compiled = pi_walker::CompiledWalkGlob::new(glob_util::search_scope_patterns(pattern))
 			.map_err(|err| Error::from_reason(format!("Invalid glob pattern: {err}")))?;
 		filter = filter.glob(compiled);
 	}
@@ -489,6 +494,13 @@ fn collect_candidates(
 
 	files.sort_by(|a, b| a.display_path.cmp(&b.display_path));
 	Ok(files)
+}
+
+fn has_parse_error(ast: &AstGrep<StrDoc<SupportLang>>) -> bool {
+	// Recovery can insert missing tokens without producing an ERROR node.
+	ast.root()
+		.dfs()
+		.any(|node| node.is_error() || node.is_missing())
 }
 
 fn compile_pattern(
@@ -771,7 +783,7 @@ pub fn ast_grep<'env>(
 			}
 
 			let ast = language.ast_grep(source);
-			if ast.root().dfs().any(|node| node.is_error()) {
+			if has_parse_error(&ast) {
 				parse_errors.push(format!(
 					"{}: parse error (syntax tree contains error nodes)",
 					candidate.display_path
@@ -897,7 +909,7 @@ pub fn ast_match(options: AstMatchOptions<'_>) -> task::Promise<AstMatchResult> 
 		let mut match_sequence = 0u64;
 		if !compiled_patterns.is_empty() {
 			let ast = language.ast_grep(&source);
-			if ast.root().dfs().any(|node| node.is_error()) {
+			if has_parse_error(&ast) {
 				parse_errors.push("parse error (syntax tree contains error nodes)".to_string());
 			}
 			for pattern in &compiled_patterns {
@@ -1151,7 +1163,7 @@ fn ast_edit_blocking(
 		};
 
 		let ast = language.ast_grep(&source);
-		if ast.root().dfs().any(|node| node.is_error()) {
+		if has_parse_error(&ast) {
 			let parse_issue =
 				format!("{}: parse error (syntax tree contains error nodes)", candidate.display_path);
 			if fail_on_parse_error {
@@ -1296,6 +1308,167 @@ mod tests {
 		fs::write(root.join("nested").join("b.ts"), "const b = 2;\n")
 			.expect("temp file nested/b.ts should be written");
 		TempTree { root }
+	}
+
+	const BROKEN_PYTHON: &str = "def broken(:\n    print(\"BADPY_MARKER\")\n";
+	const VALID_PYTHON: &str = "def working():\n    print(\"BADPY_MARKER\")\n";
+	const REWRITTEN_PYTHON: &str = "def working():\n    repr(\"BADPY_MARKER\")\n";
+
+	#[test]
+	fn detects_missing_python_token_and_preserves_recovered_matches() {
+		let ast = SupportLang::Python.ast_grep(BROKEN_PYTHON);
+		assert!(!ast.root().dfs().any(|node| node.is_error()));
+		assert!(
+			ast.root()
+				.dfs()
+				.any(|node| node.is_missing() && !node.is_named())
+		);
+		assert!(has_parse_error(&ast));
+		let pattern =
+			compile_pattern("print($A)", None, &MatchStrictness::Smart, SupportLang::Python)
+				.expect("print pattern should compile");
+		let matches: Vec<_> = ast.root().find_all(pattern).collect();
+		assert_eq!(matches.len(), 1);
+		assert_eq!(matches[0].text(), "print(\"BADPY_MARKER\")");
+	}
+
+	#[test]
+	fn valid_python_matches_without_parse_errors() {
+		let ast = SupportLang::Python.ast_grep(VALID_PYTHON);
+		assert!(!has_parse_error(&ast));
+		let pattern =
+			compile_pattern("print($A)", None, &MatchStrictness::Smart, SupportLang::Python)
+				.expect("print pattern should compile");
+		let matches: Vec<_> = ast.root().find_all(pattern).collect();
+		assert_eq!(matches.len(), 1);
+		assert_eq!(matches[0].text(), "print(\"BADPY_MARKER\")");
+	}
+
+	#[test]
+	fn detects_existing_typescript_error_nodes() {
+		let ast = SupportLang::TypeScript.ast_grep("export function broken( { return 1; }");
+		assert!(ast.root().dfs().any(|node| node.is_error()));
+		assert!(has_parse_error(&ast));
+	}
+
+	fn edit_python_tree(
+		tree: &TempTree,
+		dry_run: bool,
+		fail_on_parse_error: bool,
+	) -> Result<AstReplaceResult> {
+		let rewrites = HashMap::from([("print($A)".to_string(), "repr($A)".to_string())]);
+		ast_edit_blocking(
+			task::CancelToken::default(),
+			&BlockingFs::native(),
+			Some(rewrites),
+			Some("python".to_string()),
+			Some(tree.root.to_string_lossy().into_owned()),
+			Some("*.py".to_string()),
+			None,
+			None,
+			Some(dry_run),
+			None,
+			None,
+			Some(fail_on_parse_error),
+		)
+	}
+
+	#[test]
+	fn ast_edit_skips_missing_python_token_in_preview_and_apply() {
+		let tree = make_temp_tree();
+		let path = tree.root.join("broken.py");
+		fs::write(&path, BROKEN_PYTHON).expect("broken fixture should be written");
+		for dry_run in [true, false] {
+			let result =
+				edit_python_tree(&tree, dry_run, false).expect("invalid file should be skipped");
+			assert_eq!(result.files_searched, 1);
+			assert_eq!(result.files_touched, 0);
+			assert_eq!(result.total_replacements, 0);
+			assert!(result.changes.is_empty());
+			assert!(result.file_changes.is_empty());
+			let issues = result
+				.parse_errors
+				.expect("missing token should be reported");
+			assert_eq!(issues, ["broken.py: parse error (syntax tree contains error nodes)"]);
+			assert_eq!(
+				fs::read(&path).expect("fixture should remain readable"),
+				BROKEN_PYTHON.as_bytes()
+			);
+		}
+	}
+
+	#[test]
+	fn ast_edit_previews_and_applies_valid_python() {
+		let tree = make_temp_tree();
+		let path = tree.root.join("valid.py");
+		fs::write(&path, VALID_PYTHON).expect("valid fixture should be written");
+		for dry_run in [true, false] {
+			let result = edit_python_tree(&tree, dry_run, false).expect("valid Python should rewrite");
+			assert!(result.parse_errors.is_none());
+			assert_eq!(result.total_replacements, 1);
+			assert_eq!(result.files_touched, 1);
+			assert_eq!(result.applied, !dry_run);
+			assert_eq!(result.changes.len(), 1);
+			assert_eq!(result.changes[0].before, "print(\"BADPY_MARKER\")");
+			assert_eq!(result.changes[0].after, "repr(\"BADPY_MARKER\")");
+			let expected = if dry_run {
+				VALID_PYTHON
+			} else {
+				REWRITTEN_PYTHON
+			};
+			assert_eq!(fs::read(&path).expect("fixture should be readable"), expected.as_bytes());
+		}
+	}
+
+	#[test]
+	fn ast_edit_tolerant_mode_only_applies_valid_python_files() {
+		let tree = make_temp_tree();
+		let valid = tree.root.join("a_valid.py");
+		let broken = tree.root.join("b_broken.py");
+		fs::write(&valid, VALID_PYTHON).expect("valid fixture should be written");
+		fs::write(&broken, BROKEN_PYTHON).expect("broken fixture should be written");
+		let result = edit_python_tree(&tree, false, false).expect("tolerant edit should succeed");
+		assert_eq!(result.files_searched, 2);
+		assert_eq!(result.files_touched, 1);
+		assert_eq!(result.total_replacements, 1);
+		assert_eq!(
+			result
+				.parse_errors
+				.expect("broken file should be reported")
+				.len(),
+			1
+		);
+		assert_eq!(
+			fs::read(&valid).expect("valid file should be readable"),
+			REWRITTEN_PYTHON.as_bytes()
+		);
+		assert_eq!(
+			fs::read(&broken).expect("broken file should be readable"),
+			BROKEN_PYTHON.as_bytes()
+		);
+	}
+
+	#[test]
+	fn ast_edit_strict_parse_failure_does_not_partially_write() {
+		let tree = make_temp_tree();
+		let valid = tree.root.join("a_valid.py");
+		let broken = tree.root.join("b_broken.py");
+		fs::write(&valid, VALID_PYTHON).expect("valid fixture should be written");
+		fs::write(&broken, BROKEN_PYTHON).expect("broken fixture should be written");
+		for dry_run in [true, false] {
+			let error = edit_python_tree(&tree, dry_run, true)
+				.err()
+				.expect("strict mode should reject missing token");
+			assert!(error.reason.contains("b_broken.py: parse error"));
+			assert_eq!(
+				fs::read(&valid).expect("valid file should be readable"),
+				VALID_PYTHON.as_bytes()
+			);
+			assert_eq!(
+				fs::read(&broken).expect("broken file should be readable"),
+				BROKEN_PYTHON.as_bytes()
+			);
+		}
 	}
 
 	fn retained_test_match(line: u32) -> RetainedAstFindMatch {

@@ -188,21 +188,16 @@ const memoryToolDeveloperInstructionsBySession = new WeakMap<
 >();
 const memoryToolDeveloperInstructionsByRoot = new Map<string, MemoryToolDeveloperInstructionsSnapshot | undefined>();
 
-function getMemoryInstructionRoot(agentDir: string, settings: Settings): string {
-	return getMemoryRoot(agentDir, settings.getCwd());
-}
-
 function getMemoryInstructionSessionFile(session: MemoryInstructionSession): string | undefined {
 	return session.sessionManager.getSessionFile() ?? undefined;
 }
 
 async function readMemoryToolDeveloperInstructionsSnapshot(
-	agentDir: string,
+	memoryRoot: string,
 	settings: Settings,
 ): Promise<MemoryToolDeveloperInstructionsSnapshot | undefined> {
 	const cfg = loadMemoryConfig(settings);
 	if (!cfg.enabled) return undefined;
-	const memoryRoot = getMemoryInstructionRoot(agentDir, settings);
 
 	let summary = "";
 	try {
@@ -277,14 +272,15 @@ export function clearMemoryToolDeveloperInstructionsCache(session: MemoryInstruc
 export async function refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
 	session: MemoryInstructionSession,
 	agentDir: string,
+	cwd: string,
 	settings: Settings,
 ): Promise<void> {
 	if (memoryConversationStarted(session)) return;
 	const sessionFile = getMemoryInstructionSessionFile(session);
 	const cached = memoryToolDeveloperInstructionsBySession.get(session);
-	const current = await readMemoryToolDeveloperInstructionsSnapshot(agentDir, settings);
+	const root = getMemoryRoot(agentDir, cwd);
+	const current = await readMemoryToolDeveloperInstructionsSnapshot(root, settings);
 	if (memoryConversationStarted(session)) return;
-	const root = getMemoryInstructionRoot(agentDir, settings);
 	const baseline = memoryToolDeveloperInstructionsByRoot.get(root);
 	const cachedLearned = cached && cached.sessionFile === sessionFile ? cached.snapshot?.learned : undefined;
 	const learned = cachedLearned ?? baseline?.learned ?? "";
@@ -294,15 +290,21 @@ export async function refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
 
 /**
  * Build memory usage instructions for prompt injection.
+ *
+ * `cwd` is the session's project directory, the same scope consolidation and
+ * `learn` write to; never `settings.getCwd()`, which an embedding host may pin
+ * to one directory for sessions spanning several projects.
  */
 export async function buildMemoryToolDeveloperInstructions(
 	agentDir: string,
+	cwd: string,
 	settings: Settings,
 	session?: MemoryInstructionSession,
 ): Promise<string | undefined> {
+	const root = getMemoryRoot(agentDir, cwd);
 	if (!session) {
-		const snapshot = await readMemoryToolDeveloperInstructionsSnapshot(agentDir, settings);
-		memoryToolDeveloperInstructionsByRoot.set(getMemoryInstructionRoot(agentDir, settings), snapshot);
+		const snapshot = await readMemoryToolDeveloperInstructionsSnapshot(root, settings);
+		memoryToolDeveloperInstructionsByRoot.set(root, snapshot);
 		return renderMemoryToolDeveloperInstructionsSnapshot(snapshot, settings);
 	}
 
@@ -310,7 +312,7 @@ export async function buildMemoryToolDeveloperInstructions(
 	const cached = memoryToolDeveloperInstructionsBySession.get(session);
 	if (cached && cached.sessionFile === sessionFile) return cached.value;
 
-	const snapshot = await readMemoryToolDeveloperInstructionsSnapshot(agentDir, settings);
+	const snapshot = await readMemoryToolDeveloperInstructionsSnapshot(root, settings);
 	return cacheMemoryToolDeveloperInstructions(session, sessionFile, snapshot, settings);
 }
 
@@ -358,7 +360,12 @@ async function runMemoryStartup(options: MemoryStartupOptions): Promise<void> {
 	if (!isMemoryStartupActive(options)) return;
 	await runPhase2(options);
 	if (!isMemoryStartupActive(options)) return;
-	await refreshMemoryToolDeveloperInstructionsCacheAfterStartup(options.session, options.agentDir, options.settings);
+	await refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
+		options.session,
+		options.agentDir,
+		options.session.sessionManager.getCwd(),
+		options.settings,
+	);
 	if (!isMemoryStartupActive(options)) return;
 	if (memoryConversationStarted(options.session)) return;
 	await options.session.refreshBaseSystemPrompt?.();

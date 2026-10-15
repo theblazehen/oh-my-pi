@@ -3,9 +3,9 @@
  * snapshot. Refresh tokens never leave the broker; mutating methods (`replace*`,
  * `upsert*`, `delete*ForProvider`) throw because login flows are server-side.
  *
- * Cache (`getCache`/`setCache`/`cleanExpiredCache`) is in-memory and ephemeral —
- * usage reports cache TTL is 5 minutes per credential, so durability across
- * runs isn't required.
+ * Cache (`getCache`/`setCache`/`cleanExpiredCache`) is in-memory and ephemeral.
+ * The bounded hot set preserves recently used session pins without keeping
+ * every gateway client's 30-day sticky row resident.
  */
 import * as os from "node:os";
 import { getAppName, getInstallId, logger, postmortem } from "@oh-my-pi/pi-utils";
@@ -35,6 +35,11 @@ import type {
 	SnapshotResponse,
 	SnapshotStreamEvent,
 } from "./types";
+
+// Bound both the number of distinct session pins and the size of caller-supplied
+// keys/values; an evicted session falls back to normal credential selection.
+const REMOTE_CACHE_MAX_ENTRIES = 4096;
+const REMOTE_CACHE_MAX_CHARACTERS = 4 * 1024 * 1024;
 
 /**
  * Per-provider OAuth identities visible to this trusted broker client.
@@ -289,6 +294,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	/** Present while the background loop is parked; resolved by `#noteActivity` or `close()`. */
 	#activityWakeup: PromiseWithResolvers<void> | null = null;
 	#cache: Map<string, CacheEntry> = new Map();
+	#cacheCharacters = 0;
 	#usageCache?: UsageCacheEntry;
 	#usageInflight?: Promise<UsageReport[] | null>;
 	#credentialBlockReconcileAfter: Map<string, number> = new Map();
@@ -1177,28 +1183,46 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		const entry = this.#cache.get(key);
 		if (!entry) return null;
 		if (entry.expiresAtSec * 1000 <= Date.now()) {
-			this.#cache.delete(key);
+			this.#deleteCache(key);
 			return null;
 		}
+		this.#cache.delete(key);
+		this.#cache.set(key, entry);
 		return entry.value;
 	}
 
 	setCache(key: string, value: string, expiresAtSec: number): void {
 		this.#noteActivity();
+		this.#deleteCache(key);
+		const size = key.length + value.length;
+		if (size > REMOTE_CACHE_MAX_CHARACTERS) return;
 		this.#cache.set(key, { value, expiresAtSec });
+		this.#cacheCharacters += size;
+		while (this.#cache.size > REMOTE_CACHE_MAX_ENTRIES || this.#cacheCharacters > REMOTE_CACHE_MAX_CHARACTERS) {
+			const oldest = this.#cache.keys().next().value;
+			if (oldest === undefined) break;
+			this.#deleteCache(oldest);
+		}
+	}
+
+	#deleteCache(key: string): void {
+		const entry = this.#cache.get(key);
+		if (!entry) return;
+		this.#cacheCharacters -= key.length + entry.value.length;
+		this.#cache.delete(key);
 	}
 
 	/** Drop all cache rows whose keys start with the supplied prefix. */
 	deleteCachePrefix(prefix: string): void {
 		for (const key of this.#cache.keys()) {
-			if (key.startsWith(prefix)) this.#cache.delete(key);
+			if (key.startsWith(prefix)) this.#deleteCache(key);
 		}
 	}
 
 	cleanExpiredCache(): void {
 		const nowSec = Math.floor(Date.now() / 1000);
 		for (const [key, entry] of this.#cache) {
-			if (entry.expiresAtSec <= nowSec) this.#cache.delete(key);
+			if (entry.expiresAtSec <= nowSec) this.#deleteCache(key);
 		}
 	}
 
@@ -1572,6 +1596,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		// process exiting right after close() still sends it; failures are dropped.
 		void this.#flushObservedUsage().finally(() => this.#cancelObservedUsageExitFlush?.());
 		this.#cache.clear();
+		this.#cacheCharacters = 0;
 		this.#usageOverlays.clear();
 	}
 }

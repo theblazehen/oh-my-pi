@@ -70,14 +70,16 @@ export class TanCommandController {
 		}
 
 		const parentSessionId = session.sessionId;
-		// Providers route on `promptCacheKey ?? sessionId`, so the parent's live
-		// requests may cache under a pinned key that differs from its session id
-		// (the parent being itself a fork/tan). Mirror exactly what the parent
-		// populated the cache under — same rule as advisor and handoff calls.
-		const parentPromptCacheKey = session.agent.promptCacheKey ?? parentSessionId;
+		// Explicit keys stay pinned; automatic candidates must remain model-gated
+		// if the clone later switches models or falls back during authentication.
+		const taskPromptCacheKey = this.ctx.sessionManager.getHeader()?.taskPromptCacheKey;
+		const parentPromptCacheKey =
+			session.agent.promptCacheKey ?? (taskPromptCacheKey === undefined ? parentSessionId : undefined);
 		const thinkingLevel = session.configuredThinkingLevel();
 		const systemPrompt = [...session.systemPrompt];
 		const toolNames = session.getEnabledToolNames();
+		const activeToolNames = session.getActiveToolNames();
+		const mountedToolNames = session.getMountedXdevToolNames();
 		const modelRegistry = session.modelRegistry;
 		// Snapshot the parent's rebindable extensions and root policy at dispatch.
 		// The child rebinds these (skipping discovery) so it re-registers the
@@ -131,9 +133,9 @@ export class TanCommandController {
 				// accumulated spend that session cost is otherwise derived from.
 				resetInheritedCost: true,
 				// The parent may be mid-turn: pair any tool call it left unresolved
-				// with a synthetic aborted result so the clone inherits a terminal
-				// transcript instead of rendering the parent's in-flight call as its
-				// own pending work (issue #11118).
+				// with an unknown-outcome result (the parent may still be running it)
+				// so the clone inherits a terminal transcript instead of rendering the
+				// parent's in-flight call as its own pending work (issue #11118).
 				repairInterruptedTail: true,
 			});
 
@@ -156,8 +158,11 @@ export class TanCommandController {
 								thinkingLevel,
 								systemPrompt,
 								toolNames,
+								mountedToolNames,
+								advertiseHeadlessAsk: activeToolNames.includes("ask"),
 								providerSessionId: `${parentSessionId}:tan:${Snowflake.next()}`,
 								providerPromptCacheKey: parentPromptCacheKey,
+								taskPromptCacheKey,
 								modelRegistry,
 								authStorage: modelRegistry.authStorage,
 								settings,
@@ -168,6 +173,7 @@ export class TanCommandController {
 								agentId: cloneId,
 								agentDisplayName: "tan",
 								parentTaskPrefix: cloneId,
+								asyncJobManager: manager,
 								parentAgentId: ownerId,
 								agentRegistry,
 								disableExtensionDiscovery: true,
@@ -181,6 +187,7 @@ export class TanCommandController {
 								localProtocolOptions,
 							});
 							clone = created.session;
+							await clone.setActiveToolPresentation(toolNames, mountedToolNames);
 						} catch (error) {
 							mcpFollower?.dispose();
 							throw error;

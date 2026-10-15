@@ -248,6 +248,68 @@ describe("agentLoop with AgentMessage", () => {
 		expect(nudgeText).toContain('<｜DSML｜invoke name=\\"TOOL_NAME\\">');
 	});
 
+	it("removes doubled-pipe residue from committed thinking and text before retrying", async () => {
+		const context: AgentContext = { systemPrompt: ["You are helpful."], messages: [], tools: [] };
+		const mock = createMockModel({
+			id: deepseekId,
+			responses: [
+				{
+					content: [
+						{ type: "thinking", thinking: "Plan.</｜｜DSML｜｜parameter>" },
+						{ type: "thinking", thinking: "Signed.</｜｜DSML｜｜parameter>", thinkingSignature: "signed" },
+						"Checking the build.</｜｜DSML｜｜invoke>",
+					],
+				},
+				{ content: ["Done."] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const messages = await agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream).result();
+
+		expect((messages[1] as AssistantMessage).content).toEqual([
+			{ type: "thinking", thinking: "Plan." },
+			{ type: "text", text: "Checking the build." },
+		]);
+		expect(messages.map(message => message.role)).toEqual(["user", "assistant", "developer", "assistant"]);
+	});
+
+	it("removes doubled-pipe wrapper residue alongside an executed tool call", async () => {
+		const executions: string[] = [];
+		const context: AgentContext = {
+			systemPrompt: ["You are helpful."],
+			messages: [],
+			tools: [makeEchoTool(executions)],
+		};
+		const mock = createMockModel({
+			id: deepseekId,
+			responses: [
+				{
+					content: [
+						{
+							type: "thinking",
+							thinking: "Ready.</｜｜DSML｜｜parameter>",
+							thinkingSignature: "reasoning_content",
+						},
+						{ type: "toolCall", name: "echo", arguments: { value: "build passed" } },
+						"Reported.</｜｜DSML｜｜ calls>",
+					],
+				},
+				{ content: ["Done."] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const messages = await agentLoop([createUserMessage("Hello")], context, config, undefined, mock.stream).result();
+
+		expect(executions).toEqual(["build passed"]);
+		expect((messages[1] as AssistantMessage).content).toEqual([
+			expect.objectContaining({ type: "toolCall", name: "echo" }),
+			{ type: "text", text: "Reported." },
+		]);
+		expect(messages.some(message => message.role === "developer")).toBe(false);
+	});
+
 	it("keeps prose that follows a removed DSML call", async () => {
 		const context: AgentContext = { systemPrompt: ["You are helpful."], messages: [], tools: [] };
 		const mock = createMockModel({

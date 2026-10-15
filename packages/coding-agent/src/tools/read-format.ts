@@ -148,11 +148,15 @@ export function countTextLines(text: string): number {
 	return text.length === 0 ? 0 : countNewlines(text) + 1;
 }
 
-/** `(raw ? text.split("\n") : splitAddressableFileLines(text)).length` without splitting. */
-function countSplitLines(text: string, raw: boolean): number {
-	if (raw) return countNewlines(text) + 1;
+/** Count addressable lines without splitting; a terminal LF closes the last line. */
+function countSplitLines(text: string): number {
 	if (text.length === 0) return 0;
 	return countNewlines(text) + (text.endsWith("\n") ? 0 : 1);
+}
+
+/** Raw reads retain the addressable empty line of an empty source, as disk reads do. */
+function countRawLines(text: string): number {
+	return text.length === 0 ? 1 : countSplitLines(text);
 }
 
 /** `lines.slice(start, end).join("\n")` as a substring of the `text` that `lines` was split from. */
@@ -165,11 +169,10 @@ function sliceLineRange(text: string, lines: readonly string[], start: number, e
 }
 
 /**
- * `text.split("\n").slice(start, end).join("\n")` as a substring of `text`, found
- * by walking newlines so raw reads never split the whole text for one window.
- * `start` must address an existing segment.
+ * Slice a raw range without splitting the whole text. Open-ended reads retain
+ * the terminal newline when it closes the last addressable line.
  */
-function sliceRawLineRange(text: string, start: number, end: number): string {
+function sliceRawLineRange(text: string, start: number, end: number, includeFinalNewline: boolean): string {
 	let from = 0;
 	for (let i = 0; i < start; i++) from = text.indexOf("\n", from) + 1;
 	let to = from;
@@ -177,7 +180,7 @@ function sliceRawLineRange(text: string, start: number, end: number): string {
 		const newlineAt = text.indexOf("\n", to);
 		to = newlineAt === -1 ? text.length + 1 : newlineAt + 1;
 	}
-	return text.slice(from, Math.max(from, to - 1));
+	return text.slice(from, Math.max(from, to - (includeFinalNewline ? 0 : 1)));
 }
 
 export function contiguousLineNumbers(startLine: number, count: number): number[] {
@@ -288,8 +291,7 @@ export interface InMemoryTextOptions {
 
 /**
  * Render any read selector against in-memory text. Pins `:-N` tails to the
- * text's own line count (raw mode addresses `\n` segments verbatim; otherwise
- * the hashline-addressable split), then dispatches multi-range selectors to
+ * text's addressable line count, then dispatches multi-range selectors to
  * {@link buildInMemoryMultiRangeResult} and everything else to
  * {@link buildInMemoryTextResult}. Raw mode is derived from the selector.
  */
@@ -300,7 +302,7 @@ export async function buildInMemorySelectorResult(
 	options: Omit<InMemoryTextOptions, "raw">,
 ): Promise<AgentToolResult<ReadToolDetails>> {
 	const raw = isRawSelector(parsed);
-	const totalLines = countSplitLines(text, raw);
+	const totalLines = raw ? countRawLines(text) : countSplitLines(text);
 	const sel = resolveTailSelector(parsed, totalLines);
 	if (sel.kind === "lines" && sel.ranges.length > 1) {
 		return buildInMemoryMultiRangeResult(session, text, sel.ranges, { ...options, raw });
@@ -322,7 +324,7 @@ export async function buildInMemoryTextResult(
 	// Raw mode addresses verbatim `\n` segments and shows no block context, so it
 	// slices the window straight out of `text`; only addressable reads need every line.
 	const allLines = rawDisplay ? undefined : splitAddressableFileLines(text);
-	const totalLines = allLines ? allLines.length : countNewlines(text) + 1;
+	const totalLines = allLines ? allLines.length : countRawLines(text);
 	details.totalLines = totalLines;
 	// User-requested 0-indexed range start. Lines BEFORE this are leading
 	// context (added below if offset is explicit).
@@ -374,7 +376,12 @@ export async function buildInMemoryTextResult(
 	// re-join it so the result never pins `text` through a substring.
 	const selectedRange = allLines
 		? sliceLineRange(text, allLines, startLine, endLine)
-		: sliceRawLineRange(text, startLine, endLine);
+		: sliceRawLineRange(
+				text,
+				startLine,
+				endLine,
+				limit === undefined && endLine === totalLines && text.endsWith("\n"),
+			);
 	const joinSelectedLines = (): string =>
 		(allLines ? allLines.slice(startLine, endLine) : selectedRange.split("\n")).join("\n");
 	const userLimitedLines = limit !== undefined ? endLine - startLine : undefined;
@@ -478,7 +485,7 @@ export async function buildInMemoryTextResult(
 			result: truncation,
 			options: { direction: "head", startLine: startLineDisplay, totalFileLines: totalLines },
 		};
-	} else if (userLimitedLines !== undefined && startLine + userLimitedLines < totalLines) {
+	} else if (!rawDisplay && userLimitedLines !== undefined && startLine + userLimitedLines < totalLines) {
 		const remaining = totalLines - (startLine + userLimitedLines);
 		const nextOffset = startLine + userLimitedLines + 1;
 
@@ -528,7 +535,7 @@ export async function buildInMemoryMultiRangeResult(
 	const details = options.details ?? {};
 	// Raw mode only emits the requested windows, so it never splits the whole text.
 	const allLines = options.raw === true ? undefined : splitAddressableFileLines(text);
-	const totalLines = allLines ? allLines.length : countNewlines(text) + 1;
+	const totalLines = allLines ? allLines.length : countRawLines(text);
 	details.totalLines = totalLines;
 	const shouldAddHashLines = displayMode.hashLines;
 	const shouldAddLineNumbers = shouldAddHashLines ? false : displayMode.lineNumbers;
@@ -562,7 +569,12 @@ export async function buildInMemoryMultiRangeResult(
 		if (!allLines) {
 			// Re-join (as the split path did) so the part never pins `text` through a substring.
 			rawParts.push(
-				sliceRawLineRange(text, range.startLine - 1, effectiveEnd)
+				sliceRawLineRange(
+					text,
+					range.startLine - 1,
+					effectiveEnd,
+					range.endLine === undefined && effectiveEnd === totalLines && text.endsWith("\n"),
+				)
 					.split("\n")
 					.join("\n"),
 			);

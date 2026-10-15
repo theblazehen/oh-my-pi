@@ -402,6 +402,19 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser navigation, frames, dialogs, and t
 				}),
 			),
 		).toBe("run");
+		expect(
+			valueOf(await invoke({ action: "run", name: "frames", code: 'return await (await tab.frame("#f")).text();' })),
+		).toContain("run");
+		// Only an omitted selector means the body; `null` is still rejected, as on the tab.
+		expect(
+			valueOf(
+				await invoke({
+					action: "run",
+					name: "frames",
+					code: 'const f = await tab.frame("#f"); try { await f.text(null); return "read"; } catch (e) { return String(e.message); }',
+				}),
+			),
+		).toContain("selector must be a string");
 		await invoke({
 			action: "call",
 			name: "frames",

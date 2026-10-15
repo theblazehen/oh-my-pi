@@ -18,7 +18,8 @@ export function emptyUsageStatistics(): UsageStatistics {
 	};
 }
 
-function taskUsageFrom(details: unknown): Usage | undefined {
+/** Orchestration usage a task tool result carries, when present. */
+export function taskUsageFrom(details: unknown): Usage | undefined {
 	if (details === null || typeof details !== "object") return undefined;
 	const maybeUsage = (details as Record<string, unknown>).usage;
 	return maybeUsage !== null && typeof maybeUsage === "object" ? (maybeUsage as Usage) : undefined;

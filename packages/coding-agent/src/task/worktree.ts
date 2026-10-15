@@ -6,7 +6,7 @@ import * as path from "node:path";
 import type { VcsCommitAuthor, VcsGitRepo } from "@oh-my-pi/pi-natives";
 import * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { formatBytes, getWorktreeDir, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { formatBytes, getWorktreeDir, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { SettingValueOf } from "../config/registry";
 
 import { withRepoLock } from "../utils/repo-lock";
@@ -369,7 +369,34 @@ export interface DeltaPatchResult {
 	nestedPatches: NestedRepoPatch[];
 }
 
+async function hasGitEntry(dir: string): Promise<boolean> {
+	try {
+		await fs.lstat(path.join(dir, ".git"));
+		return true;
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		throw error;
+	}
+}
+
 export async function captureDeltaPatch(isolationDir: string, baseline: WorktreeBaseline): Promise<DeltaPatchResult> {
+	// Synthetic tree construction may read a new gitlink commit before the
+	// root patch exists. Keep isolation-local objects in the source ODB first;
+	// this does not change its refs, HEAD, or index. Submodules added inside
+	// the isolation have no source checkout or `modules/<name>` admin dir (a
+	// patch apply never creates one), so their objects go to the source root
+	// ODB — the only store that survives isolation cleanup.
+	const sourceRoot = baseline.root.repoRoot;
+	const relativePaths = new Set([
+		...(await vcs.requireGit(sourceRoot).submodulePaths()),
+		...(await vcs.requireGit(isolationDir).submodulePaths()),
+	]);
+	for (const relativePath of relativePaths) {
+		const isolatedDir = path.join(isolationDir, relativePath);
+		const sourceDir = path.join(sourceRoot, relativePath);
+		if (!(await hasGitEntry(isolatedDir))) continue;
+		await vcs.copyGitObjects(isolatedDir, (await hasGitEntry(sourceDir)) ? sourceDir : sourceRoot);
+	}
 	const rootPatch = await captureRepoDeltaPatch(isolationDir, baseline.root, baseline.root.repoRoot);
 	const nestedPatches: NestedRepoPatch[] = [];
 
@@ -551,6 +578,44 @@ function getTaskIsolationSegment(repoRoot: string, id: string): string {
 	return `${TASK_ISOLATION_DIR_PREFIX}${digest}`;
 }
 
+/**
+ * Submodule pointers in copied checkouts may target the source admin directory
+ * or one under the root `.git` that detach removes. Materialize missing trees
+ * from parents down, then detach admin state from leaves up.
+ */
+async function detachSubmodules(sourceRoot: string, isolationRoot: string): Promise<void> {
+	const paths = await vcs.requireGit(sourceRoot).submodulePaths();
+	const initialized: Array<{ sourceDir: string; isolatedDir: string; isFile: boolean }> = [];
+	for (const relativePath of paths) {
+		const sourceDir = path.join(sourceRoot, relativePath);
+		const isolatedDir = path.join(isolationRoot, relativePath);
+		try {
+			await fs.lstat(path.join(sourceDir, ".git"));
+		} catch (error) {
+			if (isEnoent(error)) continue;
+			throw error;
+		}
+		let isolatedEntry;
+		try {
+			isolatedEntry = await fs.lstat(path.join(isolatedDir, ".git"));
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			// `git worktree add` (rcopy) checks out gitlinks but not their trees.
+			await fs.cp(sourceDir, isolatedDir, { recursive: true });
+			isolatedEntry = await fs.lstat(path.join(isolatedDir, ".git"));
+		}
+		initialized.push({ sourceDir, isolatedDir, isFile: isolatedEntry.isFile() });
+	}
+	for (const { sourceDir, isolatedDir, isFile } of initialized.reverse()) {
+		if (!isFile) continue;
+		const info = vcs.requireGit(sourceDir).info();
+		// A relative pointer into the copied root `.git/modules` becomes
+		// dangling after root detach; read from the source until detached.
+		await fs.writeFile(path.join(isolatedDir, ".git"), `gitdir: ${info.gitDir}\n`);
+		await vcs.detachGitDir(isolatedDir, info.commonDir);
+	}
+}
+
 export async function ensureIsolation(
 	baseCwd: string,
 	id: string,
@@ -582,6 +647,7 @@ export async function ensureIsolation(
 			// task's git operations would mutate the parent checkout and stack
 			// parallel task branches. Detaching gives each isolation a private,
 			// frozen repo that still borrows the source object DB via alternates.
+			await detachSubmodules(repoRoot, mergedDir);
 			await vcs.detachGitDir(mergedDir, sourceCommonDir);
 			return {
 				mergedDir,

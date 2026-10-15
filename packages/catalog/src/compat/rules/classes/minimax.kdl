@@ -30,7 +30,7 @@ class "minimax" {
 	// upstream metadata, not the model ceiling (documented: 1M in / 128K out).
 	// Exact selectors are case-sensitive, so both served spellings are listed:
 	// MiniMax hosts publish `MiniMax-M3`, Charm Hyper publishes `minimax-m3`.
-	on "charm-hyper" "minimax" "minimax-cn" "minimax-code" "minimax-code-cn" {
+	on "charm-hyper" "minimax" "minimax-cn" "minimax-code" "minimax-code-cn" "sambanova" {
 		models "MiniMax-M3" "minimax-m3" {
 			limits-patch {
 				context-window 1000000
@@ -97,5 +97,15 @@ class "minimax" {
 	}
 	on "minimax-code" "minimax-code-cn" "wafer-serverless" {
 		reasoning-content-field "reasoning_content"
+	}
+	// M3 reasoning reaches omp as its plaintext trace on every host, and
+	// MiniMax asks agents to pass all earlier reasoning back.
+	family "m3" {
+		portable-reasoning #true
+		// residue: M3.1 Flash Preview classifies as family m3 (no revision is
+		// extracted), but it is a different model.
+		models "*m3.1*" {
+			portable-reasoning #false
+		}
 	}
 }

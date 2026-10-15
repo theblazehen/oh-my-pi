@@ -85,9 +85,9 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { supportsOutputTokenLimit } from "@oh-my-pi/pi-catalog/compat/output-limits";
 import { requiresNativeTools, requiresToolFreeHistoryForToolOptOut } from "@oh-my-pi/pi-catalog/compat/tools";
-import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { type EditStore, PowerAssertion, type PowerAssertionOptions } from "@oh-my-pi/pi-natives";
 import {
@@ -95,7 +95,6 @@ import {
 	escapeXmlText,
 	formatDuration,
 	getAgentDbPath,
-	isEnoent,
 	isBunTestRuntime,
 	isInteractiveHost,
 	isRecord,
@@ -109,6 +108,7 @@ import {
 	withFileLock,
 } from "@oh-my-pi/pi-utils";
 import { writeArchive } from "@oh-my-pi/pi-utils/ar";
+import { frameDataBytesBudget, readerIncludesThinking } from "@oh-my-pi/snapcompact";
 import type { AdvisorConfig } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import { formatUsageResetWindow } from "@oh-my-pi/pi-tui/overlays/usage-display";
 import { loadAdvisorTranscriptCosts } from "../advisor";
@@ -155,7 +155,7 @@ import type {
 	ToolInfo,
 	TreePreparation,
 } from "../extensibility/extensions";
-import { emitSessionShutdownEvent, TOP_LEVEL_AGENT } from "../extensibility/extensions";
+import { emitSessionShutdownEvent, TOP_LEVEL_AGENT, UNAVAILABLE_ANNOTATIONS } from "../extensibility/extensions";
 import { extensionEventFromSessionEvent } from "../extensibility/extensions/lifecycle-mirror";
 import { ManagedTimers } from "../extensibility/extensions/managed-timers";
 import { createExtensionModelQuery } from "../extensibility/extensions/model-api";
@@ -172,6 +172,7 @@ import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
 import { type ChainJudge, hasNativeJudge, journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { DaemonCompletionNotification } from "../launch/protocol";
+import { MEMORY_RECALL_CHANGES_MESSAGE_TYPE } from "../memory-backend/recall-entry";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { MAGIC_KEYWORDS, type MagicKeywordContext, type MagicKeywordId } from "../modes/magic-keywords";
@@ -271,6 +272,8 @@ import type {
 	AgentSessionDisposeOptions,
 	AsyncJobInspection,
 	AsyncJobSnapshot,
+	AsyncJobSnapshotItem,
+	AsyncJobTree,
 	CommandMetadataChangedListener,
 	ContextUsageBreakdown,
 	DroppedPrompt,
@@ -314,7 +317,12 @@ import {
 	semanticToolResult,
 } from "./checkpoint-entries";
 import type { ClientBridge } from "./client-bridge";
-import { type ClaudeResetAction, type ClaudeResetPlan, planClaudeResetRedemptions } from "./claude-auto-reset";
+import {
+	type ClaudeResetAction,
+	type ClaudeResetPlan,
+	claudeResetStatusesFromReports,
+	planClaudeResetRedemptions,
+} from "./claude-auto-reset";
 import {
 	type CodexAutoRedeemCoordinator,
 	type CodexResetAction,
@@ -324,10 +332,12 @@ import {
 	ATTEMPT_COOLDOWN_MS,
 	resetAccountLockKey,
 	defaultCodexAutoRedeemCoordinator,
+	headlessApprovedResetActions,
 	isTerminalRedeemOutcome,
 	overlayLiveResetCredits,
 	planCodexResetRedemptions,
 	REDEEM_RETRY_DEFER_MS,
+	resetPlanSettings,
 	SWEEP_MIN_INTERVAL_MS,
 	shouldEvaluateCodexAutoRedeem,
 	shouldPromptCodexAutoRedeem,
@@ -337,7 +347,9 @@ import { isDateCwdReminderControl } from "./date-cwd-reminder";
 import { EvalRunner, type EvalRunnerHost } from "./eval-runner";
 import {
 	collectPendingToolCalls,
+	createInterruptedToolResults,
 	createInterruptedTurnAbortMessage,
+	hasRestorableTurn,
 	SESSION_EXIT_CUSTOM_TYPE,
 	type SessionExitData,
 	summarizeToolArguments,
@@ -395,6 +407,7 @@ import {
 	queueChipText,
 	toRestoredQueuedMessage,
 } from "./queued-messages";
+import { checkCodexBalance, readResetMarker, resetLockPath, withResetFence } from "./reset-fence";
 import type { ServingModel } from "./retry-fallback-chains";
 import {
 	type AdvisorCatchupOptions,
@@ -452,6 +465,21 @@ const DEFERRED_TITLE_MIN_WORDS = 40;
 /** Cap on the forked title request itself (measured p90 2.3s). */
 const TITLE_FORK_TIMEOUT_MS = 15_000;
 
+/** The public summary of `job` (see {@link AsyncJobSnapshotItem}). */
+function jobSnapshotItem(job: AsyncJob): AsyncJobSnapshotItem {
+	return {
+		id: job.id,
+		type: job.type,
+		status: job.status,
+		label: job.label,
+		command: job.process?.command,
+		startTime: job.startTime,
+		endTime: job.endTime,
+		agentId: job.agentId,
+		ownerId: job.ownerId,
+	};
+}
+
 import { LoopGuards, type StreamGuardsHost, StreamingEditGuard } from "./stream-guards";
 import { TodoTracker, type TodoTrackerHost } from "./todo-tracker";
 import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
@@ -461,7 +489,6 @@ import { cfgBrowserEnabled, cfgBrowserFreezeOnTurnEnd, cfgBrowserIdleCloseSec } 
 import {
 	cfgClaudeResets,
 	cfgClaudeResetsAutoRedeem,
-	cfgCodeModeInputs,
 	cfgCodexResets,
 	cfgCodexResetsAutoRedeem,
 	cfgDefaultThinkingLevel,
@@ -481,6 +508,7 @@ import {
 	cfgTierGoogle,
 	cfgTierOpenai,
 	cfgProvidersAnthropicSlowMode,
+	type ResetAutoRedeemMode,
 } from "./settings";
 import { type AnthropicSlowModeController, anthropicSlowModeLanes, formatUsageLimitLabel } from "./anthropic-slow-mode";
 import type { UsageLimitState } from "./usage-limit";
@@ -533,6 +561,12 @@ const cfgWorkspacePromptInputs = combine({
 const PLAN_MODE_REMINDER_MAX = 3;
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
 const AGENT_START_POLICY_MAX_ATTEMPTS = 3;
+/**
+ * How long the first turn waits for deferred UI/RPC MCP startup (the sdk's startup barrier
+ * uses it too): covers the 250ms startup window, config load, and servers that connect soon
+ * after, while a hung server costs at most 1.5s.
+ */
+export const MCP_DISCOVERY_TURN_WAIT_MS = 1500;
 /** Vision descriptions gate admission; stay under the RPC clients' 30 s request timeout. */
 const IMAGE_DESCRIPTION_ADMISSION_TIMEOUT_MS = 20_000;
 
@@ -606,6 +640,7 @@ const noOpUIContext: ExtensionUIContext = {
 	setFooter: () => {},
 	setHeader: () => {},
 	setEditorComponent: () => {},
+	getEditorComponent: () => undefined,
 	getToolsExpanded: () => false,
 	setToolsExpanded: () => {},
 };
@@ -748,6 +783,22 @@ function captureLiveDumpState(ref: AgentRef): SessionDumpLiveState | undefined {
 	};
 }
 
+/**
+ * Why {@link AgentSession.runEphemeralTurn} would reject a `maxTokens` cap on `model`, or
+ * `undefined` when it honors one.
+ */
+function ephemeralMaxTokensRejection(model: Model): string | undefined {
+	const thinking = model.thinking;
+	const budgetThinking = thinking?.mode === "budget" || thinking?.mode === "anthropic-budget-effort";
+	if (budgetThinking && thinking.requiresEffort && !thinking.suppressWhenOff) {
+		return "requires budget thinking and cannot preserve maxTokens for ephemeral turns";
+	}
+	// Do not silently start an unbounded request when discovery or transport
+	// policy says the output limit will be omitted or overwritten.
+	if (!supportsOutputTokenLimit(model)) return "does not support maxTokens for ephemeral turns";
+	return undefined;
+}
+
 export class AgentSession implements SettingsScope {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -876,6 +927,7 @@ export class AgentSession implements SettingsScope {
 	// Retry state
 	readonly #recovery: TurnRecovery;
 	#textOutputCommitted = true;
+	#stopTimeTodoRemindersEnabled = true;
 	#planModeReminderCount = 0;
 	#planModeReminderAwaitingProgress = false;
 	readonly #todo: TodoTracker;
@@ -916,18 +968,9 @@ export class AgentSession implements SettingsScope {
 
 	readonly #eval: EvalRunner;
 	readonly #evalToolSession: ToolSession | undefined;
-	/**
-	 * AsyncJobManager owned by this session (top-level only). Subagents leave
-	 * this undefined and **MUST NOT** dispose the global instance on teardown.
-	 */
+	/** Manager owned by this top-level session; subagents borrow but never dispose it. */
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
-	/**
-	 * AsyncJobManager scoped to this session for introspection/cancellation.
-	 *
-	 * This differs from `#ownedAsyncJobManager`: subagents can inherit a parent
-	 * manager for their own owner id, while secondary top-level sessions are left
-	 * undefined to avoid reading the primary's jobs.
-	 */
+	/** Manager of this session's root, used for its own job queries and deliveries. */
 	readonly #asyncJobManager: AsyncJobManager | undefined;
 	/** Clears this session's owner delivery sink registration; set when a manager + agent id exist. */
 	#unregisterAsyncDeliverySink: (() => void) | undefined;
@@ -989,6 +1032,10 @@ export class AgentSession implements SettingsScope {
 	#modelRegistry: ModelRegistry;
 	/** Creation-time permission for switchSession to keep the current model when a target's saved model is unrestorable. */
 	readonly #allowSessionModelFallback: boolean;
+	/** Creation-time: false when the extension UI context cannot reach a human (ACP without form elicitation). */
+	readonly #interactivePrompts: boolean;
+	/** Newest usage reports, cached by fetchUsageReports. */
+	#usageReports: UsageReport[] | undefined;
 	#usageFallbackConfirmer: UsageFallbackConfirmer | undefined;
 	#usagePreflightAbortControllers = new Set<AbortController>();
 	/** In-flight vision descriptions that gate prompt admission; abort() cancels them. */
@@ -1042,6 +1089,12 @@ export class AgentSession implements SettingsScope {
 	 * Esc would otherwise stall for the full recall timeout (issue #12668).
 	 */
 	#promptSetupAbortController: AbortController | undefined;
+	/**
+	 * Deferred UI/RPC MCP discovery still in flight (see `sdk.ts`). A turn waits on it,
+	 * bounded, so its system prompt already carries the MCP routes and instructions;
+	 * otherwise the prompt changes on the next turn and the provider prompt cache misses.
+	 */
+	#pendingMCPDiscovery: Promise<void> | undefined;
 	#activeAgentContinue: ActiveAgentContinue | undefined;
 	#agentContinueSchedulerToken = 0;
 
@@ -1602,8 +1655,6 @@ export class AgentSession implements SettingsScope {
 		return listPlanFiles({ localProtocolOptions: this.#localProtocolOptions() });
 	}
 
-	#codeModeState: { namespacesInfo?: unknown };
-
 	/** Live generation tok/s for the working row; fed by this session's own streamed deltas. */
 	readonly tokenRate: TokenRateMeter;
 
@@ -1615,13 +1666,13 @@ export class AgentSession implements SettingsScope {
 			(previous, next) =>
 				isHiddenUserCompanion(previous) && (isHiddenUserCompanion(next) || isUserQueuedMessage(next)),
 		);
-		this.#codeModeState = config.codeModeState ?? {};
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#skillDescriptions = config.skillDescriptions ?? new SkillDescriptionCatalog();
 		this.memoryEnabled = config.memoryEnabled ?? true;
 		this.#modelRegistry = config.modelRegistry;
 		this.#allowSessionModelFallback = config.allowSessionModelFallback === true;
+		this.#interactivePrompts = config.interactivePrompts !== false;
 		this.#extensionRoots =
 			config.extensionRoots ??
 			(() => ({
@@ -1659,7 +1710,12 @@ export class AgentSession implements SettingsScope {
 		});
 		this.#evalToolSession = config.evalToolSession;
 		const initialEvalStateContext = this.#buildEvalStateContextMessage();
-		if (initialEvalStateContext) this.agent.appendMessage(initialEvalStateContext);
+		if (
+			initialEvalStateContext &&
+			this.#needsEvalStateContext(this.agent.state.messages, initialEvalStateContext.content)
+		) {
+			this.agent.appendMessage(initialEvalStateContext);
+		}
 		const ircHost: IrcBridgeHost = {
 			agent: this.agent,
 			sessionManager: this.sessionManager,
@@ -1792,6 +1848,7 @@ export class AgentSession implements SettingsScope {
 			streamingEditAbortTriggered: () => this.#streamingEditGuard.abortTriggered,
 			promptGeneration: () => this.#promptGeneration,
 			promptSequence: () => this.#promptSequence,
+			unexpectedStopAbortSignal: () => this.#postPromptTasksAbortController.signal,
 			sessionId: () => this.sessionId,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
@@ -1813,6 +1870,7 @@ export class AgentSession implements SettingsScope {
 		this.#recovery = new TurnRecovery(recoveryHost, {
 			initialRetryFallback: config.initialRetryFallback,
 			deferFallbackChainValidation: this.#fallbackChainValidationDeferred,
+			unexpectedStopJudgeTimeoutMs: config.unexpectedStopJudgeTimeoutMs,
 		});
 		this.#detachUsageBeforeQueueDequeue = this.agent.addBeforeQueuedMessageDequeueHook(async signal => {
 			if (
@@ -2024,9 +2082,6 @@ export class AgentSession implements SettingsScope {
 			queuedMessageCount: () => this.queuedMessageCount,
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			model: () => this.model,
-			setCodeModeNamespacesInfo: info => {
-				this.#codeModeState.namespacesInfo = info;
-			},
 			memoryBackendSession: () => this,
 			clearInheritedProviderPromptCacheKey: () => this.#clearInheritedProviderPromptCacheKey(),
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
@@ -2317,8 +2372,12 @@ export class AgentSession implements SettingsScope {
 			reconnectToAgent: () => this.#reconnectToAgent(),
 			drainStrandedQueuedMessages: () => this.#drainStrandedQueuedMessages(),
 			buildDisplaySessionContext: () => this.buildDisplaySessionContext(),
+			persistEvalStateContext: () => {
+				const message = this.#buildEvalStateContextMessage();
+				if (message) this.sessionManager.appendMessage(message);
+			},
 			convertToLlmForSideRequest: messages => this.#convertToLlmForSideRequest(messages),
-			buildLiveProviderContext: async (summarized, retained, signal) => {
+			buildLiveProviderContext: async (summarized, retained, signal, model) => {
 				// compact() rebuilds the previous summary message; send the live
 				// agent's own one. Conversion caches and the shared date/cwd reminder
 				// key on message identity, so a copy would re-root the reminder state
@@ -2334,9 +2393,9 @@ export class AgentSession implements SettingsScope {
 				// Transform the whole history as the live turn does, then cut it:
 				// provider transforms (inline imaging, image budgets) decide per
 				// request, so a separately transformed prefix can differ.
-				const prefixLength = (await this.convertMessagesToLlm(history, signal)).length;
+				const prefixLength = (await this.convertMessagesToLlm(history, signal, model)).length;
 				const live = await this.agent.buildSideRequestContext(
-					await this.convertMessagesToLlm([...history, ...retained], signal),
+					await this.convertMessagesToLlm([...history, ...retained], signal, model),
 				);
 				// Date/cwd reminder controls are the only messages the transforms
 				// insert: count past them, and leave out any at the cut, so the kept
@@ -2358,7 +2417,7 @@ export class AgentSession implements SettingsScope {
 				this.#todo.syncFromBranch();
 				this.#modelMentions.syncFromBranch();
 			},
-			resetAdvisorRuntimes: (reason?: string) => this.#advisors.resetAllRuntimes(reason),
+			resetAdvisorRuntimes: (reason, options) => this.#advisors.resetAllRuntimes(reason, options),
 			rebaseAdvisorPrefix: reason => this.#advisors.rebaseDeliveredPrefixes(reason),
 			rebaseAfterCompaction: () => this.#stats.rebaseAfterCompaction(),
 			recordAnchoredHistoryRewrite: tokensRemoved => this.#stats.recordAnchoredHistoryRewrite(tokensRemoved),
@@ -2383,6 +2442,11 @@ export class AgentSession implements SettingsScope {
 			abortHandoff: () => this.abortHandoff(),
 		};
 		this.#maintenance = new SessionMaintenance(maintenanceHost);
+		this.addDisposer(
+			this.agent.addBeforeModelCallHook((_signal, context) =>
+				this.#maintenance.renderArchiveForModel(context.messages),
+			),
+		);
 
 		const handoffHost: SessionHandoffHost = {
 			agent: this.agent,
@@ -2394,6 +2458,7 @@ export class AgentSession implements SettingsScope {
 			model: () => this.model,
 			thinkingLevel: () => this.thinkingLevel,
 			sessionId: () => this.sessionId,
+			getPromptCacheKeyForModel: model => this.getPromptCacheKeyForModel(model),
 			baseSystemPrompt: () => this.#tools.baseSystemPrompt,
 			setSkipPostTurnMaintenance: timestamp => {
 				this.#maintenance.skipPostTurnMaintenanceAssistantTimestamp = timestamp;
@@ -2401,7 +2466,7 @@ export class AgentSession implements SettingsScope {
 			},
 			obfuscateTextForProvider: text => this.#obfuscateTextForProvider(text),
 			deobfuscateFromProvider: text => this.#deobfuscateFromProvider(text),
-			convertMessagesToLlm: (messages, signal) => this.convertMessagesToLlm(messages, signal),
+			convertMessagesToLlm: (messages, signal, model) => this.convertMessagesToLlm(messages, signal, model),
 			prepareSimpleStreamOptions: (options, provider) => this.prepareSimpleStreamOptions(options, provider),
 			effectiveServiceTier: model => this.#models.effectiveServiceTier(model),
 		};
@@ -2439,11 +2504,6 @@ export class AgentSession implements SettingsScope {
 				armIdleCloseForOwner(ownerId, seconds * 1000);
 			}
 		});
-		cfgCodeModeInputs.listen(this, () =>
-			this.#tools.reconcileCodeMode().catch(error => {
-				logger.warn("Code Mode reconcile after setting change failed", { error: String(error) });
-			}),
-		);
 
 		// Config-declared resolution done against the catalog as it stands at
 		// construction can be premature: background discovery is started
@@ -2451,11 +2511,14 @@ export class AgentSession implements SettingsScope {
 		// the CLI path), so discovery-backed providers (e.g. GitHub Copilot, or a
 		// models.yml LiteLLM provider with a cold cache) may not be populated yet.
 		// Reactivate a `no_model` advisor (#9010), retract stale
-		// retry.fallbackChains warnings (#10048), and rebind the active model to
-		// its refreshed same-selector entry (#10488) once discovery settles.
+		// retry.fallbackChains warnings (#10048), rebind the active model to
+		// its refreshed same-selector entry (#10488), and surface registry
+		// warnings discovery produced (e.g. an unreachable OLLAMA_BASE_URL)
+		// once discovery settles.
 		void this.#retryInactiveAdvisorAfterModelDiscovery();
 		void this.#revalidateFallbackChainsAfterModelDiscovery();
 		if (config.rebindModelAfterDiscovery) void this.#rebindActiveModelAfterModelDiscovery();
+		void this.#surfaceModelRegistryWarningsAfterDiscovery();
 		this.#watchWorkspaceAndPowerSettings();
 		this.#watchSessionSettings();
 		this.#watchModelAvailabilitySettings();
@@ -2830,37 +2893,51 @@ export class AgentSession implements SettingsScope {
 		const manager = this.#asyncJobManager;
 		if (!manager) return null;
 		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
-		const running = manager.getRunningJobs(ownerFilter).map(job => ({
-			id: job.id,
-			type: job.type,
-			status: job.status,
-			label: job.label,
-			command: job.process?.command,
-			startTime: job.startTime,
-			agentId: job.agentId,
-		}));
-		const recent = manager.getRecentJobs(options?.recentLimit ?? 5, ownerFilter).map(job => ({
-			id: job.id,
-			type: job.type,
-			status: job.status,
-			label: job.label,
-			command: job.process?.command,
-			startTime: job.startTime,
-			endTime: job.endTime,
-			agentId: job.agentId,
-		}));
+		const running = manager.getRunningJobs(ownerFilter).map(jobSnapshotItem);
+		const recent = manager.getRecentJobs(options?.recentLimit ?? 5, ownerFilter).map(jobSnapshotItem);
 		const delivery = manager.getDeliveryState(ownerFilter);
 		return { running, recent, delivery };
 	}
 
 	/**
-	 * Inspect one async job this session owns: its command, live pids, exit
-	 * status and output. Undefined when the job is unknown, owned by another
-	 * agent, or evicted.
+	 * Async jobs of this agent and every subagent below it: the running ones and
+	 * the `recentLimit` (default 10) newest settled ones across the tree, with the subagents
+	 * that own them and the ancestors linking those to this agent. Lineage comes
+	 * from the agent registry, falling back to the task job that runs a subagent
+	 * once its registry entry is gone.
+	 */
+	getAsyncJobTree(options?: { recentLimit?: number }): AsyncJobTree | null {
+		const manager = this.#asyncJobManager;
+		if (!manager) return null;
+		const rootId = this.#agentId;
+		const parents = this.#jobTreeParents();
+		const running = manager.getRunningJobs().filter(job => this.#inJobTree(job, parents));
+		const recent = manager
+			.getRecentJobs(Number.POSITIVE_INFINITY)
+			.filter(job => this.#inJobTree(job, parents))
+			.slice(0, options?.recentLimit ?? 10);
+		const agents = new Map<string, { id: string; parentId?: string }>();
+		for (const job of [...running, ...recent]) {
+			for (let id = job.ownerId; id !== undefined && id !== rootId && !agents.has(id); id = parents.get(id)) {
+				agents.set(id, { id, parentId: parents.get(id) });
+			}
+		}
+		return {
+			running: running.map(jobSnapshotItem),
+			recent: recent.map(jobSnapshotItem),
+			rootId,
+			agents: [...agents.values()],
+		};
+	}
+
+	/**
+	 * Inspect one async job in this agent's tree (see {@link getAsyncJobTree}):
+	 * its command, live pids, exit status and output. Undefined when the job is
+	 * unknown, owned outside the tree, or evicted.
 	 */
 	inspectAsyncJob(id: string): AsyncJobInspection | undefined {
-		const job = this.#ownedAsyncJob(id);
-		if (!job) return undefined;
+		const job = this.#asyncJobManager?.getJob(id);
+		if (!job || job.foreground || !this.#inJobTree(job, this.#jobTreeParents())) return undefined;
 		const details = job.latestDetails;
 		const reported = typeof details?.exitCode === "number" ? details.exitCode : undefined;
 		// Bash reports only non-zero exits; a completed command exited 0.
@@ -2881,6 +2958,33 @@ export class AgentSession implements SettingsScope {
 	cancelAsyncJob(id: string): boolean {
 		const job = this.#ownedAsyncJob(id);
 		return job !== undefined && this.#asyncJobManager?.cancel(id, { ownerId: job.ownerId }) === true;
+	}
+
+	/** Each agent's parent: the registry's link, else the owner of the task job that runs it. */
+	#jobTreeParents(): Map<string, string> {
+		const parents = new Map<string, string>();
+		const manager = this.#asyncJobManager;
+		if (manager) {
+			for (const job of [...manager.getRunningJobs(), ...manager.getRecentJobs(Number.POSITIVE_INFINITY)]) {
+				if (job.agentId !== undefined && job.ownerId !== undefined) parents.set(job.agentId, job.ownerId);
+			}
+		}
+		for (const ref of AgentRegistry.global().list()) {
+			if (ref.parentId !== undefined) parents.set(ref.id, ref.parentId);
+		}
+		return parents;
+	}
+
+	/** Whether `job`'s owner is this agent or descends from it; every job when this session has no agent id. */
+	#inJobTree(job: AsyncJob, parents: ReadonlyMap<string, string>): boolean {
+		const rootId = this.#agentId;
+		if (!rootId) return true;
+		const seen = new Set<string>();
+		for (let id = job.ownerId; id !== undefined && !seen.has(id); id = parents.get(id)) {
+			if (id === rootId) return true;
+			seen.add(id);
+		}
+		return false;
 	}
 
 	/** A listed job by id, under the same owner scope as {@link getAsyncJobSnapshot}. */
@@ -3581,9 +3685,7 @@ export class AgentSession implements SettingsScope {
 			if (assistantMsg.stopReason !== "aborted" && assistantMsg.stopReason !== "error" && assistantMsg.usage) {
 				assistantMsg.contextSnapshot = {
 					promptTokens: calculatePromptTokens(assistantMsg.usage),
-					nonMessageTokens:
-						this.#stats.pendingNonMessageTokens ??
-						computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision),
+					...this.#stats.nonMessageSnapshot(),
 					compactionEpoch: this.#stats.compactionEpoch,
 				};
 			}
@@ -3665,12 +3767,14 @@ export class AgentSession implements SettingsScope {
 	 * run into hidden continuity context for the next turn. Short fragments are
 	 * omitted; `convertToLlm` still strips their incomplete thinking from replay.
 	 *
-	 * Skipped for anthropic-dialect targets: the continuity quote replays the
+	 * Skipped for readers whose classifier refuses quoted reasoning (the
+	 * `classifier-cot-extraction` catalog axis): the continuity quote replays the
 	 * model's own reasoning as conversation text, which Anthropic's
 	 * `reasoning_extraction` classifier refuses (verified live against Fable 5 —
 	 * the quoted fragment trips it even inside a full agentic request on
 	 * OAuth/subscription auth). transform-messages already drops the unsigned
-	 * trailing run from replay, so nothing else is lost.
+	 * trailing run from replay, so nothing else is lost. With no model to resolve
+	 * the reader from, the quote is skipped too.
 	 *
 	 * The original thinking stays on the assistant message so live render, reload,
 	 * and display-reset rebuilds keep showing it.
@@ -3679,7 +3783,8 @@ export class AgentSession implements SettingsScope {
 		message: AssistantMessage,
 	): CustomMessage<InterruptedThinkingDetails> | undefined {
 		if (message.stopReason !== "aborted" || !isUserInterruptAbort(message)) return undefined;
-		if (preferredDialect(this.agent.state.model?.id ?? message.model) === "anthropic") return undefined;
+		const reader = this.agent.state.model ?? this.#modelRegistry.find(message.provider, message.model);
+		if (!reader || !readerIncludesThinking(reader)) return undefined;
 		const demoted = demoteInterruptedThinking(message);
 		if (!demoted || demoted.reasoning.length < INTERRUPTED_THINKING_MIN_CHARS) return undefined;
 		const interruptedAt = Date.now();
@@ -4484,7 +4589,8 @@ export class AgentSession implements SettingsScope {
 					await emitAgentEndNotification({ willContinue: true });
 					return;
 				}
-				const todoContinuationScheduled = await this.#todo.checkCompletion(msg);
+				const todoContinuationScheduled =
+					this.#stopTimeTodoRemindersEnabled && (await this.#todo.checkCompletion(msg));
 				if (todoContinuationScheduled) {
 					await emitAgentEndNotification({ willContinue: true });
 					return;
@@ -5022,11 +5128,12 @@ export class AgentSession implements SettingsScope {
 		});
 	}
 
-	async #emitAgentEndNotification(messages: AgentMessage[], options?: { willContinue?: boolean }): Promise<void> {
+	async #emitAgentEndNotification(messages: AgentMessage[], options?: AgentEndSettleOptions): Promise<void> {
 		await this.#extensionRunner?.emit({
 			type: "agent_end",
 			messages,
 			willContinue: options?.willContinue,
+			...(options?.willContinue === true && options.awaitingAsyncWork === true ? { awaitingAsyncWork: true } : {}),
 		});
 	}
 
@@ -5606,7 +5713,7 @@ export class AgentSession implements SettingsScope {
 		try {
 			await state?.dispose({ timeoutMs: consolidateTimeoutMs });
 		} finally {
-			// Consolidation may embed final memories, so terminate its worker only afterward.
+			// Consolidation may embed final memories, so drop the embedding-server connection only afterward.
 			await shutdownMnemopiEmbedClient();
 		}
 	}
@@ -6107,6 +6214,11 @@ export class AgentSession implements SettingsScope {
 			if (!this.agent.state.isStreaming && this.#inFlightEventHandlers.size === 0) return;
 		}
 	}
+	/** Stop todo reminders from starting extra turns in a single-shot print run. */
+	disableStopTimeTodoReminders(): void {
+		this.#stopTimeTodoRemindersEnabled = false;
+	}
+
 	/**
 	 * Prevent advisor notes from starting hidden primary turns while a headless
 	 * caller prints and drains the final primary response.
@@ -6239,11 +6351,6 @@ export class AgentSession implements SettingsScope {
 		return this.#tools.getEvalBridgeToolNames();
 	}
 
-	/** Tools left directly model-visible by Code Mode; undefined when inactive. */
-	getCodeModeDirectToolNames(): readonly string[] | undefined {
-		return this.#tools.getCodeModeDirectToolNames();
-	}
-
 	/** Whether a registry entry came from a built-in factory. */
 	hasBuiltInTool(name: string): boolean {
 		return this.#tools.hasBuiltInTool(name);
@@ -6356,29 +6463,6 @@ export class AgentSession implements SettingsScope {
 		return refresh;
 	}
 
-	/**
-	 * Applies Code Mode at session startup: when the initial model activates
-	 * it (`codeMode` `on`, or `auto` matching a `code_mode_only` catalog flag),
-	 * the initial tool surface is routed through the Code Mode-aware path so
-	 * the restricted direct surface and namespaces snapshot exist before the
-	 * first provider turn instead of waiting for an unrelated reconciliation.
-	 *
-	 * Inactive sessions keep their initial surface untouched: re-applying an
-	 * unchanged set would seed the prompt-rebuild signature cache and suppress
-	 * the first late tool registration's rebuild (non-MCP `xd://` mounts are
-	 * deliberately not part of that signature).
-	 */
-	initializeCodeMode(): Promise<void> {
-		const model = this.model;
-		if (!model || !this.#tools.codeModeChangesBetween(undefined, model)) return Promise.resolve();
-		return this.#tools.reconcileCodeMode();
-	}
-
-	/** Current Code Mode `tool_namespaces_info` snapshot, or `undefined` when inactive. */
-	get codeModeNamespacesInfo(): unknown {
-		return this.#codeModeState.namespacesInfo;
-	}
-
 	/** Selects enabled tools, ignoring names absent from the registry. */
 	setActiveToolsByName(toolNames: string[]): Promise<void> {
 		return this.#tools.setActiveToolsByName(toolNames);
@@ -6452,6 +6536,15 @@ export class AgentSession implements SettingsScope {
 	/** Replaces connected MCP tools and enables them immediately. */
 	refreshMCPTools(mcpTools: CustomTool[]): Promise<void> {
 		return this.#tools.refreshMCPTools(mcpTools);
+	}
+
+	/** Makes turns wait, bounded, for in-flight MCP discovery before building their system prompt. */
+	setPendingMCPDiscovery(discovery: Promise<void>): void {
+		const settled = () => {
+			if (this.#pendingMCPDiscovery === pending) this.#pendingMCPDiscovery = undefined;
+		};
+		const pending = discovery.then(settled, settled);
+		this.#pendingMCPDiscovery = pending;
 	}
 
 	/** Replaces host-owned RPC tools before the next model call. */
@@ -6545,14 +6638,22 @@ export class AgentSession implements SettingsScope {
 		return this.#providerBoundary.getImageAttachments();
 	}
 
-	buildDisplaySessionContext(): SessionContext {
-		return this.#withEvalStateContext(this.#providerBoundary.buildDisplaySessionContext());
+	buildDisplaySessionContext(model = this.model): SessionContext {
+		return this.#withEvalStateContext(this.#providerBoundary.buildDisplaySessionContext(model));
 	}
 
 	#withEvalStateContext(context: SessionContext): SessionContext {
 		const evalStateContext = this.#buildEvalStateContextMessage();
 		if (!evalStateContext) return context;
+		if (!this.#needsEvalStateContext(context.messages, evalStateContext.content)) return context;
 		return { ...context, messages: [...context.messages, evalStateContext] };
+	}
+
+	#needsEvalStateContext(messages: AgentMessage[], content: CustomMessage["content"]): boolean {
+		const latest = messages.findLast(
+			message => message.role === "custom" && message.customType === "eval-state-context",
+		);
+		return latest?.role !== "custom" || latest.content !== content;
 	}
 
 	#buildEvalStateContextMessage(): CustomMessage | undefined {
@@ -6613,14 +6714,30 @@ export class AgentSession implements SettingsScope {
 		return this.#providerBoundary.convertToLlmForSideRequest(messages);
 	}
 
-	/** Convert session messages using the same pre-LLM pipeline as the active session. */
-	async convertMessagesToLlm(messages: AgentMessage[], signal?: AbortSignal): Promise<Message[]> {
-		return await this.#providerBoundary.convertMessagesToLlm(messages, signal);
+	/**
+	 * Convert session messages using the same pre-LLM pipeline as the active
+	 * session, for a request to `model` (the active model by default): each
+	 * snapcompact archive is the view that model may read, swapped in a copy.
+	 */
+	async convertMessagesToLlm(messages: AgentMessage[], signal?: AbortSignal, model = this.model): Promise<Message[]> {
+		const readable = model ? await this.#maintenance.messagesForModel(messages, model) : messages;
+		return await this.#providerBoundary.convertMessagesToLlm(readable, signal);
 	}
 
 	/** Apply session-level stream hooks to a direct side request. */
 	prepareSimpleStreamOptions(options: SimpleStreamOptions, provider = "anthropic"): SimpleStreamOptions {
 		return this.#providerBoundary.prepareSimpleStreamOptions(options, provider);
+	}
+
+	/** Cache identity for the main loop and side requests that reuse its context. */
+	getPromptCacheKeyForModel(model: Model | undefined): string | undefined {
+		const candidate = this.sessionManager.getHeader()?.taskPromptCacheKey;
+		return (
+			this.agent.promptCacheKey ??
+			(candidate !== undefined && model !== undefined && resolveCatalogPolicy(model).taskSiblingPromptCache === true
+				? candidate
+				: undefined)
+		);
 	}
 
 	/** Current steering mode */
@@ -7015,8 +7132,7 @@ export class AgentSession implements SettingsScope {
 				: sessionPlanUrl;
 
 		const planExists = fs.existsSync(resolvedPlanPath);
-		// Capability gates, not the visible surface: a Code Mode partition keeps
-		// `task` and `ask` callable through the eval bridge after demoting them.
+		// Capability gates, not the visible surface: `xd://`-mounted tools stay callable.
 		const capableToolNames = this.getEnabledToolNames();
 		const content = prompt.render(planModeActivePrompt, {
 			planFilePath: displayPlanPath,
@@ -7693,6 +7809,18 @@ export class AgentSession implements SettingsScope {
 			(!this.#isDisposed || alreadyDisposing) &&
 			!signal?.aborted;
 		const cancelled = { baseXdevCatalogDelivered: false, commit: () => undefined };
+		const pendingMCPDiscovery = this.#pendingMCPDiscovery;
+		if (pendingMCPDiscovery) {
+			const timedOut = new Error("MCP discovery still pending");
+			// Abort ends the wait at once.
+			await withTimeout(pendingMCPDiscovery, MCP_DISCOVERY_TURN_WAIT_MS, timedOut, signal).catch(error => {
+				// Only the first turn pays the wait; later turns take whatever discovery has applied.
+				if (error === timedOut && this.#pendingMCPDiscovery === pendingMCPDiscovery) {
+					this.#pendingMCPDiscovery = undefined;
+				}
+				logger.debug("Turn started before MCP discovery finished", { error: String(error) });
+			});
+		}
 		for (let attempt = 0; attempt < AGENT_START_POLICY_MAX_ATTEMPTS; attempt++) {
 			await this.#memory.transition;
 			if (!isCurrent()) return cancelled;
@@ -7715,6 +7843,17 @@ export class AgentSession implements SettingsScope {
 			};
 			if (!overrideIsCurrent()) continue;
 			const messages: AgentMessage[] = [];
+			if (basePreparation.memoryNotice) {
+				messages.push({
+					role: "custom",
+					customType: MEMORY_RECALL_CHANGES_MESSAGE_TYPE,
+					content: basePreparation.memoryNotice.content,
+					details: basePreparation.memoryNotice.details,
+					display: false,
+					attribution: "agent",
+					timestamp: Date.now(),
+				});
+			}
 			const attribution = "attribution" in message ? message.attribution : undefined;
 			for (const payload of result?.messages ?? []) {
 				const normalized = normalizeCustomMessagePayload(payload);
@@ -8066,6 +8205,9 @@ export class AgentSession implements SettingsScope {
 				// OMP-owned Chromium alive (#5643).
 				void this.dispose().finally(() => process.exit(0));
 			},
+			resolvePlanReview: () => false,
+			getPendingPlanReview: () => undefined,
+			openPlanReview: async () => false,
 			getContextUsage: () => this.getContextUsage(),
 			getAsyncJobSnapshot: () => this.getAsyncJobSnapshot(),
 			waitForIdle: () => this.waitForIdle(),
@@ -8102,6 +8244,9 @@ export class AgentSession implements SettingsScope {
 			},
 			getSystemPrompt: () => this.systemPrompt,
 			runEphemeralTurn: args => this.runEphemeralTurn(args),
+			// The SDK always builds a runner (which receives the annotations factory); this runner-less
+			// context only exists for directly constructed sessions, which have no `/annotate` wiring.
+			annotations: UNAVAILABLE_ANNOTATIONS,
 			setInterval: (callback, ms, ...args) => this.#fallbackTimers().setInterval(callback, ms, ...args),
 			setTimeout: (callback, ms, ...args) => this.#fallbackTimers().setTimeout(callback, ms, ...args),
 			clearTimer: timer => this.#fallbackTimers().clear(timer),
@@ -8964,12 +9109,14 @@ export class AgentSession implements SettingsScope {
 
 	/** Chip texts for the queue display. Steering live steering took for the streaming response
 	 *  stays listed until the transcript records it, when the model actually switches to it. */
-	getQueuedMessages(): { steering: readonly string[]; followUp: readonly string[] } {
+	getQueuedMessages(): { steering: readonly string[]; followUp: readonly string[]; liveSteered: number } {
+		const liveSteered = this.agent.peekLiveSteeredMessages().filter(isUserAuthoredQueuedMessage).length;
 		return {
 			steering: [...this.agent.peekLiveSteeredMessages(), ...this.agent.peekSteeringQueue()]
 				.filter(isUserAuthoredQueuedMessage)
 				.map(queueChipText),
 			followUp: this.agent.peekFollowUpQueue().filter(isUserAuthoredQueuedMessage).map(queueChipText),
+			liveSteered,
 		};
 	}
 
@@ -8978,7 +9125,9 @@ export class AgentSession implements SettingsScope {
 	 *  externally observable transitions RPC/ACP/TUI subscribers actually care
 	 *  about, so a mutation that leaves the displayable queue unchanged (e.g. an
 	 *  agent-authored aside, or a claim/restore round-trip) never re-emits. */
-	#lastEmittedQueueSnapshot: { steering: readonly string[]; followUp: readonly string[] } | undefined;
+	#lastEmittedQueueSnapshot:
+		| { steering: readonly string[]; followUp: readonly string[]; liveSteered: number }
+		| undefined;
 
 	#emitQueueUpdateIfChanged(): void {
 		const snapshot = this.getQueuedMessages();
@@ -8987,11 +9136,17 @@ export class AgentSession implements SettingsScope {
 			last !== undefined &&
 			last.steering.length === snapshot.steering.length &&
 			last.followUp.length === snapshot.followUp.length &&
+			last.liveSteered === snapshot.liveSteered &&
 			last.steering.every((text, i) => text === snapshot.steering[i]) &&
 			last.followUp.every((text, i) => text === snapshot.followUp[i]);
 		if (unchanged) return;
 		this.#lastEmittedQueueSnapshot = snapshot;
-		this.#emit({ type: "queue_update", steering: [...snapshot.steering], followUp: [...snapshot.followUp] });
+		this.#emit({
+			type: "queue_update",
+			steering: [...snapshot.steering],
+			followUp: [...snapshot.followUp],
+			liveSteered: snapshot.liveSteered,
+		});
 	}
 
 	/**
@@ -10100,6 +10255,11 @@ export class AgentSession implements SettingsScope {
 		return this.#models.isFastModeActive();
 	}
 
+	/** Reports whether a fresh session on `model` realizes a fast tier from configured `tier.*` settings. */
+	isFastModeConfiguredFor(model: Model): boolean {
+		return this.#models.isFastModeConfiguredFor(model);
+	}
+
 	/** Effective wire service tier for a request to `model` under the live per-family tiers. */
 	effectiveServiceTier(model: Model): ServiceTier | undefined {
 		return this.#models.effectiveServiceTier(model);
@@ -10288,8 +10448,8 @@ export class AgentSession implements SettingsScope {
 		if (this.agent.state.messages.length === 0) {
 			await this.refreshBaseSystemPrompt();
 		} else if (enabled) {
-			// Enabled covers top-level, xd://-mounted, and Code Mode bridge-demoted
-			// tools: every path through which the model can still reach a reader.
+			// Enabled covers top-level and xd://-mounted tools: every path through
+			// which the model can still reach a reader.
 			const hasSkillReader = this.getEnabledToolNames().some(name => toolReadsSkillUris(this.getToolByName(name)));
 			const renderedSkills = this.#skillDescriptions.render(
 				hasSkillReader ? this.skills.filter(skill => skill.hide !== true) : [],
@@ -10680,19 +10840,17 @@ export class AgentSession implements SettingsScope {
 			this.#emit({ type: "model_changed" });
 		}
 
-		await this.#reconcileModelDependentState(currentModel, model);
+		await this.#reconcileModelDependentState(model);
 	}
 
-	async #reconcileModelDependentState(previousModel: Model | undefined, model: Model): Promise<void> {
+	async #reconcileModelDependentState(model: Model): Promise<void> {
 		// Re-evaluate append-only context mode — provider or setting may have changed
 		this.#syncAppendOnlyContext(model);
 
-		if (this.#tools.codeModeChangesBetween(previousModel, model) || this.#tools.codeModeDirectWireMetadataChanged()) {
-			try {
-				await this.#tools.reconcileCodeMode();
-			} catch (error) {
-				logger.warn("Code Mode reconcile after model change failed", { error: String(error) });
-			}
+		try {
+			await this.#maintenance.renderArchiveForModel();
+		} catch (error) {
+			logger.warn("snapcompact archive view after model change failed", { error: String(error) });
 		}
 
 		try {
@@ -10718,11 +10876,16 @@ export class AgentSession implements SettingsScope {
 
 	#resetCurrentResponsesProviderSession(reason: string): void {
 		const currentModel = this.model;
-		if (currentModel?.api !== "openai-responses" && currentModel?.api !== "openai-codex-responses") {
+		if (currentModel?.api === "openai-responses") {
+			// Keep the closed record: it rebuilds history from message content until
+			// the next success, while a fresh one on a host without connection
+			// binding would resend the native items the server just refused.
+			this.#providerSessionState.get(`openai-responses:${currentModel.provider}`)?.close();
+		} else if (currentModel?.api === "openai-codex-responses") {
+			this.#closeProviderSessionsForModelSwitch(currentModel, currentModel);
+		} else {
 			return;
 		}
-
-		this.#closeProviderSessionsForModelSwitch(currentModel, currentModel);
 		this.agent.appendOnlyContext?.invalidateForModelChange();
 		logger.debug("Reset Responses provider session after stale replay error", {
 			provider: currentModel.provider,
@@ -10846,6 +11009,38 @@ export class AgentSession implements SettingsScope {
 	/** Retry the last failed assistant turn when the session is idle. */
 	retry(): Promise<boolean> {
 		return this.#recovery.retry();
+	}
+
+	/**
+	 * Go on with the turn the previous process was in when it ended (`omp --restore`).
+	 *
+	 * A turn cut off without an exit record (a crash, SIGKILL or power loss records
+	 * none) is first closed the way exit recovery closes one whose exit was recorded:
+	 * its unfinished tool calls get "outcome unknown" results and an interrupted-turn
+	 * abort ends it. That turn is then retried as `/retry` does: a batch whose every
+	 * call was cut off runs again, otherwise the model answers from where the
+	 * transcript stops. A turn that finished, failed, or the user interrupted stays
+	 * as it is.
+	 *
+	 * @returns whether a continuation was scheduled; false while a turn runs, without
+	 * a model, or with nothing left unfinished.
+	 */
+	async restoreInterruptedTurn(): Promise<boolean> {
+		const branch = this.sessionManager.getBranch();
+		if (this.isStreaming || !hasRestorableTurn(branch)) return false;
+		const model = this.model;
+		if (!model) return false;
+		const abort = createInterruptedTurnAbortMessage(
+			branch,
+			{ api: model.api, provider: model.provider, model: model.id },
+			{ assumeExit: true },
+		);
+		if (abort) {
+			for (const result of createInterruptedToolResults(branch)) this.sessionManager.appendMessage(result);
+			this.sessionManager.appendMessage(abort);
+			this.agent.replaceMessages(this.buildDisplaySessionContext().messages);
+		}
+		return this.retry();
 	}
 
 	// =========================================================================
@@ -10985,12 +11180,26 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
+	 * Whether {@link runEphemeralTurn} would honor a `maxTokens` cap on the current model without
+	 * otherwise changing the request. On budget-thinking models a cap forces thinking off; when the
+	 * session thinks, that changes the thinking parameters, which providers key their prompt caches
+	 * on. Callers whose cap is optional send one only when this holds.
+	 */
+	ephemeralMaxTokensPreservesRequest(): boolean {
+		const model = this.model;
+		if (!model || ephemeralMaxTokensRejection(model)) return false;
+		const budgetThinking = model.thinking?.mode === "budget" || model.thinking?.mode === "anthropic-budget-effort";
+		return !budgetThinking || shouldDisableReasoning(this.thinkingLevel);
+	}
+
+	/**
 	 * Run a single ephemeral side-channel turn against this session's current
 	 * model + system prompt + history. The main turn's tool catalog is sent
 	 * to preserve the prompt cache unless `tools: false` is requested. The
 	 * model is reminded not to call tools and any tool calls are discarded. The side request
 	 * does not block on, or interfere with, any in-flight main turn. The
-	 * session's history and persisted state are NOT modified by this call.
+	 * session's history is NOT modified by this call (a snapcompact archive's
+	 * no-reasoning view may be stored on its compaction entry).
 	 *
 	 * Used by `BtwController` (`/btw`) and `OmfgController` (`/omfg`) to share
 	 * the snapshot + stream pipeline. The snapshot includes any in-flight
@@ -11024,21 +11233,15 @@ export class AgentSession implements SettingsScope {
 		const cappedBudgetThinking =
 			args.maxTokens !== undefined &&
 			(model.thinking?.mode === "budget" || model.thinking?.mode === "anthropic-budget-effort");
-		if (cappedBudgetThinking && model.thinking?.requiresEffort && !model.thinking.suppressWhenOff) {
+		const maxTokensRejection = args.maxTokens !== undefined ? ephemeralMaxTokensRejection(model) : undefined;
+		if (maxTokensRejection) {
 			throw new Error(
-				`Model ${modelDescription} requires budget thinking and cannot preserve maxTokens for ephemeral turns. Omit the cap or use a model that supports output limits.`,
+				`Model ${modelDescription} ${maxTokensRejection}. Omit the cap or use a model that supports output limits.`,
 			);
 		}
 		if (args.tools === false && requiresNativeTools(model)) {
 			throw new Error(
 				`Model ${modelDescription} does not support tools: false for ephemeral turns because its transport requires native tools.`,
-			);
-		}
-		// Do not silently start an unbounded request when discovery or transport
-		// policy says the output limit will be omitted or overwritten.
-		if (args.maxTokens !== undefined && !supportsOutputTokenLimit(model)) {
-			throw new Error(
-				`Model ${modelDescription} does not support maxTokens for ephemeral turns. Omit the cap or use a model that supports output limits.`,
 			);
 		}
 		assertEphemeralTurnReady();
@@ -11089,10 +11292,14 @@ export class AgentSession implements SettingsScope {
 				// Serialized BTW follow-ups reuse a topic-specific lineage; standalone
 				// side requests retain their unique request lineage.
 				sessionId: sideSessionId,
-				promptCacheKey: this.agent.promptCacheKey ?? this.agent.sessionId,
+				// Request controls (OpenAI effort updates) still replay the main
+				// conversation's, so the side request keeps its cached prefix.
+				parentSessionId: cacheSessionId,
+				promptCacheKey: this.getPromptCacheKeyForModel(model) ?? this.agent.sessionId,
 				preferWebsockets: this.preferWebsockets,
 				providerSessionState: this.#providerSessionState,
 				reasoning: toReasoningEffort(this.thinkingLevel),
+				minimizeEffort: args.minimizeEffort,
 				// Budget-thinking transports can raise explicit caps to make room for their
 				// default thinking budget. A side turn's cap is a hard resource boundary.
 				disableReasoning: shouldDisableReasoning(this.thinkingLevel) || cappedBudgetThinking,
@@ -11433,6 +11640,11 @@ export class AgentSession implements SettingsScope {
 						? `Could not restore model ${targetModelStrings[0]}. Using ${currentModel.provider}/${currentModel.id}`
 						: `Could not restore model ${targetModelStrings[0]}`;
 				}
+			}
+			// The first build used the departing model's frame budget; size the
+			// archive for the model this session is about to adopt.
+			if (targetModel && frameDataBytesBudget(targetModel) !== frameDataBytesBudget(this.model)) {
+				sessionContext = this.buildDisplaySessionContext(targetModel);
 			}
 			const didReloadConversationChange =
 				previousSessionContext !== undefined &&
@@ -12251,7 +12463,9 @@ export class AgentSession implements SettingsScope {
 			}
 
 			// Update agent state — build display context to populate agent messages.
-			const stateContext = this.sessionManager.buildSessionContext();
+			const stateContext = this.sessionManager.buildSessionContext({
+				maxFrameDataBytes: frameDataBytesBudget(this.model),
+			});
 			const displayContext = this.#withEvalStateContext(deobfuscateSessionContext(stateContext, this.#obfuscator));
 			this.agent.replaceMessages(displayContext.messages);
 			this.#rehydrateCheckpointRewindState();
@@ -12281,7 +12495,9 @@ export class AgentSession implements SettingsScope {
 					summaryEntry,
 					fromExtension: summaryText ? fromExtension : undefined,
 				});
-				const rawContext = this.sessionManager.buildSessionContext();
+				const rawContext = this.sessionManager.buildSessionContext({
+					maxFrameDataBytes: frameDataBytesBudget(this.model),
+				});
 				return {
 					editorText,
 					editorImages,
@@ -12477,8 +12693,16 @@ export class AgentSession implements SettingsScope {
 		});
 		// Every fresh usage snapshot doubles as the salvage-sweep heartbeat: the
 		// status line calls this every 5 minutes while the TUI is open.
-		if (reports) this.#maybeScheduleResetSweep(reports);
+		if (reports) {
+			this.#usageReports = reports;
+			this.#maybeScheduleResetSweep(reports);
+		}
 		return reports;
+	}
+
+	/** The newest usage snapshot, available without a network call. */
+	get cachedUsageReports(): UsageReport[] | undefined {
+		return this.#usageReports;
 	}
 
 	/** Models whose live `/usage` reports map to a quantitative provider scope. */
@@ -12555,31 +12779,41 @@ export class AgentSession implements SettingsScope {
 		return [...codex, ...claude];
 	}
 	/**
-	 * Ask before a provider's first automatic spend. Consent is persisted in
-	 * that provider's independent settings group; headless hosts only receive a
-	 * one-shot notice and never spend while the mode is unset.
+	 * Ask before a provider's first automatic spend and return the approved
+	 * actions. Consent is persisted in that provider's independent settings
+	 * group; a host that cannot prompt (no extension UI, or one whose prompts
+	 * cannot reach a human) spends only credits about to expire and gets a
+	 * one-shot notice for the rest while the mode is unset.
 	 */
 	async #confirmAutoRedeem(
 		provider: "openai-codex" | "anthropic",
 		actions: (CodexResetAction | ClaudeResetAction)[],
 		coordinator: CodexAutoRedeemCoordinator,
-	): Promise<boolean> {
-		const first = actions[0];
-		if (!first) return false;
+	): Promise<readonly (CodexResetAction | ClaudeResetAction)[]> {
+		if (actions.length === 0) return [];
 		const providerLabel = provider === "anthropic" ? "Claude" : "Codex";
 		const settingsKey = provider === "anthropic" ? "claudeResets.autoRedeem" : "codexResets.autoRedeem";
 		const source = provider === "anthropic" ? "claude-auto-reset" : "codex-auto-reset";
 		const runner = this.#extensionRunner;
-		if (!runner?.hasUI()) {
-			if (!coordinator.notifiedKeys.has(first.attemptKey)) {
-				coordinator.notifiedKeys.add(first.attemptKey);
+		if (!runner?.hasUI() || !this.#interactivePrompts) {
+			const approved = headlessApprovedResetActions(actions);
+			const waiting = actions.find(action => !approved.some(spend => spend.attemptKey === action.attemptKey));
+			if (waiting && !coordinator.notifiedKeys.has(waiting.attemptKey)) {
+				coordinator.notifiedKeys.add(waiting.attemptKey);
 				this.emitNotice(
 					"warning",
 					`Saved ${providerLabel} resets are eligible to spend, but auto-redeem is unset and no prompt UI is available. Run \`/usage reset\` or set ${settingsKey}.`,
 					source,
 				);
 			}
-			return false;
+			for (const action of approved) {
+				this.emitNotice(
+					"info",
+					`Spending a saved ${providerLabel} reset for ${action.label} before it expires in ${formatDuration(action.expiresInMs ?? 0)}; auto-redeem is unset and no prompt UI is available. Set ${settingsKey} to no to let resets expire instead.`,
+					source,
+				);
+			}
+			return approved;
 		}
 
 		const lines = actions.map(action => {
@@ -12616,7 +12850,7 @@ export class AgentSession implements SettingsScope {
 			if (choice === "Yes") {
 				if (provider === "anthropic") cfgClaudeResetsAutoRedeem.set(this.settings, "yes");
 				else cfgCodexResetsAutoRedeem.set(this.settings, "yes");
-				return true;
+				return actions;
 			}
 			if (choice === "No") {
 				if (provider === "anthropic") cfgClaudeResetsAutoRedeem.set(this.settings, "no");
@@ -12625,7 +12859,20 @@ export class AgentSession implements SettingsScope {
 		} catch (error) {
 			logger.warn(`${source} prompt failed`, { error: String(error) });
 		}
-		return false;
+		return [];
+	}
+
+	/** Spend every planned action under `yes`, and only the confirmed ones under `unset`. */
+	async #redeemConsentedResets(
+		provider: "openai-codex" | "anthropic",
+		mode: ResetAutoRedeemMode,
+		actions: (CodexResetAction | ClaudeResetAction)[],
+		coordinator: CodexAutoRedeemCoordinator,
+	): Promise<{ restoredCredentialIds: number[]; poolLimited: boolean }> {
+		const approved = shouldPromptCodexAutoRedeem(mode)
+			? await this.#confirmAutoRedeem(provider, actions, coordinator)
+			: actions;
+		return this.#executeResetActions(provider, approved, coordinator);
 	}
 
 	#planCodexResets(
@@ -12642,13 +12889,10 @@ export class AgentSession implements SettingsScope {
 			trigger,
 			provider: model?.provider ?? "",
 			modelId: model?.id ?? "",
-			settings: {
-				enabled: shouldEvaluateCodexAutoRedeem(cfg.autoRedeem),
-				minBlockedMinutes: Math.max(0, cfg.minBlockedMinutes),
-				keepCredits: Math.max(0, Math.trunc(cfg.keepCredits)),
-				salvageHorizonMs: Math.max(0, cfg.salvageHorizonHours) * 3_600_000,
-			},
+			settings: resetPlanSettings(cfg),
 			identity,
+			permitsCredential: credentialId =>
+				this.#modelRegistry.authStorage.sessions.permits("openai-codex", this.sessionId, credentialId),
 			reports,
 			attemptedKeys: coordinator.attemptedKeys,
 			deferredUntilByKey: coordinator.deferredUntilByKey,
@@ -12675,14 +12919,11 @@ export class AgentSession implements SettingsScope {
 			trigger,
 			provider: model?.provider ?? "",
 			modelId: model?.provider === "anthropic" ? model.id : "",
-			settings: {
-				enabled: shouldEvaluateCodexAutoRedeem(cfg.autoRedeem),
-				minBlockedMinutes: Math.max(0, cfg.minBlockedMinutes),
-				keepCredits: Math.max(0, Math.trunc(cfg.keepCredits)),
-				salvageHorizonMs: Math.max(0, cfg.salvageHorizonHours) * 3_600_000,
-			},
+			settings: resetPlanSettings(cfg),
 			reports,
 			statuses,
+			permitsCredential: credentialId =>
+				this.#modelRegistry.authStorage.sessions.permits("anthropic", this.sessionId, credentialId),
 			attemptedKeys: coordinator.attemptedKeys,
 			deferredUntilByKey: coordinator.deferredUntilByKey,
 			lastAttemptAtByAccount: coordinator.lastAttemptAtByAccount,
@@ -12692,22 +12933,6 @@ export class AgentSession implements SettingsScope {
 			logger.debug("claude-auto-reset: plan", { trigger, actions: plan.actions.length, skipped: plan.skipped });
 		}
 		return plan;
-	}
-
-	#resetLockPath(lockKey: string, coordinator: CodexAutoRedeemCoordinator): string {
-		return `${coordinator.resetLockPath ?? getAgentDbPath()}.reset-${Bun.hash(lockKey).toString(16)}`;
-	}
-
-	async #readResetMarker(lockPath: string): Promise<{ state: string; atMs: number }> {
-		let text: string;
-		try {
-			text = await Bun.file(lockPath).text();
-		} catch (error) {
-			if (!isEnoent(error)) throw error;
-			text = "";
-		}
-		const [state, timestamp] = text.split(":");
-		return { state, atMs: Number(timestamp) };
 	}
 
 	#adoptResetMarker(lockKey: string, marker: { state: string; atMs: number }): boolean {
@@ -12726,46 +12951,61 @@ export class AgentSession implements SettingsScope {
 	async #adoptRecentReset(
 		statuses: readonly ResetCreditAccountStatus[],
 		coordinator: CodexAutoRedeemCoordinator,
-	): Promise<boolean> {
+	): Promise<number | undefined> {
 		for (const status of statuses) {
 			if (status.provider !== this.model?.provider) continue;
+			// A peer's reset of an account outside the session's pool cannot serve its retry.
+			if (!this.#modelRegistry.authStorage.sessions.permits(status.provider, this.sessionId, status.credentialId)) {
+				continue;
+			}
 			const lockKey = resetAccountLockKey(status);
 			if (!lockKey) continue;
-			const lockPath = this.#resetLockPath(lockKey, coordinator);
+			const lockPath = resetLockPath(lockKey, coordinator.resetLockPath);
 			await fs.promises.mkdir(path.dirname(lockPath), { recursive: true });
 			const adopted = await withFileLock(
 				lockPath,
-				async () => this.#adoptResetMarker(lockKey, await this.#readResetMarker(lockPath)),
+				async () => this.#adoptResetMarker(lockKey, await readResetMarker(lockPath)),
 				{ retries: 300, retryDelayMs: 100 },
 			);
 			if (adopted) {
 				await this.#modelRegistry.authStorage.credentials.revalidate();
-				return true;
+				return status.credentialId;
 			}
 		}
-		return false;
+		return undefined;
 	}
 
 	/**
 	 * Shared consume executor for Codex and Claude plans. Attempt keys enter the
 	 * process-wide set before mutation, while nonterminal outcomes release and
 	 * defer the episode so a still-banked grant is not buried permanently.
+	 * Returns the credentials whose reset was spent or adopted from a peer, and
+	 * whether the session's account pool dropped a planned restore.
 	 */
 	async #executeResetActions(
 		provider: "openai-codex" | "anthropic",
-		actions: (CodexResetAction | ClaudeResetAction)[],
+		actions: readonly (CodexResetAction | ClaudeResetAction)[],
 		coordinator: CodexAutoRedeemCoordinator,
-	): Promise<number> {
+	): Promise<{ restoredCredentialIds: number[]; poolLimited: boolean }> {
 		const authStorage = this.#modelRegistry.authStorage;
 		const providerLabel = provider === "anthropic" ? "Claude" : "Codex";
 		const source = provider === "anthropic" ? "claude-auto-reset" : "codex-auto-reset";
-		let redeemed = 0;
+		// Consent, earlier actions, the fence and the live listing all wait after
+		// planning: a restore the session's account pool no longer allows is dropped.
+		// Checked with no await before the redeem call.
+		const outsidePool = (action: CodexResetAction | ClaudeResetAction): boolean =>
+			action.reason === "blocked-account" &&
+			!authStorage.sessions.permits(provider, this.sessionId, action.target.credentialId);
+		const restored: number[] = [];
+		let poolLimited = false;
 		for (const action of actions) {
 			if (coordinator.attemptedKeys.has(action.attemptKey)) continue;
+			const previousAttemptAt = coordinator.lastAttemptAtByAccount.get(action.accountKey);
 			coordinator.attemptedKeys.add(action.attemptKey);
 			coordinator.lastAttemptAtByAccount.set(action.accountKey, Date.now());
 			let outcome: ResetCreditRedeemOutcome | undefined;
 			let sharedReset = false;
+			let leftPool = false;
 			try {
 				const redeemOptions = {
 					target: action.target,
@@ -12776,54 +13016,39 @@ export class AgentSession implements SettingsScope {
 				const lockKey = resetAccountLockKey(action.target);
 				if (!lockKey) {
 					// An account without an upstream identity cannot share a cross-process fence.
-					outcome = await authStorage.resets.redeem(redeemOptions);
+					leftPool = outsidePool(action);
+					if (!leftPool) outcome = await authStorage.resets.redeem(redeemOptions);
 				} else {
 					// The coordinator is process-local. Fence concurrent processes and
 					// remember a recent attempt so a late 429 cannot spend again.
-					const lockPath = this.#resetLockPath(lockKey, coordinator);
-					await fs.promises.mkdir(path.dirname(lockPath), { recursive: true });
-					outcome = await withFileLock(
-						lockPath,
-						async () => {
-							const marker = await this.#readResetMarker(lockPath);
-							if (Date.now() - marker.atMs < ATTEMPT_COOLDOWN_MS) {
-								sharedReset = this.#adoptResetMarker(lockKey, marker);
-								if (sharedReset) await authStorage.credentials.revalidate();
-								return undefined;
-							}
+					outcome = await withResetFence<ResetCreditRedeemOutcome | undefined>(
+						resetLockPath(lockKey, coordinator.resetLockPath),
+						async marker => {
+							sharedReset = this.#adoptResetMarker(lockKey, marker);
+							if (sharedReset) await authStorage.credentials.revalidate();
+							return undefined;
+						},
+						async markedRedeem => {
 							// Claude's redeem revalidates its exact offer. Codex needs its
 							// balance rechecked after acquiring the cross-process fence.
 							if (provider === "openai-codex") {
 								const statuses = await this.listResetCredits(AbortSignal.timeout(10_000), provider);
-								const live = statuses.find(
-									status => status.credentialId === action.target.credentialId && !status.error,
-								);
-								if (!live) {
-									return {
-										ok: false,
-										code: "credit_list_failed",
-										provider,
-									} satisfies ResetCreditRedeemOutcome;
-								}
-								if (action.availableCount !== undefined && live.availableCount < action.availableCount) {
-									return undefined;
-								}
-								if (live.availableCount < 1) {
-									return { ok: false, code: "no_credit", provider } satisfies ResetCreditRedeemOutcome;
-								}
+								const balance = checkCodexBalance(statuses, action.target.credentialId, action.availableCount);
+								if (balance === "spent") return undefined;
+								if (balance) return { ok: false, code: balance, provider } satisfies ResetCreditRedeemOutcome;
 							}
-							const attemptedAt = Date.now();
-							await Bun.write(lockPath, `pending:${attemptedAt}`);
-							const result = await authStorage.resets.redeem(redeemOptions);
-							if (result.code === "reset") {
-								await Bun.write(lockPath, `reset:${attemptedAt}`);
-								this.#adoptedResetMarkers.set(lockKey, attemptedAt);
-							} else if (result.code === "no_credit" || result.code === "nothing_to_reset") {
-								await Bun.write(lockPath, "");
-							}
+							const { outcome: result, attemptedAt } = await markedRedeem(async () => {
+								// Checked after the pending marker is written, with no await before
+								// the redeem. A restore the pool no longer allows is never sent:
+								// report a no-op so the fence clears its marker, and drop it below.
+								leftPool = outsidePool(action);
+								if (leftPool) return { ok: false, code: "nothing_to_reset", provider };
+								return authStorage.resets.redeem(redeemOptions);
+							});
+							if (leftPool) return undefined;
+							if (result.code === "reset") this.#adoptedResetMarkers.set(lockKey, attemptedAt);
 							return result;
 						},
-						{ retries: 300, retryDelayMs: 100 },
 					);
 				}
 			} catch (error) {
@@ -12836,7 +13061,17 @@ export class AgentSession implements SettingsScope {
 				continue;
 			}
 			if (!outcome) {
-				if (sharedReset) redeemed++;
+				if (sharedReset) restored.push(action.target.credentialId);
+				if (leftPool) {
+					// Never attempted: the episode and cooldown stay free if the pool allows it again.
+					poolLimited = true;
+					coordinator.attemptedKeys.delete(action.attemptKey);
+					if (previousAttemptAt === undefined) coordinator.lastAttemptAtByAccount.delete(action.accountKey);
+					else coordinator.lastAttemptAtByAccount.set(action.accountKey, previousAttemptAt);
+					logger.debug(`${source}: restore dropped, account left the session's pool`, {
+						account: action.accountKey,
+					});
+				}
 				continue;
 			}
 			if (!isTerminalRedeemOutcome(outcome.code)) {
@@ -12845,7 +13080,7 @@ export class AgentSession implements SettingsScope {
 			}
 			switch (outcome.code) {
 				case "reset": {
-					redeemed++;
+					restored.push(action.target.credentialId);
 					const left =
 						action.availableCount === undefined ? undefined : ` (${Math.max(0, action.availableCount - 1)} left)`;
 					const detail =
@@ -12898,8 +13133,8 @@ export class AgentSession implements SettingsScope {
 					break;
 			}
 		}
-		if (redeemed > 0) void this.fetchUsageReports();
-		return redeemed;
+		if (restored.length > 0) void this.fetchUsageReports();
+		return { restoredCredentialIds: restored, poolLimited };
 	}
 
 	async #maybeAutoRedeemReset(activeBlockUnblockAtMs?: number): Promise<ResetRecoveryResult> {
@@ -12913,8 +13148,18 @@ export class AgentSession implements SettingsScope {
 		const identityValue = (identity?.accountId ?? identity?.email ?? identity?.orgId)?.trim().toLowerCase();
 		if (!identityValue) return { restored: false };
 		const accountKey = `${provider}|${identity?.orgId?.trim().toLowerCase() ?? "-"}|${identityValue}`;
-		const existing = coordinator.inFlightByAccount.get(accountKey);
-		if (existing) return existing;
+		// A pass plans within its own session's account pool. A session joining it
+		// keeps its outcome only if the pass restored an account this session may
+		// use, or restored nothing without its pool excluding a candidate.
+		let existing = coordinator.inFlightByAccount.get(accountKey);
+		while (existing) {
+			const shared = await existing;
+			const serves = shared.restored
+				? shared.restoredCredentialIds?.some(id => authStorage.sessions.permits(provider, this.sessionId, id))
+				: !shared.poolLimited;
+			if (serves) return shared;
+			existing = coordinator.inFlightByAccount.get(accountKey);
+		}
 
 		const run = (async (): Promise<ResetRecoveryResult> => {
 			let reports: UsageReport[] | null = null;
@@ -12935,8 +13180,10 @@ export class AgentSession implements SettingsScope {
 							coordinator,
 							activeBlockUnblockAtMs,
 						);
+			const poolLimited = plan.skipped.some(skip => skip.reason === "outside-account-pool");
 			if (plan.actions.length === 0) {
-				if (await this.#adoptRecentReset(statuses, coordinator)) return { restored: true };
+				const adoptedId = await this.#adoptRecentReset(statuses, coordinator);
+				if (adoptedId !== undefined) return { restored: true, restoredCredentialIds: [adoptedId] };
 				let retryAfterMs: number | undefined;
 				if (provider === "anthropic" && cfg.autoRedeem === "yes") {
 					for (const status of statuses) {
@@ -12946,15 +13193,14 @@ export class AgentSession implements SettingsScope {
 						retryAfterMs = retryAfterMs === undefined ? delay : Math.min(retryAfterMs, delay);
 					}
 				}
-				return { restored: false, retryAfterMs };
+				return { restored: false, retryAfterMs, poolLimited };
 			}
-			if (
-				shouldPromptCodexAutoRedeem(cfg.autoRedeem) &&
-				!(await this.#confirmAutoRedeem(provider, plan.actions, coordinator))
-			) {
-				return { restored: false };
-			}
-			return { restored: (await this.#executeResetActions(provider, plan.actions, coordinator)) > 0 };
+			const executed = await this.#redeemConsentedResets(provider, cfg.autoRedeem, plan.actions, coordinator);
+			return {
+				restored: executed.restoredCredentialIds.length > 0,
+				restoredCredentialIds: executed.restoredCredentialIds,
+				poolLimited: poolLimited || executed.poolLimited,
+			};
 		})()
 			.catch((error): ResetRecoveryResult => {
 				logger.warn("auto-reset: blocked pass failed", { provider, account: accountKey, error: String(error) });
@@ -12970,6 +13216,8 @@ export class AgentSession implements SettingsScope {
 	 * consent independently. Last-chance expiry checks remain active even with
 	 * the broader salvage horizon disabled. Every candidate is refreshed through
 	 * its live listing before spend; a failed listing cannot fall back to stale usage.
+	 * Claude finds its candidates in the usage reports' reset inventory first, so a
+	 * sweep with nothing to salvage lists no Claude account.
 	 */
 	#maybeScheduleResetSweep(reports: UsageReport[]): void {
 		const coordinator = this.#resetCoordinator;
@@ -12993,27 +13241,31 @@ export class AgentSession implements SettingsScope {
 					const effectiveReports = overlayLiveResetCredits(reports, statuses);
 					const identity = this.#modelRegistry.authStorage.oauth.identity("openai-codex", this.sessionId);
 					const plan = this.#planCodexResets("sweep", effectiveReports, identity, coordinator);
-					if (
-						plan.actions.length > 0 &&
-						(!shouldPromptCodexAutoRedeem(codexCfg.autoRedeem) ||
-							(await this.#confirmAutoRedeem("openai-codex", plan.actions, coordinator)))
-					) {
-						await this.#executeResetActions("openai-codex", plan.actions, coordinator);
-					}
+					await this.#redeemConsentedResets("openai-codex", codexCfg.autoRedeem, plan.actions, coordinator);
 				} catch (error) {
 					logger.warn("codex-auto-reset: salvage listing failed", { error: String(error) });
 				}
 			}
 			if (claudeEnabled) {
 				try {
-					const statuses = await this.listResetCredits(AbortSignal.timeout(10_000), "anthropic");
-					const plan = this.#planClaudeResets("sweep", reports, statuses, coordinator);
-					if (
-						plan.actions.length > 0 &&
-						(!shouldPromptCodexAutoRedeem(claudeCfg.autoRedeem) ||
-							(await this.#confirmAutoRedeem("anthropic", plan.actions, coordinator)))
-					) {
-						await this.#executeResetActions("anthropic", plan.actions, coordinator);
+					const accounts = this.#modelRegistry.authStorage.oauth.accounts("anthropic", this.sessionId);
+					const candidates = this.#planClaudeResets(
+						"sweep",
+						reports,
+						claudeResetStatusesFromReports(accounts, reports),
+						coordinator,
+					);
+					const plan =
+						candidates.actions.length > 0
+							? this.#planClaudeResets(
+									"sweep",
+									reports,
+									await this.listResetCredits(AbortSignal.timeout(10_000), "anthropic"),
+									coordinator,
+								)
+							: candidates;
+					if (plan.actions.length > 0) {
+						await this.#redeemConsentedResets("anthropic", claudeCfg.autoRedeem, plan.actions, coordinator);
 					}
 				} catch (error) {
 					logger.warn("claude-auto-reset: salvage listing failed", { error: String(error) });
@@ -13213,7 +13465,7 @@ export class AgentSession implements SettingsScope {
 		if (this.messages.length === 0) return undefined;
 		const result = await anonymizeSessionTranscripts({
 			header: this.sessionManager.getHeader(),
-			entries: this.sessionManager.getEntries(),
+			entries: await this.sessionManager.getAllEntries(),
 			sessionFile: this.sessionManager.getSessionFile(),
 			malformedRecords: this.sessionManager.loadedMalformedRecords,
 		});
@@ -13326,6 +13578,22 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
+	 * Move registry warnings produced by the initial background discovery into
+	 * {@link configWarnings} so the interactive header shows them. Startup drains
+	 * the registry before discovery runs, so a discovery-time warning (an
+	 * env-redirected built-in provider failing) would otherwise only be logged.
+	 */
+	async #surfaceModelRegistryWarningsAfterDiscovery(): Promise<void> {
+		if (this.#isDisposed || typeof this.#modelRegistry.awaitInitialBackgroundRefresh !== "function") return;
+		await this.#modelRegistry.awaitInitialBackgroundRefresh(this.#modelDiscoveryAbortController.signal);
+		if (this.#isDisposed) return;
+		const warnings = this.#modelRegistry.drainConfigWarnings();
+		if (warnings.length === 0) return;
+		this.configWarnings.push(...warnings);
+		this.#emit({ type: "config_warnings_changed" });
+	}
+
+	/**
 	 * Rebind the active model to its refreshed registry entry once the initial
 	 * background discovery settles.
 	 *
@@ -13358,7 +13626,7 @@ export class AgentSession implements SettingsScope {
 		const refreshed = found && this.#modelRegistry.fitContextWindow(found, this.settings);
 		if (!refreshed || refreshed.contextWindow === current.contextWindow) return;
 		this.agent.setModel(refreshed);
-		await this.#reconcileModelDependentState(current, refreshed);
+		await this.#reconcileModelDependentState(refreshed);
 		if (this.#isDisposed) return;
 		this.#emit({ type: "model_changed" });
 	}

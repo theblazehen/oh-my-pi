@@ -46,7 +46,7 @@ Pattern grammar and language support exposed to the model:
   - continuation lines for multi-line matches rendered with a leading space,
   - an optional `meta: NAME=value, …` line per match when ast-grep captured metavariables.
 - If no matches are found, text is `No matches found` or `No matches found. Parse issues mean the query may be mis-scoped; narrow \`path\` before concluding absence.` plus formatted parse issues.
-- If the wrapper truncates visible results, the text ends with `Result limit reached; narrow path or increase limit.`
+- If the wrapper truncates visible results, the text ends with `Result limit reached; narrow path or use skip to page through results.`
 - `details` includes counts and metadata, not full match payloads:
   - `matchCount`, `fileCount`, `filesSearched`, `limitReached`
   - optional `parseErrors`, `parseErrorsTotal`, `scopePath`, `searchPath`, `cwd`, `files`, `fileMatches`, `displayContent`, `meta`

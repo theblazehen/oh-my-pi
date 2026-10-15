@@ -1017,6 +1017,48 @@ describe("Agent", () => {
 		expect(toolResults[0]).toMatchObject({ toolCallId: toolCall.id, toolName: toolCall.name });
 	});
 
+	it("keeps only the re-run result when Cursor re-dispatches a buffered call", async () => {
+		// Issue #15749: Cursor re-sent an exec frame for a call it had already
+		// run. The provider keeps one block for the call; persisting both results
+		// paired two answers with one id, which Cursor rejects on every rebuild.
+		const mock = createMockModel({ responses: [] });
+		const toolCall = {
+			type: "toolCall" as const,
+			id: "cursor-read-race",
+			name: "read",
+			arguments: { path: "/tmp/race.txt" },
+			[kCursorExecResolved]: true,
+		};
+		const started = createAssistantMessage([toolCall]);
+		const readResult = (text: string, isError: boolean): ToolResultMessage => ({
+			role: "toolResult",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text }],
+			isError,
+			timestamp: Date.now(),
+		});
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (_model, _context, options) => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(async () => {
+					await options?.cursorOnToolResult?.(readResult("not found", true));
+					await options?.cursorOnToolResult?.(readResult("hello", false));
+					stream.push({ type: "start", partial: started });
+					stream.push({ type: "done", reason: "stop", message: started });
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("trigger");
+
+		const toolResults = agent.state.messages.filter(message => message.role === "toolResult");
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0]).toMatchObject({ isError: false, content: [{ type: "text", text: "hello" }] });
+	});
+
 	it("injects Cursor-carried passive context after the buffered results on success and provider error", async () => {
 		for (const outcome of ["done", "fail"] as const) {
 			const mock = createMockModel({ responses: [] });
@@ -1062,6 +1104,46 @@ describe("Agent", () => {
 				content: [{ type: "text", text: "cursor passive context" }],
 			});
 		}
+	});
+
+	it("delivers a returned call's updates to subscribers after its run ended", async () => {
+		// A backgrounded job keeps reporting through the call's `onUpdate` once
+		// the run yielded; its frames must still reach the transcript.
+		const toolSchema = type({});
+		let report: ((text: string) => void) | undefined;
+		const tool: AgentTool<typeof toolSchema, { state: string }> = {
+			name: "job",
+			label: "Job",
+			description: "Starts a background job",
+			parameters: toolSchema,
+			async execute(_toolCallId, _params, _signal, onUpdate) {
+				report = text => onUpdate?.({ content: [{ type: "text", text }], details: { state: "completed" } });
+				return { content: [{ type: "text", text: "started" }], details: { state: "running" } };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-job", name: "job", arguments: {} }] },
+				{ content: ["yielding"] },
+			],
+		});
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			streamFn: mock.stream,
+		});
+		const events: AgentEvent[] = [];
+		agent.subscribe(event => events.push(event));
+
+		await agent.prompt("start the job");
+		expect(events.at(-1)?.type).toBe("agent_end");
+		report?.("job output");
+
+		const late = events.at(-1);
+		expect(late).toMatchObject({
+			type: "tool_execution_update",
+			toolCallId: "tool-job",
+			partialResult: { content: [{ type: "text", text: "job output" }], details: { state: "completed" } },
+		});
 	});
 
 	it("sends passive tool context with the default LLM conversion", async () => {

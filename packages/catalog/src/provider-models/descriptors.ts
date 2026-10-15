@@ -59,6 +59,7 @@ import {
 	qianfanModelManagerOptions,
 	qwenPortalModelManagerOptions,
 	sakanaModelManagerOptions,
+	sambanovaModelManagerOptions,
 	siliconflowCnModelManagerOptions,
 	siliconflowModelManagerOptions,
 	singularityApiDevModelManagerOptions,
@@ -79,6 +80,7 @@ import {
 	zhipuCodingPlanModelManagerOptions,
 } from "./openai-compat";
 import {
+	cloudflareWorkersAiModelManagerOptions,
 	cursorModelManagerOptions,
 	devinModelManagerOptions,
 	factoryDroidModelManagerOptions,
@@ -105,6 +107,7 @@ const MODEL_MANAGER_FACTORIES: Readonly<Partial<Record<KnownProvider, ModelManag
 	cerebras: config => cerebrasModelManagerOptions(config),
 	"charm-hyper": config => charmHyperModelManagerOptions(config),
 	"cloudflare-ai-gateway": config => cloudflareAiGatewayModelManagerOptions(config),
+	"cloudflare-workers-ai": () => cloudflareWorkersAiModelManagerOptions(),
 	commandcode: config => commandCodeModelManagerOptions(config),
 	coralbricks: config => coralbricksModelManagerOptions(config),
 	cursor: config => cursorModelManagerOptions(config),
@@ -144,6 +147,7 @@ const MODEL_MANAGER_FACTORIES: Readonly<Partial<Record<KnownProvider, ModelManag
 	qianfan: config => qianfanModelManagerOptions(config),
 	"qwen-portal": config => qwenPortalModelManagerOptions(config),
 	sakana: config => sakanaModelManagerOptions(config),
+	sambanova: config => sambanovaModelManagerOptions(config),
 	siliconflow: config => siliconflowModelManagerOptions(config),
 	"siliconflow-cn": config => siliconflowCnModelManagerOptions(config),
 	"singularityapi-dev": config => singularityApiDevModelManagerOptions(config),

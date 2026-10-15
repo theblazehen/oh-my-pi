@@ -185,7 +185,7 @@ describe("queued user delivery policy", () => {
 				systemPrompt: [
 					...BASE,
 					`tools:${toolNames.join(",")}`,
-					(await backend.buildDeveloperInstructions(dir.path(), settings, session)) ?? "",
+					(await backend.buildDeveloperInstructions(dir.path(), dir.path(), settings, session)) ?? "",
 				],
 			}),
 			{ settings, tools, policy },

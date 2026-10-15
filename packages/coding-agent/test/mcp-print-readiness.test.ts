@@ -48,7 +48,26 @@ async function startServers(): Promise<{ manager: MCPManager; elapsedMs: number 
 		},
 		{},
 	);
-	return { manager, elapsedMs: Date.now() - start };
+	const elapsedMs = Date.now() - start;
+	// The startup window (250 ms) can close before a CPU-starved runner finishes
+	// even the instant handshakes; every scenario assumes only slowstart lags.
+	await waitForTools(manager, expectedTools.slice(0, 2));
+	return { manager, elapsedMs };
+}
+
+/** Resolve once every named tool is registered, however late its server's handshake lands. */
+async function waitForTools(manager: MCPManager, names: string[]): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const check = () => {
+		if (names.every(name => manager.getTools().some(tool => tool.name === name))) resolve();
+	};
+	const unsubscribe = manager.addToolsChangedListener(check);
+	check();
+	try {
+		await promise;
+	} finally {
+		unsubscribe();
+	}
 }
 
 function printSession(manager: MCPManager, refreshGate?: Promise<void>, onRefreshStarted?: () => void) {
@@ -75,7 +94,9 @@ function printSession(manager: MCPManager, refreshGate?: Promise<void>, onRefres
 			prompted = [...offered];
 		},
 		getLastAssistantMessage: () => undefined,
+		disableStopTimeTodoReminders: () => {},
 		prepareForHeadlessAdvisorDrain: () => {},
+		waitForIdle: async () => {},
 		setTextOutputCommitted: () => {},
 		waitForAdvisorCatchup: async () => true,
 		dispose: async () => {

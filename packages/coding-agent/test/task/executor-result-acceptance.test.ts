@@ -358,6 +358,76 @@ describe("runSubprocess result acceptance", () => {
 		}
 	});
 
+	it.each([true, false])(
+		"reports an IRC-only wake accurately to the parent (already messaged: %s)",
+		async alreadyMessaged => {
+			const manager = new AsyncJobManager({});
+			const harness = createHarness({ asyncJobManager: manager });
+			const registry = AgentRegistry.global();
+			registry.register({
+				id: "Parent",
+				displayName: "Parent",
+				kind: "main",
+				session: createHarness().session,
+				status: "running",
+			});
+			registry.register({
+				id: AGENT_ID,
+				displayName: AGENT_ID,
+				kind: "sub",
+				parentId: "Parent",
+				session: harness.session,
+				status: "idle",
+			});
+			attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+			const observer = harness.wakeObserver();
+			if (!observer) throw new Error("wake-turn observer was not registered");
+			const parent = {
+				cwd: "/tmp",
+				settings: Settings.isolated({ "launch.enabled": false }),
+				agentRegistry: registry,
+				asyncJobManager: manager,
+				getAgentId: () => "Parent",
+			} as unknown as ToolSession;
+
+			try {
+				const finish = observer([
+					{
+						role: "custom",
+						customType: "irc:incoming",
+						content: "report your findings",
+						display: false,
+						details: { id: "msg-report", from: "Parent", message: "report your findings" },
+						attribution: "agent",
+						timestamp: Date.now(),
+					} as unknown as AgentMessage,
+				]);
+				if (alreadyMessaged) {
+					const bus = IrcBus.global();
+					const reply = bus.wait("Parent", { from: AGENT_ID }, 1000);
+					const receipt = await bus.send({ from: AGENT_ID, to: "Parent", body: "Found the cause." });
+					expect(receipt.outcome).not.toBe("failed");
+					expect((await reply)?.body).toBe("Found the cause.");
+				}
+				const waiting = new WaitTool(parent).execute("parent-wait", {});
+				// No yield or assistant prose: only the optional IRC message above.
+				await finish?.(undefined);
+				const result = await waiting;
+				const job = result.details?.jobs?.[0];
+				expect(job?.status).toBe("completed");
+				expect(job?.resultText).toContain(`history://${AGENT_ID}`);
+				if (alreadyMessaged) {
+					expect(job?.resultText).not.toContain("produced no output");
+					expect(job?.resultText).toContain(`${AGENT_ID} sent a message during this turn`);
+				} else {
+					expect(job?.resultText).toContain("produced no output");
+				}
+			} finally {
+				await manager.dispose({ timeoutMs: 1000 });
+			}
+		},
+	);
+
 	it("blocks the parent's wait on a turn its message woke and returns the turn's answer once", async () => {
 		const manager = new AsyncJobManager({});
 		const harness = createHarness({ asyncJobManager: manager });

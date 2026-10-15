@@ -11,6 +11,7 @@ export function compositeLineAt(
 	overlayWidth: number,
 	totalWidth: number,
 ): string {
+	// An image row owns its terminal cells; the writer must see its exact placement shape.
 	if (TERMINAL.isImageLine(overlayLine)) return overlayLine;
 	if (TERMINAL.isImageLine(baseLine)) {
 		// Full-width overlays such as /switch are opaque: replace the

@@ -106,6 +106,18 @@ function extractQuotedPrefix(text: string): string | null {
 	return text.slice(quoteStart);
 }
 
+/** Extract the live whitespace-delimited or double-quoted `@` file token ending at the cursor. */
+export function extractAtFilePrefix(text: string): string | null {
+	const quotedPrefix = extractQuotedPrefix(text);
+	if (quotedPrefix?.startsWith('@"')) {
+		return quotedPrefix;
+	}
+
+	const lastDelimiterIndex = findLastDelimiter(text);
+	const tokenStart = lastDelimiterIndex === -1 ? 0 : lastDelimiterIndex + 1;
+	return text[tokenStart] === "@" ? text.slice(tokenStart) : null;
+}
+
 function parsePathPrefix(prefix: string): { rawPrefix: string; isAtPrefix: boolean; isQuotedPrefix: boolean } {
 	if (prefix.startsWith('@"')) {
 		return { rawPrefix: prefix.slice(2), isAtPrefix: true, isQuotedPrefix: true };
@@ -719,7 +731,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		}
 
 		// Check for @ file reference (fuzzy search) - must be after a delimiter or at start
-		const atPrefix = this.#extractAtPrefix(textBeforeCursor);
+		const atPrefix = extractAtFilePrefix(textBeforeCursor);
 		if (atPrefix) {
 			const { rawPrefix, isQuotedPrefix } = parsePathPrefix(atPrefix);
 			// Recursive fuzzy walks rooted outside the project (e.g. `@../`,
@@ -862,7 +874,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 		// Check if we're completing a file attachment (prefix starts with "@")
 		if (prefix.startsWith("@")) {
-			const liveAtPrefix = this.#extractAtPrefix(textBeforeCursor);
+			const liveAtPrefix = extractAtFilePrefix(textBeforeCursor);
 			if (liveAtPrefix) {
 				beforePrefix = currentLine.slice(0, cursorCol - liveAtPrefix.length);
 			}
@@ -894,23 +906,6 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			cursorLine,
 			cursorCol: beforePrefix.length + item.value.length,
 		};
-	}
-
-	// Extract @ prefix for fuzzy file suggestions
-	#extractAtPrefix(text: string): string | null {
-		const quotedPrefix = extractQuotedPrefix(text);
-		if (quotedPrefix?.startsWith('@"')) {
-			return quotedPrefix;
-		}
-
-		const lastDelimiterIndex = findLastDelimiter(text);
-		const tokenStart = lastDelimiterIndex === -1 ? 0 : lastDelimiterIndex + 1;
-
-		if (text[tokenStart] === "@") {
-			return text.slice(tokenStart);
-		}
-
-		return null;
 	}
 
 	// Extract a path-like prefix from the text before cursor

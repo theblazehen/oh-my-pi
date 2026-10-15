@@ -13,6 +13,7 @@ import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as unexpectedStopClassifier from "@oh-my-pi/pi-coding-agent/session/unexpected-stop-classifier";
+import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import * as logger from "@oh-my-pi/pi-utils/logger";
@@ -1934,6 +1935,16 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 	it("forwards todo reminder lifecycle signals to extensions", async () => {
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		// Stop reminders only fire while the todo tool is active.
+		session.agent.setTools([
+			new TodoTool({
+				cwd: tempDir.path(),
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				settings: session.settings,
+			}),
+		]);
 
 		session.setTodoPhases([
 			{

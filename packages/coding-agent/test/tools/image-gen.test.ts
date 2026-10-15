@@ -418,6 +418,26 @@ describe("imageGenTool catalog routing", () => {
 		expect(result.details?.imageCount).toBe(1);
 	});
 
+	it("labels a LiteLLM hosted image request with the conversation session header", async () => {
+		const proxied = catalogModel("litellm", "gpt-5.6-sol", "openai-responses", "chat");
+		const sessionHeaders: (string | null)[] = [];
+		const fetchMock: FetchImpl = async (_input, init) => {
+			sessionHeaders.push(new Headers(init?.headers).get("x-litellm-session-id"));
+			return hostedResponse();
+		};
+		const ctx = createContext({
+			models: [proxied],
+			settings: Settings.isolated(),
+			fetch: fetchMock,
+			activeModel: proxied,
+		});
+
+		const result = await imageGenTool.execute("litellm-hosted", { subject: "proxy" }, undefined, ctx);
+		collectPaths(result);
+
+		expect(sessionHeaders).toEqual([ctx.sessionManager.getSessionId()]);
+	});
+
 	it("omits the image tool model for Codex hosted image requests", async () => {
 		const image = catalogModel("openai-codex", "gpt-image-selected", "openai-codex-responses");
 		const carrier = catalogModel("openai-codex", "gpt-5.5", "openai-codex-responses", "chat");
@@ -485,6 +505,39 @@ describe("imageGenTool catalog routing", () => {
 		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
 		expect(text).toContain("Model: gpt-image-2-codex (catalog entry openai-codex/gpt-image-2)");
 		expect(text).toContain("(1774x887, quality low)");
+	});
+
+	it("spells the requested shape into the Codex prompt because the backend ignores the size field", async () => {
+		const image = catalogModel("openai-codex", "gpt-image-2", "openai-codex-responses");
+		const carrier = catalogModel("openai-codex", "gpt-5.5", "openai-codex-responses", "chat");
+		const requests: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = async (_input, init) => {
+			requests.push(JSON.parse(String(init?.body)));
+			const event = {
+				type: "response.completed",
+				response: { output: [{ type: "image_generation_call", result: WEBP_DATA }] },
+			};
+			return new Response(`data: ${JSON.stringify(event)}\n\n`, {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+		};
+		const settings = Settings.isolated({ modelRoles: { image: "openai-codex/gpt-image-2" } });
+		const ctx = createContext({ models: [image, carrier], settings, fetch: fetchMock });
+
+		for (const params of [{ aspect_ratio: "3:2" as const }, { image_size: "1024x1536" as const }]) {
+			collectPaths(await imageGenTool.execute("codex-shape", { subject: "apple", ...params }, undefined, ctx));
+		}
+
+		const sent = requests.map(body => {
+			const input = body.input as Array<{ content: Array<{ text?: string }> }>;
+			const tools = body.tools as Array<{ size?: string }>;
+			return { text: input[0]?.content[0]?.text, size: tools[0]?.size };
+		});
+		expect(sent).toEqual([
+			{ text: "apple.\n\nOutput format: landscape image, 3:2 aspect ratio.", size: "1536x1024" },
+			{ text: "apple.\n\nOutput format: portrait image, 1024x1536 pixels.", size: "1024x1536" },
+		]);
 	});
 
 	it.skipIf(process.platform === "win32")(

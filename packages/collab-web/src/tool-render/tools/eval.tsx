@@ -314,7 +314,8 @@ function detailCellsOf(details: Record<string, unknown> | null): DetailCell[] {
 			title: str(item.title) ?? "",
 			code: str(item.code) ?? "",
 			lang: language !== null ? (evalLangAlias(language) ?? "py") : null,
-			output: str(item.output) ?? "",
+			// JSON displays render once, from `jsonOutputs` (#10778).
+			output: str(item.textOutput) ?? str(item.output) ?? "",
 			status: str(item.status) ?? "",
 			durationMs: num(item.durationMs),
 			exitCode: num(item.exitCode),

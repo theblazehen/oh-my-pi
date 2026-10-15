@@ -451,7 +451,7 @@ describe("interactive native input ingress", () => {
 			throw new Error("new session rejected");
 		};
 		const commands = new CommandController(h.ctx);
-		h.ctx.handleClearCommand = () => commands.handleClearCommand();
+		h.ctx.handleNewCommand = () => commands.handleClearCommand();
 		h.draftWithImage("/new original [Image #1]");
 		const submitting = h.pressSubmit(FOLLOW_UP);
 		await entered.promise;

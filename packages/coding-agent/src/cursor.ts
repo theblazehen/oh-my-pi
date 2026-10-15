@@ -241,6 +241,11 @@ function createToolResultMessage(
  * The agent loop never sees these calls, so the bridge installs its own
  * `addAdditionalContext` sink and attaches what the call reported to the
  * result message; `Agent` injects it after the buffered Cursor results.
+ *
+ * Also sets `rawImages`: both read frames compose `:raw` for gutter-free text,
+ * and `read` must still answer an image file with the image. The flag rides on
+ * the caller's context only, because a missing context is what lets the
+ * extension wrapper fall back to the session's approval settings.
  */
 function createBridgeToolContext(options: CursorExecBridgeOptions): {
 	context: AgentToolContext | undefined;
@@ -251,6 +256,7 @@ function createBridgeToolContext(options: CursorExecBridgeOptions): {
 	return {
 		context: base && {
 			...base,
+			rawImages: true,
 			addAdditionalContext: (value: string) => {
 				reported.push(value);
 			},

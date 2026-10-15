@@ -39,35 +39,38 @@ interface FakeSessionDeps {
 function makeFakeSession(deps: FakeSessionDeps) {
 	const listeners = new Set<AgentSessionEventListener>();
 	const entries = deps.entries ?? [];
+	const sessionEntries = () =>
+		entries.map((e, i) => ({
+			id: `e${i}`,
+			parentId: i === 0 ? null : `e${i - 1}`,
+			timestamp: new Date(0).toISOString(),
+			type: "message" as const,
+			message:
+				e.role === "user"
+					? {
+							role: "user" as const,
+							content: e.text,
+							timestamp: 0,
+						}
+					: {
+							role: "assistant" as const,
+							content: [{ type: "text" as const, text: e.text }],
+							model: "x",
+							provider: "x",
+							api: "x",
+							stopReason: "end_turn" as const,
+							timestamp: 0,
+						},
+		}));
 	let hindsightState: HindsightSessionState | undefined;
 	const session = {
 		sessionId: deps.sessionId,
 		memoryEnabled: true,
 		settings: deps.settings ?? Settings.isolated(),
 		sessionManager: {
-			getAllEntries: async () =>
-				entries.map((e, i) => ({
-					id: `e${i}`,
-					parentId: i === 0 ? null : `e${i - 1}`,
-					timestamp: new Date(0).toISOString(),
-					type: "message" as const,
-					message:
-						e.role === "user"
-							? {
-									role: "user" as const,
-									content: e.text,
-									timestamp: 0,
-								}
-							: {
-									role: "assistant" as const,
-									content: [{ type: "text" as const, text: e.text }],
-									model: "x",
-									provider: "x",
-									api: "x",
-									stopReason: "end_turn" as const,
-									timestamp: 0,
-								},
-				})),
+			getAllEntries: async () => sessionEntries(),
+			getBranch: () => sessionEntries(),
+			appendCustomEntry: () => "",
 			getCwd: () => deps.cwd ?? "/tmp",
 			getSessionFile: () => null,
 			getSessionId: () => deps.sessionId ?? "",
@@ -419,7 +422,7 @@ describe("hindsightBackend first-turn injection", () => {
 			taskDepth: 0,
 		});
 
-		const prompt = await hindsightBackend.buildDeveloperInstructions("/tmp", settings, session as never);
+		const prompt = await hindsightBackend.buildDeveloperInstructions("/tmp", "/tmp", settings, session as never);
 		expect(prompt).toContain("Use `xd://recall` proactively");
 		expect(prompt).toContain("Use `retain` to store");
 	});
@@ -445,7 +448,7 @@ describe("hindsightBackend first-turn injection", () => {
 		state!.mentalModelsSnippet = "<mental_models>\n# User Preferences\nprefers tabs\n</mental_models>";
 		state!.lastRecallSnippet = "<memories>\nrecalled fact\n</memories>";
 
-		const prompt = await hindsightBackend.buildDeveloperInstructions("/tmp", settings, session as never);
+		const prompt = await hindsightBackend.buildDeveloperInstructions("/tmp", "/tmp", settings, session as never);
 		// `<memories>` and `<mental_models>` are mentioned in the static memory instructions
 		// bullets too. Match the actual injected block opener (tag + newline)
 		// to disambiguate documentation prose from the injected payloads.

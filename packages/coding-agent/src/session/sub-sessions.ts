@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { isAdvisorTranscriptName } from "../advisor/transcript-recorder";
 import { getAgentTombstonePath } from "../registry/agent-tombstone";
-import type { SessionEntry, SessionHeader } from "./session-entries";
+import { resolveSessionLeafId, type SessionEntry, type SessionHeader } from "./session-entries";
 import { loadSessionFile } from "./session-loader";
 
 /** Persisted subagent session transcript, keyed by slash-joined agent path. */
@@ -82,7 +82,7 @@ async function collectSubSessionsFromDir(
 				parent: parentKey,
 				header,
 				entries,
-				leafId: entries.length > 0 ? entries[entries.length - 1].id : null,
+				leafId: resolveSessionLeafId(entries),
 				aborted: fileNames.has(getAgentTombstonePath(name)),
 				malformedRecords,
 			};

@@ -4,6 +4,7 @@ import {
 	type AutocompleteItem,
 	type AutocompleteProvider,
 	atCompletionMatches,
+	extractAtFilePrefix,
 	findLeadingSlashCommandStart,
 	findTrailingSlashCommandStart,
 	isDirectoryCompletionValue,
@@ -99,7 +100,6 @@ function sameDecorations(a: readonly TspEditorDecoration[], b: readonly TspEdito
 	return true;
 }
 const MENTION_CONTEXT_RE = /(?:^|\s)\^[^\s]*$/;
-const AT_TOKEN_RE = /(?:^|\s)(@[^\s]*)$/;
 
 const AUTOCOMPLETE_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 	overflowSearch: false,
@@ -771,6 +771,12 @@ export class Editor implements Component, Focusable {
 	 *  cursor. The host styles it (ANSI allowed). Re-evaluated on every render, so hosts can derive
 	 *  it from live state. */
 	placeholder?: () => string | undefined;
+	/** Whole-message prediction for the next prompt, painted as ghost text after the cursor while
+	 *  the single-line buffer is a strict prefix of it, the cursor sits at its end, and no
+	 *  autocomplete is open. A shown prediction replaces the {@link placeholder}; Tab or Right inserts
+	 *  the rest without submitting. Must be a single line. Re-evaluated on every render, so hosts can
+	 *  derive it from live state. */
+	prediction?: () => string | undefined;
 
 	// Custom top border (for status line integration). Either an eager `content`
 	// (set once, reused every frame) or a `provider` that recomputes lazily just
@@ -1678,7 +1684,10 @@ export class Editor implements Component, Focusable {
 
 		const placeholder = this.#getPlaceholder();
 		const nativePlaceholder =
-			this.describePlaceholder !== undefined && !this.#autocompleteState && this.#isEditorEmpty()
+			this.describePlaceholder !== undefined &&
+			!this.#autocompleteState &&
+			this.#isEditorEmpty() &&
+			!this.#getPredictionSuffix()
 				? this.describePlaceholder()
 				: placeholder && plainText(placeholder).trim();
 		const atLineEnd = cursorCol >= (lines[cursorLine]?.length ?? 0);
@@ -1755,7 +1764,7 @@ export class Editor implements Component, Focusable {
 		let typed = this.#autocompletePrefix;
 		if (typed.startsWith("@")) {
 			const line = this.#state.lines[this.#state.cursorLine] ?? "";
-			typed = AT_TOKEN_RE.exec(line.slice(0, this.#state.cursorCol))?.[1] ?? typed;
+			typed = extractAtFilePrefix(line.slice(0, this.#state.cursorCol)) ?? typed;
 		}
 		typed = typed.replace(/^[/@:#$^]"?/, "");
 		return typed.slice(typed.lastIndexOf("/") + 1);
@@ -2211,8 +2220,8 @@ export class Editor implements Component, Focusable {
 				this.#moveCursor(1, 0); // Cursor movement (within text or history entry)
 			}
 		} else if (kb.matchesCanonical(canonical, "tui.editor.cursorRight")) {
-			// Right walks over the ghost word completion as if it were typed: no trailing space.
-			if (this.#acceptWordCompletion({ space: false })) return;
+			// Right walks over the ghost prediction or word completion as if it were typed: no trailing space.
+			if (this.#acceptPrediction() || this.#acceptWordCompletion({ space: false })) return;
 			this.#moveCursor(0, 1);
 		} else if (kb.matchesCanonical(canonical, "tui.editor.cursorLeft")) {
 			// Left
@@ -3340,7 +3349,7 @@ export class Editor implements Component, Focusable {
 					this.#tryTriggerAutocomplete();
 				}
 				// Check if we're in an @ file reference context
-				else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+				else if (extractAtFilePrefix(textBeforeCursor)) {
 					this.#tryTriggerAutocomplete();
 				}
 				// Check if we're in a model mention context
@@ -3464,7 +3473,7 @@ export class Editor implements Component, Focusable {
 		const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
 		if (this.#isInSlashAutocompleteContext()) {
 			this.#tryTriggerAutocomplete();
-		} else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+		} else if (extractAtFilePrefix(textBeforeCursor)) {
 			this.#tryTriggerAutocomplete();
 		} else if (MENTION_CONTEXT_RE.test(textBeforeCursor)) {
 			this.#tryTriggerAutocomplete();
@@ -3667,7 +3676,7 @@ export class Editor implements Component, Focusable {
 				this.#tryTriggerAutocomplete();
 			}
 			// @ file reference context
-			else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+			else if (extractAtFilePrefix(textBeforeCursor)) {
 				this.#tryTriggerAutocomplete();
 			}
 			// model mention context
@@ -3842,7 +3851,7 @@ export class Editor implements Component, Focusable {
 			const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
 			if (this.#isInSlashAutocompleteContext()) {
 				this.#tryTriggerAutocomplete();
-			} else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+			} else if (extractAtFilePrefix(textBeforeCursor)) {
 				this.#tryTriggerAutocomplete();
 			} else if (MENTION_CONTEXT_RE.test(textBeforeCursor)) {
 				this.#tryTriggerAutocomplete();
@@ -4179,7 +4188,7 @@ export class Editor implements Component, Focusable {
 				this.#tryTriggerAutocomplete();
 			}
 			// @ file reference context
-			else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+			else if (extractAtFilePrefix(textBeforeCursor)) {
 				this.#tryTriggerAutocomplete();
 			}
 			// model mention context
@@ -4440,8 +4449,8 @@ export class Editor implements Component, Focusable {
 	 * - Mid-prompt skill branch re-anchors when the popup item is a skill and the
 	 *   current text still ends in a matching trailing slash token, preventing a
 	 *   stale selection from replacing a newer skill prefix.
-	 * - `@`-file branch re-anchors via `#extractAtPrefix`; safe when the current text
-	 *   still ends in a whitespace-anchored `@<token>`.
+	 * - `@`-file branch re-anchors via `extractAtFilePrefix`; safe when the current text
+	 *   still ends in a whitespace-anchored or double-quoted `@` token.
 	 * - Everything else is stale — accepting it would corrupt the buffer (issue #4295).
 	 */
 	#autocompletePrefixMatchesCursorText(currentTextBeforeCursor: string, item?: SelectItem | null): boolean {
@@ -4476,7 +4485,7 @@ export class Editor implements Component, Focusable {
 		}
 
 		if (this.#autocompletePrefix.startsWith("@")) {
-			return /(?:^|\s)@[^\s]*$/.test(currentTextBeforeCursor);
+			return extractAtFilePrefix(currentTextBeforeCursor) !== null;
 		}
 
 		if (this.#autocompletePrefix.startsWith("^")) {
@@ -4627,6 +4636,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	async #handleTabCompletion(): Promise<void> {
+		if (this.#acceptPrediction()) return;
 		if (this.#acceptWordCompletion({ space: true })) return;
 		if (!this.#autocompleteProvider) return;
 
@@ -4662,6 +4672,13 @@ export class Editor implements Component, Focusable {
 		);
 		this.#insertTextAtCursor(space ? `${wordCompletion} ` : wordCompletion);
 		if (space) this.#lastAction = "accept-word";
+		return true;
+	}
+	/** Insert the rest of the shown {@link prediction}, if any. Never submits. */
+	#acceptPrediction(): boolean {
+		const suffix = this.#getPredictionSuffix();
+		if (!suffix) return false;
+		this.#insertTextAtCursor(suffix);
 		return true;
 	}
 
@@ -4863,8 +4880,8 @@ export class Editor implements Component, Focusable {
 	#narrowAtFileList(): void {
 		if (!this.#autocompleteList || !this.#autocompletePrefix.startsWith("@")) return;
 		const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
-		const token = AT_TOKEN_RE.exec(currentLine.slice(0, this.#state.cursorCol))?.[1];
-		if (token !== undefined) this.#autocompleteList.setFilter(token);
+		const token = extractAtFilePrefix(currentLine.slice(0, this.#state.cursorCol));
+		if (token !== null) this.#autocompleteList.setFilter(token);
 	}
 
 	#invalidateAutocompleteRequests(): void {
@@ -4918,7 +4935,7 @@ export class Editor implements Component, Focusable {
 
 	/**
 	 * Get inline hint text to show as dim ghost text after the cursor.
-	 * Checks selected autocomplete item's hint first, then falls back to provider.
+	 * Checks the selected autocomplete item's hint first, then the prediction, then the provider.
 	 */
 	#getInlineHint(): string | null {
 		// Check selected autocomplete item for a hint
@@ -4926,6 +4943,9 @@ export class Editor implements Component, Focusable {
 			const selected = this.#autocompleteList.getSelectedItem();
 			return selected?.hint ?? null;
 		}
+
+		const prediction = this.#getPredictionSuffix();
+		if (prediction) return prediction;
 
 		// Fall back to provider's getInlineHint
 		if (this.#autocompleteProvider?.getInlineHint) {
@@ -4940,8 +4960,21 @@ export class Editor implements Component, Focusable {
 		return this.#getWordCompletion();
 	}
 	#getPlaceholder(): string | undefined {
-		if (this.#autocompleteState || !this.#isEditorEmpty()) return undefined;
+		if (this.#autocompleteState || !this.#isEditorEmpty() || this.#getPredictionSuffix()) return undefined;
 		return this.placeholder?.() || undefined;
+	}
+	/** The part of {@link prediction} not yet typed, or `null` when no prediction is shown. */
+	#getPredictionSuffix(): string | null {
+		if (this.#autocompleteState) return null;
+		const prediction = this.prediction?.();
+		if (!prediction) return null;
+		const { lines, cursorCol } = this.#state;
+		if (lines.length !== 1) return null;
+		const typed = lines[0] ?? "";
+		if (cursorCol !== typed.length || typed.length >= prediction.length || !prediction.startsWith(typed)) {
+			return null;
+		}
+		return prediction.slice(typed.length);
 	}
 	/** Typing `typed` where it diverges from the shown ghost completion rejects that ghost. */
 	#reportTypedPastWordCompletion(typed: string): void {

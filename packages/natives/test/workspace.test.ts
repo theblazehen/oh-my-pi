@@ -27,7 +27,7 @@ it("keeps excluded-name files while pruning directories and finding ignored rule
 		expect(result.agentsMdFiles).toEqual(["src/AGENTS.md", "src/a/b/c/AGENTS.md"]);
 		expect(result.truncated).toBe(false);
 		const disabled = await listWorkspace({ path: root, maxDepth: 0, collectAgentsMd: false });
-		expect(disabled).toEqual({ entries: [], agentsMdFiles: [], truncated: false });
+		expect(disabled).toEqual({ entries: [], agentsMdFiles: [], truncated: false, unreadableDirectories: [] });
 	} finally {
 		await fs.rm(root, { recursive: true, force: true });
 	}

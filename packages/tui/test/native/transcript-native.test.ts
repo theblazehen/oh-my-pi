@@ -118,6 +118,59 @@ describe("native transcript", () => {
 		expect(h.errors).toEqual([]);
 	});
 
+	it("streams a table row to the terminal only once its line ends", async () => {
+		const component = new AssistantMessageComponent();
+		const h = await startWith(h => h.tui.addChild(component));
+		const table = "| PR | Who |\n|---|---|\n| [#1](https://example.com/pull/1) | a |";
+		component.updateContent(assistant([{ type: "text", text: `${table}\n| [#2](https://exa` }]), { transient: true });
+		await h.render();
+		const md = h.find(node => node.k === "md");
+		expect(md?.p).toMatchObject({ text: table, stream: true });
+
+		// A finished last row is sent once its newline arrives and stays sent while a tool call streams after it.
+		const before = h.frames.length;
+		const row = "\n| [#2](https://example.com/pull/2) | b |";
+		component.updateContent(
+			assistant([
+				{ type: "text", text: `${table}${row}\n` },
+				{ type: "toolCall", id: "call-1", name: "lookup_thing", arguments: {} },
+			]),
+			{ transient: true },
+		);
+		await h.render();
+		expect(opsSince(h, before)).toContainEqual(["text", md!.id, "append", row]);
+
+		const full = `${table}${row}\n| [#3](https://ex`;
+		component.updateContent(assistant([{ type: "text", text: full }]));
+		component.markTranscriptBlockFinalized();
+		await h.render();
+		expect(h.byId(md!.id)?.p).toMatchObject({ text: full });
+		expect(h.errors).toEqual([]);
+	});
+
+	it("streams an open link as its closed form, fixing only the tail as the URL grows", async () => {
+		const component = new AssistantMessageComponent();
+		const h = await startWith(h => h.tui.addChild(component));
+		const prose = "See [the docs](https://ex";
+		component.updateContent(assistant([{ type: "text", text: prose }]), { transient: true });
+		await h.render();
+		const md = h.find(node => node.k === "md");
+		expect(md?.p).toMatchObject({ text: `${prose})`, stream: true });
+
+		const before = h.frames.length;
+		component.updateContent(assistant([{ type: "text", text: `${prose}ample.com` }]), { transient: true });
+		await h.render();
+		// Only the new URL text crosses the wire: the guessed `)` stays in place behind it.
+		expect(opsSince(h, before)).toEqual([["splice", md!.id, prose.length, 0, "ample.com"]]);
+
+		const full = `${prose}ample.com) and more`;
+		component.updateContent(assistant([{ type: "text", text: full }]));
+		component.markTranscriptBlockFinalized();
+		await h.render();
+		expect(h.byId(md!.id)?.p).toMatchObject({ text: full });
+		expect(h.errors).toEqual([]);
+	});
+
 	it("hands the terminal session-resolved targets for relative links once the segment closes", async () => {
 		const component = new AssistantMessageComponent();
 		const h = await startWith(h => h.tui.addChild(component));

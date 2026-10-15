@@ -418,6 +418,8 @@ export interface ContextUsage {
 export interface QueuedMessagesState {
 	steering: string[];
 	followUp: string[];
+	/** Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them. */
+	liveSteered?: number;
 }
 
 export interface ToolDescriptor {
@@ -545,6 +547,7 @@ export interface CompactionResult {
 	shortSummary?: string;
 	details?: unknown;
 	preserveData?: Record<string, unknown>;
+	providerReplayThroughEntryId?: string;
 }
 
 export interface ModelCycleResult {
@@ -985,6 +988,8 @@ export interface QueueUpdateEvent {
 	type: "queue_update";
 	steering: string[];
 	followUp: string[];
+	/** Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them. */
+	liveSteered?: number;
 }
 
 /** A session event, discriminated by `type`; `set_event_filter` selects which are sent. */

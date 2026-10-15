@@ -28,6 +28,7 @@ import {
 } from "../render/render-utils";
 import { renderStatusLine } from "../render";
 import { framedToolCard } from "../render/tool-card";
+import { wrapPrefixedLine } from "../render/hanging-wrap";
 import { ansi, code, col, compact, keyed, md, node, row, span, text } from "../native/describe";
 import type { NativeNode } from "../native/node";
 import { OwnerMemo } from "../native/memo";
@@ -245,7 +246,7 @@ export function renderResult(
 		return { label: "Response", state: "success", bodyLines: renderGeneric(text, lines, expanded, theme) };
 	};
 
-	return framedToolCard(theme, () => {
+	return framedToolCard(theme, ({ contentWidth }) => {
 		// Read mutable state at render time
 		const { expanded, isPartial, spinnerFrame } = options;
 		const slot = expanded ? 1 : 0;
@@ -263,12 +264,18 @@ export function renderResult(
 			: formatStatusIcon(isPartial ? "running" : "error", theme, spinnerFrame);
 		const header = `${icon} LSP ${actionLabel}`;
 
+		const rail = ` ${theme.fg("mdCodeBlockBorder", theme.boxRound.vertical)} `;
+		const contentLines = codeBlockMatch
+			? bodyLines.flatMap(line =>
+					line.startsWith(rail) ? wrapPrefixedLine(rail, rail, line.slice(rail.length), contentWidth) : [line],
+				)
+			: bodyLines;
 		return {
 			header,
 			phase: isPartial ? "partial" : state,
 			sections: [
 				...(requestLines.length > 0 ? [{ content: requestLines }] : []),
-				{ label: theme.fg("toolTitle", "Response"), content: bodyLines },
+				{ label: theme.fg("toolTitle", "Response"), content: contentLines },
 			],
 			applyBg: false,
 		};

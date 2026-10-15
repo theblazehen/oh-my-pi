@@ -2,7 +2,15 @@ import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-a
 import { type Component, Container } from "../tui";
 import { Image, type ImageBudget } from "../components/image";
 import { ImageProtocol, TERMINAL } from "../terminal-capabilities";
-import { Markdown, type MarkdownTheme, rewriteMarkdownLinkDestinations } from "../components/markdown";
+import {
+	type DefaultTextStyle,
+	holdPartialTableRow,
+	Markdown,
+	type MarkdownTheme,
+	rewriteMarkdownLinkDestinations,
+	speculativeStreamingSource,
+	streamingMarkdownSource,
+} from "../components/markdown";
 import { Spacer } from "../components/spacer";
 import { Text } from "../components/text";
 import { formatDuration, formatNumber } from "@oh-my-pi/pi-utils";
@@ -12,9 +20,10 @@ import type { AssistantThinkingRenderer } from "./extension-types";
 import { ensureThemeSync, getMarkdownTheme, getMarkdownThemeWithLinkTargets, getThemeEpoch, theme } from "../theme";
 import { card, col, elapsed, node, span, text } from "../native/describe";
 import { hasTranscriptActions, runTranscriptAction } from "./transcript-actions";
-import type { NativeChild, NativeNode, NativeUiEvent } from "../native/node";
+import type { DescribeContext, NativeChild, NativeNode, NativeUiEvent } from "../native/node";
 import { isNativeRendering } from "../native/state";
-import { NativeImageCache } from "../native/blobs";
+import { NativeImageCache, nativeMediaNode } from "../native/blobs";
+import { linkedImageText } from "../prompt/image-references";
 import { Memo } from "../native/memo";
 import { EMPTY_LINK_TARGETS, resolveImageOptions } from "../render/render-utils";
 import { WidthAwareText } from "../render";
@@ -105,6 +114,14 @@ interface StableRenderInputs {
 	readonly markdown: MarkdownTheme;
 	readonly color: ((text: string) => string) | undefined;
 }
+
+/**
+ * A partial last thinking line the prose fold may still drop: the start of a
+ * fence marker (`` ` ``, `~`) or of an empty `<!-- -->` sentinel. Once it turns
+ * into either, the fold's ellipsis lands back on the line above it
+ * (`formatThinkingForDisplay`), so that line is not yet settled.
+ */
+const UNSETTLED_THINKING_TAIL = /(?:^|\n)[^\S\n]*(?:`{1,2}|~{1,2}|<(?:!(?:-(?:-[^\S\n]*-{0,2})?)?)?)[^\S\n]*$/;
 
 function isSnapshotExtension(previous: readonly StablePart[], current: readonly StablePart[]): boolean {
 	if (previous.length > current.length) return false;
@@ -245,6 +262,8 @@ export class AssistantMessageComponent extends Container {
 	#lastMessage?: AssistantMessage;
 	#emergencyText?: ProseBlock;
 	#toolImagesByCallId = new Map<string, ImageContent[]>();
+	/** File each grouped read showed that Tern's media viewer shows, for native `media` nodes. */
+	#toolMediaPathByCallId = new Map<string, string>();
 	/**
 	 * Payload keys ({@link imagePayloadKey}) whose Kitty PNG conversion this
 	 * component is awaiting, so a re-delivered image neither re-encodes nor
@@ -388,6 +407,26 @@ export class AssistantMessageComponent extends Container {
 
 	setTextColorTransform(transform?: (text: string) => string): void {
 		this.#textColorTransform = transform;
+	}
+
+	/**
+	 * Default text style for assistant paragraph Markdown. An explicitly
+	 * installed transform (live-command output) always wins and keeps its
+	 * historical paint-everything contract; otherwise the optional
+	 * `assistantMessageText` theme token paints prose, flagged `proseFg` so
+	 * markdown sub-elements keep their own `md*` tokens (docs/theme.md).
+	 * Returns undefined when the token is unset or empty so the terminal
+	 * default foreground is used byte-for-byte, exactly as before the token
+	 * existed.
+	 *
+	 * The token is re-derived on every rebuild (the theme-change path calls
+	 * `invalidate()` and rebuilds through the teardown path, which re-consults
+	 * the active theme), so prose follows theme switches both ways.
+	 */
+	#getProseTextStyle(): DefaultTextStyle | undefined {
+		if (this.#textColorTransform) return { color: this.#textColorTransform };
+		if (typeof theme === "undefined" || !theme.hasColor("assistantMessageText")) return undefined;
+		return { color: (text: string) => theme.fg("assistantMessageText", text), proseFg: true };
 	}
 
 	#getProseTheme(): MarkdownTheme {
@@ -773,7 +812,8 @@ export class AssistantMessageComponent extends Container {
 	 * head's `title`. With `hideThinkingBlock` only the live head shows (collapsed)
 	 * and a finished thought emits nothing.
 	 */
-	override describe(): NativeNode {
+	override describe(cx?: DescribeContext): NativeNode {
+		const media = cx?.supports("media") === true;
 		const tail = this.#displayedMessage ? this.#thinkingTailIndex(this.#displayedMessage) : undefined;
 		const rate =
 			tail !== undefined && this.#lastUpdateTransient && this.#thinkingRateLive
@@ -788,9 +828,10 @@ export class AssistantMessageComponent extends Container {
 			this.#errorExpanded,
 			this.#nativeViewVersion,
 			rate,
+			media,
 			getThemeEpoch(),
 		];
-		return this.#native.get(key, () => this.#describeMessage(tail, rate));
+		return this.#native.get(key, () => this.#describeMessage(tail, rate, media));
 	}
 
 	/**
@@ -803,10 +844,10 @@ export class AssistantMessageComponent extends Container {
 		this.#nativeViewVersion++;
 	}
 
-	/** Mirrors a thinking section collapsed or expanded in the terminal. */
+	/** Mirrors a thinking section collapsed or expanded in the terminal; runs its controls' clicks. */
 	handleNativeEvent(event: NativeUiEvent): void {
 		if (event.type === "action") {
-			this.#handleErrorAction(event.act);
+			this.#handleAction(event.act);
 			return;
 		}
 		if (event.type !== "toggle" || !event.key.startsWith("k")) return;
@@ -816,7 +857,7 @@ export class AssistantMessageComponent extends Container {
 		this.#nativeViewVersion++;
 	}
 
-	#describeMessage(thinkingTail: number | undefined, rate: number): NativeNode {
+	#describeMessage(thinkingTail: number | undefined, rate: number, media: boolean): NativeNode {
 		const message = this.#displayedMessage;
 		const previousParts = this.#nativeParts;
 		const parts = new Map<string, { text: string; stream: boolean; node: NativeNode }>();
@@ -829,12 +870,19 @@ export class AssistantMessageComponent extends Container {
 					: {
 							text: source,
 							stream,
-							node: node("md", stream ? { text: source, stream: true } : { text: source }, undefined, key),
+							// A streaming node renders its open link or math span as already closed, as the TUI does.
+							node: node(
+								"md",
+								stream ? { text: speculativeStreamingSource(source), stream: true } : { text: source },
+								undefined,
+								key,
+							),
 						};
 			parts.set(slot, entry);
 			return entry.node;
 		};
 		const children: NativeChild[] = [];
+		let answered = false;
 		if (message) {
 			const live = !this.#transcriptBlockFinalized && this.#lastUpdateTransient;
 			let tailIndex = -1;
@@ -851,7 +899,10 @@ export class AssistantMessageComponent extends Container {
 				const content = message.content[index]!;
 				const streaming = live && index === tailIndex;
 				if (content.type === "text" && canonicalizeMessage(content.text)) {
-					const source = content.text.trim();
+					answered = true;
+					// A native terminal sizes table columns by every row it gets: send a growing row once
+					// its line ends. Hold before trimming, which would drop the newline ending a finished row.
+					const source = (streaming ? holdPartialTableRow(content.text) : content.text).trim();
 					// The terminal renders this source itself and would resolve a relative
 					// link against its own idea of the cwd: hand it the session-resolved
 					// targets (resolved once the segment closes, so never while streaming).
@@ -935,9 +986,26 @@ export class AssistantMessageComponent extends Container {
 				}
 			}
 			if (this.#showImages && this.#showToolResultImages) {
+				// Reads of files Tern's media viewer shows: the host loads each file once by path, no bytes uploaded.
+				const shownPaths = new Set<string>();
+				if (media) {
+					for (const [toolCallId, mediaPath] of this.#toolMediaPathByCallId) {
+						if (shownPaths.has(mediaPath)) continue;
+						shownPaths.add(mediaPath);
+						children.push(nativeMediaNode(mediaPath, `r${toolCallId}`));
+					}
+				}
 				for (const [toolCallId, images] of this.#toolImagesByCallId) {
+					if (media && this.#toolMediaPathByCallId.has(toolCallId)) continue;
 					images.forEach((image, index) => {
-						children.push(this.#nativeImages.get(`r${toolCallId}:${index}`, image.data, image.mimeType));
+						children.push(
+							this.#nativeImages.get(
+								`r${toolCallId}:${index}`,
+								image.data,
+								image.mimeType,
+								this.#toolMediaPathByCallId.get(toolCallId),
+							),
+						);
 					});
 				}
 			}
@@ -958,16 +1026,29 @@ export class AssistantMessageComponent extends Container {
 		}
 		if (this.#turnUsage) {
 			const usage = formatTurnUsage(this.#turnUsage);
+			const line: NativeChild[] = [];
+			// Led by Copy and a dot: `⧉ · 12.4s · 19K tok this turn`.
+			if (answered && hasTranscriptActions()) {
+				line.push(
+					// `copy-answer`, not Tern's local `copy` (that would copy the icon's empty label).
+					node(
+						"icon",
+						{
+							name: "copy",
+							role: "omp.turn.copy",
+							title: "Copy answer",
+							aria: "Copy answer",
+							actions: { click: "copy-answer" },
+						},
+						undefined,
+						"copy",
+					),
+					node("text", { text: "·" }, undefined, "dot"),
+				);
+			}
+			line.push(node("text", { text: usage.text }, undefined, "text"));
 			children.push(
-				node(
-					"row",
-					{ role: "omp.turn.usage", gap: "xs", align: "center", title: usage.title },
-					[
-						node("icon", { name: "time" }, undefined, "icon"),
-						node("text", { text: usage.text }, undefined, "text"),
-					],
-					"turn-usage",
-				),
+				node("row", { role: "omp.turn.usage", gap: "xs", align: "center", title: usage.title }, line, "turn-usage"),
 			);
 		}
 		return col(children, { role: this.#rewound ? "omp.assistant.rewound" : "omp.assistant" });
@@ -1056,11 +1137,24 @@ export class AssistantMessageComponent extends Container {
 		return card({ role: "omp.error", tone: "error", key: "error" }, children);
 	}
 
-	/** Error frame action clicks: omp's own retry, clipboard and model-picker paths. */
-	#handleErrorAction(act: string): void {
+	/** Control clicks (the error frame's actions, the turn footer's Copy): omp's own retry, clipboard and model-picker paths. */
+	#handleAction(act: string): void {
 		if (act === "retry") runTranscriptAction({ act: "retry" });
 		else if (act === "switch-model") runTranscriptAction({ act: "switch-model" });
 		else if (act === "copy-error" && this.#errorText) runTranscriptAction({ act: "copy", text: this.#errorText });
+		else if (act === "copy-answer") {
+			const text = this.#answerText();
+			if (text) runTranscriptAction({ act: "copy", text });
+		}
+	}
+
+	/** The answer as the transcript shows it: its text blocks' markdown, a blank line apart, without thinking or tool calls. */
+	#answerText(): string {
+		const blocks: string[] = [];
+		for (const content of this.#displayedMessage?.content ?? []) {
+			if (content.type === "text" && canonicalizeMessage(content.text)) blocks.push(content.text.trim());
+		}
+		return blocks.join("\n\n");
 	}
 
 	/** Width-independent stable identities for the streamed leading thinking run. */
@@ -1173,17 +1267,23 @@ export class AssistantMessageComponent extends Container {
 					// Streaming child: publish Markdown's frozen prefix, and only
 					// once non-blank content exists past it — the block's last
 					// non-blank line is still being written (thinking's prose fold
-					// may rewrite it) and must stay out of published bytes.
+					// may rewrite it) and must stay out of published bytes. A
+					// partial thinking line the fold may still drop does not count.
+					// The frozen prefix is in streamingMarkdownSource form, so
+					// offsets into the block use that form too.
 					const raw = md.getLastRenderStableText();
 					const frozen = raw.trim();
-					if (frozen.length > 0 && /\S/.test(item.lastText.slice(raw.length))) {
+					let past = streamingMarkdownSource(item.lastText).slice(raw.length);
+					if (item.blockType === "thinking") past = past.replace(UNSETTLED_THINKING_TAIL, "");
+					if (frozen.length > 0 && /\S/.test(past)) {
 						parts.push({ kind: item.blockType, text: frozen });
 					}
 					break;
 				}
 				// Closed child: only the streaming tail may mutate in place, so
-				// everything before it is final.
-				parts.push({ kind: item.blockType, text: item.lastText });
+				// everything before it is final. Same form as the frozen prefix it
+				// published while streaming, so the snapshot still extends.
+				parts.push({ kind: item.blockType, text: streamingMarkdownSource(item.lastText) });
 				itemIndex++;
 				continue;
 			}
@@ -1269,14 +1369,7 @@ export class AssistantMessageComponent extends Container {
 	/** Markdown for a text or thinking block; live children and stable-row renders share it so stable rows prefix the block render. */
 	#createMarkdown(kind: StablePartKind, text: string): Markdown {
 		return kind === "text"
-			? new Markdown(
-					text,
-					1,
-					0,
-					this.#getProseTheme(),
-					this.#textColorTransform ? { color: this.#textColorTransform } : undefined,
-					0,
-				)
+			? new Markdown(text, 1, 0, this.#getProseTheme(), this.#getProseTextStyle(), 0)
 			: new Markdown(text, 1, 0, getMarkdownTheme(), {
 					color: (value: string) => theme.fg("thinkingText", value),
 					italic: true,
@@ -1475,8 +1568,15 @@ export class AssistantMessageComponent extends Container {
 		}
 	}
 
-	setToolResultImages(toolCallId: string, images: ImageContent[]): void {
+	/**
+	 * A grouped read's result images, and `mediaPath`: the file it read that Tern's media viewer
+	 * shows (read details), which a native host supporting `media` shows by path instead of the
+	 * images. A media-only result (a model, a PDF) passes no images.
+	 */
+	setToolResultImages(toolCallId: string, images: ImageContent[], mediaPath?: string): void {
 		if (!toolCallId) return;
+		if (mediaPath) this.#toolMediaPathByCallId.set(toolCallId, mediaPath);
+		else this.#toolMediaPathByCallId.delete(toolCallId);
 		const validImages = images.filter(img => img.type === "image" && img.data && img.mimeType);
 		if (validImages.length === 0) {
 			this.#toolImagesByCallId.delete(toolCallId);
@@ -1518,12 +1618,15 @@ export class AssistantMessageComponent extends Container {
 		}
 	}
 
-	#renderImageEntries(entries: Array<{ image: ImageContent; key: string }>, withLeadingSpacer: boolean): void {
+	#renderImageEntries(
+		entries: Array<{ image: ImageContent; key: string; sourcePath?: string }>,
+		withLeadingSpacer: boolean,
+	): void {
 		if (!this.#showImages || entries.length === 0) return;
 		this.#convertImagesForKitty(entries);
 
 		if (withLeadingSpacer) this.#contentContainer.addChild(new Spacer(1));
-		for (const { image, key } of entries) {
+		for (const { image, key, sourcePath } of entries) {
 			let displayImage: ImageContent | undefined = image;
 			if (TERMINAL.imageProtocol === ImageProtocol.Kitty && image.mimeType !== "image/png") {
 				displayImage = this.#kittyConversion(image);
@@ -1537,6 +1640,7 @@ export class AssistantMessageComponent extends Container {
 						{ fallbackColor: (text: string) => theme.fg("toolOutput", text) },
 						{
 							...resolveImageOptions(),
+							sourcePath,
 							budget: this.#imageBudget,
 							imageKey: key,
 							requestRender: this.#onImageUpdate,
@@ -1545,15 +1649,18 @@ export class AssistantMessageComponent extends Container {
 				);
 				continue;
 			}
-			this.#contentContainer.addChild(new Text(theme.fg("toolOutput", `[Image: ${image.mimeType}]`), 1, 0));
+			this.#contentContainer.addChild(
+				new Text(theme.fg("toolOutput", linkedImageText(`[Image: ${image.mimeType}]`, image, sourcePath)), 1, 0),
+			);
 		}
 	}
 
 	#renderToolImages(): void {
 		if (!this.#showToolResultImages) return;
-		const entries = Array.from(this.#toolImagesByCallId.entries()).flatMap(([toolCallId, images]) =>
-			images.map((image, index) => ({ image, key: `${toolCallId}:${index}` })),
-		);
+		const entries = Array.from(this.#toolImagesByCallId.entries()).flatMap(([toolCallId, images]) => {
+			const sourcePath = this.#toolMediaPathByCallId.get(toolCallId);
+			return images.map((image, index) => ({ image, key: `${toolCallId}:${index}`, sourcePath }));
+		});
 		this.#renderImageEntries(entries, true);
 	}
 

@@ -723,6 +723,18 @@ describe("StdinBuffer", () => {
 			buffer.process("x");
 			expect(data).toEqual(["x"]);
 		});
+
+		it("counts the byte cap in UTF-8 bytes for a multibyte paste", () => {
+			// Regression: the cap added `chunk.length` (UTF-16 code units), so
+			// a multibyte paste over the byte limit but under it in code units
+			// kept buffering instead of aborting and delivering.
+			buffer = new StdinBuffer({ timeout: 10, pasteByteLimit: 8 });
+			const pastes: string[] = [];
+			buffer.on("paste", d => pastes.push(d));
+
+			buffer.process(`\x1b[200~${"é".repeat(5)}`); // 5 units, 10 bytes
+			expect(pastes).toEqual(["é".repeat(5)]);
+		});
 	});
 
 	describe("Malformed Escape Bounds (issue #4073 case A)", () => {

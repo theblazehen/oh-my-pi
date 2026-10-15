@@ -504,6 +504,27 @@ describe.skipIf(!SHOULD_RUN)("python runner subprocess", () => {
 		}
 	});
 
+	it("preserves unsafe Python integers as decimal strings in structured displays", async () => {
+		const kernel = await PythonKernel.start({ cwd: MATPLOTLIB_TEST_CWD });
+		try {
+			const result = await executePythonWithKernel(
+				kernel,
+				"display({'seed': 18446744073709551615, 'nested': [9007199254740991, 9007199254740992, -9007199254740992, True]})",
+			);
+			expect(result.exitCode).toBe(0);
+			expect(result.output).toContain("18446744073709551615");
+			expect(result.displayOutputs).toContainEqual({
+				type: "json",
+				data: {
+					seed: "18446744073709551615",
+					nested: [9007199254740991, "9007199254740992", "-9007199254740992", true],
+				},
+			});
+		} finally {
+			await kernel.shutdown();
+		}
+	});
+
 	it.skipIf(!HAS_MATPLOTLIB)("captures display(fig) as a PNG before the figure is closed", async () => {
 		const kernel = await PythonKernel.start({ cwd: MATPLOTLIB_TEST_CWD });
 		try {

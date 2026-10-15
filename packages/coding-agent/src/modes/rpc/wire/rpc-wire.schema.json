@@ -2336,6 +2336,11 @@
 					"items": {
 						"type": "string"
 					}
+				},
+				"liveSteered": {
+					"type": "integer",
+					"description": "Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.",
+					"default": 0
 				}
 			},
 			"required": [
@@ -2622,7 +2627,8 @@
 					"$ref": "#/$defs/QueuedMessagesState",
 					"default": {
 						"steering": [],
-						"followUp": []
+						"followUp": [],
+						"liveSteered": 0
 					}
 				},
 				"todoPhases": {
@@ -2764,6 +2770,9 @@
 					"type": "object",
 					"properties": {},
 					"additionalProperties": {}
+				},
+				"providerReplayThroughEntryId": {
+					"type": "string"
 				}
 			},
 			"required": [
@@ -4158,6 +4167,11 @@
 					"items": {
 						"type": "string"
 					}
+				},
+				"liveSteered": {
+					"type": "integer",
+					"description": "Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.",
+					"default": 0
 				}
 			},
 			"required": [

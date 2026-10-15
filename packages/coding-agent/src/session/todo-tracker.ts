@@ -226,7 +226,11 @@ export class TodoTracker {
 			});
 			return false;
 		}
-		if (!cfgTodoReminders.get(this.#host.settings) || !cfgTodoEnabled.get(this.#host.settings)) {
+		if (
+			!cfgTodoReminders.get(this.#host.settings) ||
+			!cfgTodoEnabled.get(this.#host.settings) ||
+			!this.#host.getActiveToolNames().includes("todo")
+		) {
 			this.#reminderCount = 0;
 			this.#reminderAwaitingProgress = false;
 			return false;

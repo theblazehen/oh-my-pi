@@ -15,6 +15,7 @@ export interface PythonStatusEvent {
 	[key: string]: unknown;
 }
 
+/** Python display outputs; unsafe JSON integers are decimal strings, not rounded JS numbers. */
 export type KernelDisplayOutput =
 	| { type: "json"; data: unknown }
 	| ImageContent

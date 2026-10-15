@@ -8,6 +8,7 @@ import {
 	postMultipart,
 	resolveOpenAIImageSize,
 	toDataUrl,
+	validateImageInput,
 } from "./shared";
 import type { ImageGenerationOptions, ImageGenerationRequest, ImageGenerationResult } from "./types";
 
@@ -85,6 +86,7 @@ export async function generateOpenAIImage(
 				form.set("response_format", "b64_json");
 				if (size) form.set("size", size);
 				for (const image of inputImages) {
+					validateImageInput(image);
 					form.append("image", new File([Buffer.from(image.data, "base64")], "image", { type: image.mimeType }));
 				}
 				response = await postMultipart({

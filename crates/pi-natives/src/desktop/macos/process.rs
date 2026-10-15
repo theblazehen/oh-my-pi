@@ -9,8 +9,9 @@ use std::{
 	path::Path,
 };
 
+use objc2::rc::autoreleasepool;
 use objc2_app_kit::NSRunningApplication;
-use objc2_foundation::ns_string;
+use objc2_foundation::{NSBundle, ns_string};
 
 /// `proc_pidinfo` flavor for file-backed regions only
 /// (`PROC_PIDREGIONPATHINFO2`, private in `<sys/proc_info_private.h>`); skips
@@ -178,6 +179,7 @@ pub(super) fn is_chromium(pid: libc::pid_t) -> bool {
 fn is_chromium_bundle(bundle: &str) -> bool {
 	[
 		"com.google.Chrome",
+		"com.google.chrome.for.testing",
 		"org.chromium.Chromium",
 		"com.brave.Browser",
 		"com.microsoft.edgemac",
@@ -203,6 +205,22 @@ pub(super) fn is_screen_sharing(pid: libc::pid_t) -> bool {
 	NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
 		.and_then(|app| app.bundleIdentifier())
 		.is_some_and(|bundle| bundle.isEqualToString(ns_string!("com.apple.ScreenSharing")))
+}
+
+/// Whether `pid` is a `UIKit` app such as Mac Catalyst: its bundle declares
+/// `UIDeviceFamily`, which `AppKit` apps' do not. The session
+/// thread has no autorelease pool of its own, so the lookup brings one.
+pub(super) fn is_uikit(pid: libc::pid_t) -> bool {
+	autoreleasepool(|_| {
+		NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+			.and_then(|app| app.bundleURL())
+			.and_then(|url| NSBundle::bundleWithURL(&url))
+			.is_some_and(|bundle| {
+				bundle
+					.objectForInfoDictionaryKey(ns_string!("UIDeviceFamily"))
+					.is_some()
+			})
+	})
 }
 
 /// Terminal AX text areas represent a rendered grid, not the pty input. Even a
@@ -258,6 +276,7 @@ mod tests {
 	fn chromium_identity_does_not_match_unrelated_display_names() {
 		assert!(is_chromium_bundle("com.google.Chrome.canary"));
 		assert!(is_chromium_bundle("company.thebrowser.Browser"));
+		assert!(is_chromium_bundle("com.google.chrome.for.testing"));
 		assert!(!is_chromium_bundle("com.apple.archiveutility"));
 		assert!(!is_chromium_bundle("com.google.ChromeNotABrowser"));
 	}

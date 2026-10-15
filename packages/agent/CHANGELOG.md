@@ -10,9 +10,80 @@
 ### Fixed
 
 - Preserved configurable native-compaction timeouts and conservative custom/developer-message accounting when preparing forked context.
+### Added
+
+- `Tokenizer.countLatestTurn`: counts a message as the transcript's latest assistant turn, which an Anthropic Messages replay keeps byte-for-byte ([#15791](https://github.com/can1357/oh-my-pi/pull/15791) by [@will-bogusz](https://github.com/will-bogusz))
+- `Agent.prioritizeSteering`: moves given pending steering messages ahead of older ones so one-at-a-time delivery takes them first ([#15642](https://github.com/can1357/oh-my-pi/pull/15642))
+
 ### Fixed
 
-- Fixed OpenAI V1 remote compaction re-attaching a prior Anthropic native payload after a successful compact ([#15041](https://github.com/can1357/oh-my-pi/pull/15041) by [@PaleRoses](https://github.com/PaleRoses))
+- Fixed a Cursor tool call re-sent by the server persisting two results under one id; the re-run's result replaces the first ([#15749](https://github.com/can1357/oh-my-pi/issues/15749))
+- Fixed compaction keeping more recent history than `keepRecentTokens` when the latest Claude turn on the Anthropic Messages API ended its tool calls on `stop` or `length`: the replay keeps that turn's signed reasoning, but the cut point counted only its visible blocks ([#15791](https://github.com/can1357/oh-my-pi/pull/15791) by [@will-bogusz](https://github.com/will-bogusz))
+
+## [18.11.0] - 2026-10-14
+
+### Breaking Changes
+
+- Removed `ApprovalDetailsOptions`; `formatApprovalDetails` takes only `args` again, since the compact approval prompt no longer shows tool details ([#15642](https://github.com/can1357/oh-my-pi/pull/15642) by [@H4vC](https://github.com/H4vC))
+
+### Added
+
+- `AgentTool.delegationGuidance`: instructions a same-name extension replacement inherits in its description when it delegates to the native tool ([#15477](https://github.com/can1357/oh-my-pi/pull/15477) by [@iliaal](https://github.com/iliaal))
+- `CompactionPreparation.lastSummarizedEntryId` and `CompactionResult.providerReplayThroughEntryId`: a remote compaction that could only fit the history before the kept tail reports the last entry its native history covers; later entries replay normally ([#15712](https://github.com/can1357/oh-my-pi/pull/15712) by [@H4vC](https://github.com/H4vC))
+
+### Fixed
+
+- Fixed native (OpenAI/Codex) remote compaction refusing or truncating sessions that fit the window: its preflight counted the JSON-escaped request, inflating quote-, backslash- and newline-heavy tool output such as disassembly by ~10–20%; it now counts text as the model reads it ([#15712](https://github.com/can1357/oh-my-pi/pull/15712) by [@H4vC](https://github.com/H4vC))
+- Fixed OpenAI V1/V2 remote compaction failing outright when the history, kept tail included, exceeds the context window (a large final response or tool output after the last check); it retries on the history before the kept tail ([#15712](https://github.com/can1357/oh-my-pi/pull/15712) by [@H4vC](https://github.com/H4vC))
+- Fixed fitted output caps overflowing the context window on strict hosts (llama.cpp-family) after turns with many parallel tool results; chat-template framing is now charged per locally counted message ([#15699](https://github.com/can1357/oh-my-pi/issues/15699))
+- Fixed leaked DeepSeek DSML markup reaching saved history from reasoning blocks and from turns that also made a valid tool call ([#15485](https://github.com/can1357/oh-my-pi/issues/15485))
+
+## [18.10.4] - 2026-10-13
+
+### Added
+
+- `AgentTool.formatApprovalDetails` receives `ApprovalDetailsOptions`; `compact: true` asks for untruncated bodies so a compact approval prompt can count their lines ([#15550](https://github.com/can1357/oh-my-pi/pull/15550) by [@H4vC](https://github.com/H4vC))
+
+### Changed
+
+- Before-model-call hooks now receive the loop context as a second argument, and `buildProviderContext` receives the summarizer model ([#15436](https://github.com/can1357/oh-my-pi/pull/15436) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Fixed
+
+- Fixed a Claude compaction or branch summarizer receiving assistant reasoning from a snapcompact archive rendered under another model, which Claude refuses (`reasoning_extraction`) ([#15436](https://github.com/can1357/oh-my-pi/pull/15436) by [@will-bogusz](https://github.com/will-bogusz))
+
+## [18.10.3] - 2026-10-12
+
+### Breaking Changes
+
+- Removed `estimateImageContentTokens()` from `@oh-my-pi/pi-agent-core/image-tokens`; use `Tokenizer.imageTokens(size, detail)`, which prices with the reading model's catalog image rule ([#15446](https://github.com/can1357/oh-my-pi/pull/15446) by [@will-bogusz](https://github.com/will-bogusz))
+- `applyShakeRegion()` and `applyShakeRegions()` take the replacement's token count (`replacementTokens`); a block rewrite of an assistant turn adds the tokens it removes to `elidedOutputTokens`, so a replayed Claude turn's count stays lowered after a reload ([#15446](https://github.com/can1357/oh-my-pi/pull/15446) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Fixed
+
+- Fixed Claude context counts reading Opus 5.5 requests about 55% over their billed input: a replayed thinking turn now counts at the output size Claude billed for it, not its signature's bytes ([#15446](https://github.com/can1357/oh-my-pi/pull/15446) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed screenshots and other non-frame images being counted at the OpenAI rate for every model instead of the reading model's own; Claude billed them about 16% higher ([#15446](https://github.com/can1357/oh-my-pi/pull/15446) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed OpenAI Responses and Codex context estimates leaving out replayed reasoning: each turn whose encrypted reasoning actually replays now counts its reported reasoning tokens (its ciphertext when the backend reports none), and none while a cold session rebuilds it out of the request, so compaction and snapcompact sizing match billing; branch summaries no longer budget for encrypted reasoning they never send ([#15447](https://github.com/can1357/oh-my-pi/pull/15447) by [@will-bogusz](https://github.com/will-bogusz))
+
+## [18.10.2] - 2026-10-12
+
+### Added
+
+- Added `AgentLoopConfig.onDetachedToolUpdate`: a tool's `onUpdate` frames that arrive after its run's event stream ended (a returned call whose background job keeps reporting) reach it instead of being dropped; `Agent` forwards them to its subscribers as `tool_execution_update` events
+
+## [18.9.2] - 2026-10-11
+
+### Changed
+
+- Improved context caching for repeat turns, reducing redundant prompt processing and making subsequent turns faster when the system prompt is unchanged.
+
+## [18.9.0] - 2026-10-11
+
+### Fixed
+
+- Fixed stale queue updates when queued steering is adopted, withdrawn, or added to the transcript, ensuring queue listeners consistently receive the latest state.
+
+## [18.8.8] - 2026-10-10
 
 ### Added
 
@@ -21,7 +92,9 @@
 
 ### Fixed
 
+- Fixed OpenAI V1 remote compaction re-attaching a prior Anthropic native payload after a successful compact ([#15041](https://github.com/can1357/oh-my-pi/pull/15041) by [@PaleRoses](https://github.com/PaleRoses))
 - Fixed `resolveThresholdTokens()` clamping a positive `thresholdTokens` to `baseWindowTokens`; a fixed threshold is checked against the real window, and the base only rescales the percentage and reserve policies ([#15074](https://github.com/can1357/oh-my-pi/pull/15074) by [@H4vC](https://github.com/H4vC))
+- Fixed `resolveThresholdTokens()` clamping a fixed `thresholdTokens` at or past the context window to one token below it, so compaction fired only after the next request overflowed; it now clamps to the window less the reserve ([#15146](https://github.com/can1357/oh-my-pi/pull/15146) by [@will-bogusz](https://github.com/will-bogusz))
 
 ## [18.8.6] - 2026-10-08
 

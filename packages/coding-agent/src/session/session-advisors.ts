@@ -67,6 +67,7 @@ import {
 	formatAdvisorBatchContent,
 	getOrCreateAdvisorProviderSessionId,
 	isAdvisorInterruptImmuneTurnActive,
+	isClassifierRefusal,
 	isInterruptingSeverity,
 	quarantineAdvisorUnsafeOutput,
 	resolveAdvisorDeliveryChannel,
@@ -85,7 +86,7 @@ import { serviceTierForAllFamilies, serviceTierSettingToTier } from "../config/s
 import type { Settings } from "../config/settings";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "../cursor";
 import { bridgeToolMap } from "../cursor-bridge-tools";
-import { estimateToolSchemaTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
+import { estimateContextToolSchemaTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import type { PlanModeState } from "../plan-mode/state";
 import advisorBoundaryGuidance from "../prompts/advisor/boundary-guidance.md" with { type: "text" };
 import advisorSystemPrompt from "../prompts/advisor/system.md" with { type: "text" };
@@ -96,6 +97,7 @@ import {
 	resolveThinkingLevelForModel,
 	shouldDisableReasoning,
 	toReasoningEffort,
+	automaticThinkingLevel,
 } from "@oh-my-pi/pi-tui/thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ClientBridge } from "./client-bridge";
@@ -108,6 +110,7 @@ import {
 	getRetryFallbackRevertPolicy,
 	parseRetryFallbackSelector,
 	type RetryFallbackSelector,
+	retryFallbackAdmits,
 } from "./retry-fallback-chains";
 import { getOpenAiRemoteCompactionPayload } from "./session-context";
 import { formatSessionDumpText } from "./session-dump-format";
@@ -306,6 +309,8 @@ interface AdvisorRetryFallbackState {
 	originalSelector: string;
 	originalThinkingLevel: ThinkingLevel;
 	lastAppliedThinkingLevel: ThinkingLevel;
+	/** Set by a classifier refusal: no cooldown restore until a compaction or new conversation replaces the context. */
+	pinned: boolean;
 }
 
 interface ActiveAdvisor {
@@ -901,9 +906,12 @@ export class SessionAdvisors {
 		for (const advisor of this.#advisors) this.#refreshAdvisorProviderIdentity(advisor);
 	}
 
-	/** Re-primes advisor transcript views after an in-conversation history rewrite. */
-	resetAllRuntimes(reason?: string): void {
-		this.#resetAllAdvisorRuntimes(reason);
+	/**
+	 * Re-primes advisor transcript views after an in-conversation history rewrite.
+	 * `compacted` marks a rewrite that replaced history with a summary, which releases refusal pins.
+	 */
+	resetAllRuntimes(reason?: string, options?: { compacted?: boolean }): void {
+		this.#resetAllAdvisorRuntimes(reason, options?.compacted === true);
 	}
 
 	/** Re-aligns advisor delivered prefixes after an in-place rewrite their contexts already cover. */
@@ -1055,6 +1063,7 @@ export class SessionAdvisors {
 			// A reset aborts any pending usage-limit wait; clear its budget so the new
 			// conversation starts with a fresh retry allowance (issue #11947).
 			a.usageLimitRetries = 0;
+			this.#releaseRefusalPin(a);
 			// Resets the emission guard and every tool-side note state together.
 			a.adviseTool.resetDeliveredNotes();
 			a.eligibleUpdates = 0;
@@ -1167,8 +1176,8 @@ export class SessionAdvisors {
 			// is sent and reasoning stays enabled (matching the `auto`-path fix for
 			// Devin models via `clampAutoThinkingEffort`). See #4579.
 			const requestedLevel = autoThinking
-				? this.#autoAdvisorThinkingLevel()
-				: (thinkingLevel ?? ThinkingLevel.Medium);
+				? automaticThinkingLevel(model, this.#autoAdvisorThinkingLevel())
+				: (thinkingLevel ?? automaticThinkingLevel(model, ThinkingLevel.Medium));
 			const resolvedLevel = resolveThinkingLevelForModel(model, requestedLevel);
 			const advisorThinkingLevel: ThinkingLevel = resolvedLevel ?? ThinkingLevel.Inherit;
 			// Record the status entry now (in roster order) so the Map's insertion
@@ -1880,12 +1889,13 @@ export class SessionAdvisors {
 	}
 
 	/** Re-prime every advisor's transcript view after an in-conversation history rewrite. */
-	#resetAllAdvisorRuntimes(reason?: string): void {
+	#resetAllAdvisorRuntimes(reason: string | undefined, compacted: boolean): void {
 		for (const a of this.#advisors) {
 			a.runtime.reset(reason);
 			// Match the conversation-boundary re-prime: a reset must not carry a
 			// pending wait's usage-limit budget into the reset conversation.
 			a.usageLimitRetries = 0;
+			if (compacted) this.#releaseRefusalPin(a);
 		}
 	}
 
@@ -1970,7 +1980,9 @@ export class SessionAdvisors {
 			// A retry-fallback selector pinned its own effort for the fallback
 			// model; the retune resumes once the configured model is restored.
 			if (!advisor.autoThinking || advisor.runtime.disposed || advisor.retryFallback) continue;
-			const next = resolveThinkingLevelForModel(advisor.model, requested) ?? ThinkingLevel.Inherit;
+			const next =
+				resolveThinkingLevelForModel(advisor.model, automaticThinkingLevel(advisor.model, requested)) ??
+				ThinkingLevel.Inherit;
 			if (next === advisor.thinkingLevel) continue;
 			advisor.agent.setThinkingLevel(toReasoningEffort(next));
 			advisor.agent.setDisableReasoning(shouldDisableReasoning(next));
@@ -1986,10 +1998,17 @@ export class SessionAdvisors {
 		);
 	}
 
+	/** Release refusal pins so the next review may retry the configured primary. */
+	#releaseRefusalPin(advisor: ActiveAdvisor): void {
+		if (advisor.retryFallback) advisor.retryFallback.pinned = false;
+	}
+
 	/** Restore an advisor's configured primary once its fallback cooldown expires. */
 	async #maybeRestoreAdvisorRetryFallbackPrimary(advisor: ActiveAdvisor, signal: AbortSignal): Promise<void> {
 		const fallback = advisor.retryFallback;
-		if (!fallback || getRetryFallbackRevertPolicy(this.#host.settings) !== "cooldown-expiry") return;
+		if (!fallback || fallback.pinned || getRetryFallbackRevertPolicy(this.#host.settings) !== "cooldown-expiry") {
+			return;
+		}
 
 		const originalSelector = parseRetryFallbackSelector(fallback.originalSelector, this.#host.modelRegistry);
 		if (!originalSelector) {
@@ -2138,6 +2157,7 @@ export class SessionAdvisors {
 					)
 				: Promise.resolve(false);
 		if (!retrySettings.enabled || !retrySettings.modelFallback) return declineUsageLimit();
+		if (!retryFallbackAdmits(retrySettings.fallbackOn, usageLimit)) return declineUsageLimit();
 		// Same two-key walk the main loop uses: the chain that owns this advisor's
 		// active fallback, then the chain the current model owns. Without the
 		// second key an advisor that lands on the last entry of one chain never
@@ -2152,7 +2172,13 @@ export class SessionAdvisors {
 			return declineUsageLimit();
 		}
 
-		this.#host.noteRetryFallbackCooldown(currentSelector, retryAfterMs, message);
+		// A refusal by the advisor's primary judges this context, not the model's health:
+		// skip its cooldown and pin the switch. A refusing fallback gets the usual cooldown.
+		const primaryRefused =
+			assistantFailure !== undefined &&
+			isClassifierRefusal(assistantFailure) &&
+			(advisor.retryFallback === undefined || advisor.retryFallback.originalSelector === currentSelector);
+		if (!primaryRefused) this.#host.noteRetryFallbackCooldown(currentSelector, retryAfterMs, message);
 		for (const role of chainKeys) {
 			for (const selector of this.#host.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
 				if (this.#host.isRetryFallbackSelectorSuppressed(selector)) continue;
@@ -2169,12 +2195,14 @@ export class SessionAdvisors {
 				const nextThinkingLevel = this.#setAdvisorModel(advisor, candidate, requestedThinkingLevel);
 				if (advisor.retryFallback) {
 					advisor.retryFallback.lastAppliedThinkingLevel = nextThinkingLevel;
+					advisor.retryFallback.pinned ||= primaryRefused;
 				} else {
 					advisor.retryFallback = {
 						role,
 						originalSelector: currentSelector,
 						originalThinkingLevel,
 						lastAppliedThinkingLevel: nextThinkingLevel,
+						pinned: primaryRefused,
 					};
 				}
 				advisor.retryFallbackPendingSuccess = true;
@@ -2329,13 +2357,24 @@ export class SessionAdvisors {
 		// delta to that arm. Floor it by a full local estimate — fixed advisor system
 		// prompt, tool schemas, stored messages, and incoming delta — so provider
 		// under-reporting or payload transforms cannot suppress maintenance.
+		// Schema overhead depends on the model, so promotion re-evaluates the
+		// local arm against the promoted model's schema policy.
 		const providerContextTokens = this.#estimateAdvisorContextTokens(advisor) + incomingTokens;
-		const localContextTokens =
-			agent.tokenizer.countTokens(agent.state.systemPrompt) +
-			estimateToolSchemaTokens(agent.state.tools, agent.tokenizer, this.#host.settings.revision) +
-			storedConversationTokens +
-			incomingTokens;
-		const contextTokens = compactionContextTokens(providerContextTokens, localContextTokens);
+		const fixedPromptTokens = agent.tokenizer.countTokens(agent.state.systemPrompt);
+		const contextTokensFor = (model: Model): number =>
+			compactionContextTokens(
+				providerContextTokens,
+				fixedPromptTokens +
+					estimateContextToolSchemaTokens(
+						agent.state.tools,
+						agent.tokenizer,
+						model,
+						this.#host.settings.revision,
+					) +
+					storedConversationTokens +
+					incomingTokens,
+			);
+		const contextTokens = contextTokensFor(advisorModel);
 
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) {
 			return false;
@@ -2351,7 +2390,7 @@ export class SessionAdvisors {
 			);
 			const newWindow = newModel.contextWindow ?? 0;
 			if (newWindow > 0) {
-				const stillNeedsCompaction = shouldCompact(contextTokens, newWindow, compactionSettings);
+				const stillNeedsCompaction = shouldCompact(contextTokensFor(newModel), newWindow, compactionSettings);
 				if (!stillNeedsCompaction) return false;
 			}
 		}
@@ -2539,8 +2578,11 @@ export class SessionAdvisors {
 			throw new NativeCompactionError(new Error("Compaction result cannot be replayed by the advisor model"));
 		}
 		// Native replacement history already contains the retained tail. Replaying
-		// that tail again as raw messages duplicates turns and tool-call IDs.
-		const recentMessages = providerPayload ? [] : preparation.recentMessages;
+		// that tail again as raw messages duplicates turns and tool-call IDs. A
+		// prefix-only compaction (`providerReplayThroughEntryId`: the tail could not
+		// fit the window) stops before the tail, so the tail replays as raw messages.
+		const recentMessages =
+			providerPayload && compactResult.providerReplayThroughEntryId === undefined ? [] : preparation.recentMessages;
 
 		// The retained messages still carry provider usage from before this
 		// compaction. Record their exact array boundary on the in-memory summary so
@@ -2576,6 +2618,7 @@ export class SessionAdvisors {
 		} satisfies AdvisorCompactionSummaryMessage;
 
 		agent.replaceMessages([summaryMessage, ...recentMessages]);
+		this.#releaseRefusalPin(advisor);
 		return false;
 	}
 	/**

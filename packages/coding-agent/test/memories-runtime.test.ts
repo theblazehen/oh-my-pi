@@ -451,12 +451,12 @@ describe("buildMemoryToolDeveloperInstructions", () => {
 		const agentDir = await makeTempDir("memories-runtime-instructions");
 		const settings = Settings.isolated({ "memory.backend": "local" });
 
-		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings)).toBeUndefined();
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings.getCwd(), settings)).toBeUndefined();
 
 		const memoryRoot = getMemoryRoot(agentDir, settings.getCwd());
 		await fs.mkdir(memoryRoot, { recursive: true });
 		await fs.writeFile(path.join(memoryRoot, "memory_summary.md"), "   \n\t\n");
-		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings)).toBeUndefined();
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings.getCwd(), settings)).toBeUndefined();
 	});
 
 	test("renders payload with truncation for non-empty summary", async () => {
@@ -472,7 +472,7 @@ describe("buildMemoryToolDeveloperInstructions", () => {
 			`${"A".repeat(120)}\n${"B".repeat(120)}\n${"C".repeat(120)}`,
 		);
 
-		const payload = await buildMemoryToolDeveloperInstructions(agentDir, settings);
+		const payload = await buildMemoryToolDeveloperInstructions(agentDir, settings.getCwd(), settings);
 		expect(payload).toBeDefined();
 		expect(payload).toContain("memory://root/memory_summary.md");
 		expect(payload).not.toContain(memoryRoot);

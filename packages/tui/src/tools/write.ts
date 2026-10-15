@@ -7,6 +7,7 @@ import { getLanguageFromPath } from "../lang-from-path";
 import { createHighlightStream, highlightCode, type Theme } from "../theme/theme";
 import { fileHyperlink, renderStatusLine } from "../render";
 import { framedToolCard } from "../render/tool-card";
+import { wrapPrefixedLine } from "../render/hanging-wrap";
 import {
 	cachedRenderedString,
 	createRenderedStringCache,
@@ -165,7 +166,7 @@ function describeFigure(figure: ToolFigure | undefined): NativeNode | undefined 
 /** The written content as numbered code, keyed so it keeps its node as the figure above it comes and goes. */
 function describeSource(rawPath: string, content: string): NativeNode {
 	const lang = rawPath ? getLanguageFromPath(rawPath) : undefined;
-	return { ...code(content, { lang, numbers: true }), key: "source" };
+	return { ...code(content, { lang, numbers: true, wrap: true }), key: "source" };
 }
 
 function countLines(text: string): number {
@@ -386,6 +387,15 @@ function formatStreamingContent(
 	// expanded preview could never scroll-append mid-stream.
 	const spinner = spinnerFrame !== undefined ? `${formatStatusIcon("running", uiTheme, spinnerFrame)} ` : "";
 	return `${bodyText}${spinner}${uiTheme.fg("dim", `… (streaming)`)}`;
+}
+
+function wrapWritePreviewRows(lines: string[], width: number): string[] {
+	return lines.flatMap(line => {
+		const gutter = /^(\x1b\[[0-9;]*m)( *\d+ )(\x1b\[[0-9;]*m)(.*)$/.exec(line);
+		if (!gutter) return line;
+		const prefix = `${gutter[1]}${gutter[2]}${gutter[3]}`;
+		return wrapPrefixedLine(prefix, " ".repeat(Bun.stringWidth(gutter[2]!)), gutter[4] ?? "", width);
+	});
 }
 
 function renderContentPreview(
@@ -639,7 +649,7 @@ export const writeToolRenderer = {
 		const streamingCache = createRenderedStringCache();
 		return framedToolCard(
 			uiTheme,
-			() => {
+			({ contentWidth }) => {
 				const body = content
 					? formatStreamingContent(
 							content,
@@ -660,7 +670,7 @@ export const writeToolRenderer = {
 				while (bodyLines.length > 0 && bodyLines[0].trim() === "") bodyLines.shift();
 				return {
 					header,
-					sections: bodyLines.length > 0 ? [{ content: bodyLines }] : [],
+					sections: bodyLines.length > 0 ? [{ content: wrapWritePreviewRows(bodyLines, contentWidth) }] : [],
 					phase: "pending",
 					borderColor: "borderMuted",
 				};
@@ -743,7 +753,7 @@ export const writeToolRenderer = {
 		const previewCache = createRenderedStringCache();
 		return framedToolCard(
 			uiTheme,
-			() => {
+			({ contentWidth }) => {
 				const { expanded } = options;
 				let body = renderContentPreview(fileContent, expanded, lang, uiTheme, previewCache);
 				if (isPartial && progressText) {
@@ -768,7 +778,7 @@ export const writeToolRenderer = {
 				while (bodyLines.length > 0 && bodyLines[0].trim() === "") bodyLines.shift();
 				return {
 					header,
-					sections: bodyLines.length > 0 ? [{ content: bodyLines }] : [],
+					sections: bodyLines.length > 0 ? [{ content: wrapWritePreviewRows(bodyLines, contentWidth) }] : [],
 					phase: isPartial ? "partial" : "success",
 					borderColor: "borderMuted",
 				};

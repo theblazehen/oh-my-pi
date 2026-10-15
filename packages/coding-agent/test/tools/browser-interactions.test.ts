@@ -6,6 +6,12 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import { createBrowserPrelude } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { CmuxTab } from "@oh-my-pi/pi-coding-agent/tools/browser/cmux/cmux-tab";
+import {
+	clickElement,
+	clickQueryHandlerText,
+	resolveActionableQueryHandlerClickTarget,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/interactions";
+import { acquireBrowser, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { releaseAllTabs } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { TERN_KIT_SOURCE } from "@oh-my-pi/pi-coding-agent/tools/browser/tern/page-kit";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
@@ -20,6 +26,7 @@ const COMBO_TAB_NAME = `combos-${crypto.randomUUID()}`;
 const SHORTCUT = process.platform === "darwin" ? "Meta" : "Control";
 const comboHtml = `<!doctype html><textarea id="area">hello world</textarea><input id="field"><input id="paste">
 <iframe id="inner" srcdoc='<!doctype html><textarea id="deep">nested text</textarea>'></iframe>`;
+const TEXT_TAB_NAME = `text-click-${crypto.randomUUID()}`;
 let tempDir = "";
 let uploadPath = "";
 
@@ -90,7 +97,9 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser click timeouts", () => {
 		const tabName = `unclickable-${crypto.randomUUID()}`;
 		const unclickableHtml = `<!doctype html><button id="hidden" style="display:none">Hidden</button><button id="faded" style="opacity:0">Faded</button>
 <button class="multi" style="display:none">First</button><button class="multi">Second</button>
-<button id="swap">Swap</button>`;
+<button id="swap">Swap</button>
+<button style="pointer-events:none">Twin</button><button>Twin</button>
+<button id="off" disabled>Off</button><div inert><button id="asleep">Asleep</button></div>`;
 		await prelude.invoke(
 			{ action: "open", name: tabName, url: `data:text/html,${encodeURIComponent(unclickableHtml)}` },
 			context,
@@ -119,6 +128,12 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser click timeouts", () => {
 			expect(hidden).toMatch(/^tab\.click\("#hidden"\) timed out after \d+ms/);
 			expect(hidden).toContain("last check: display:none");
 			expect(await attempt(`tab.click("#faded")`)).toContain("last check: opacity:0");
+			// A refused match the browser shows is still reported; one it cannot hit test yields to a shown twin.
+			expect(await attempt(`tab.click("text/Faded")`)).toContain("last check: opacity:0");
+			expect(await attempt(`tab.click("text/Twin")`)).toBe("clicked");
+			// The browser drops these clicks, so they fail rather than report success.
+			expect(await attempt(`tab.click("#off")`)).toContain("did not deliver the click");
+			expect(await attempt(`tab.click("text/Asleep")`)).toContain("did not deliver the click");
 			// The count tells the caller the first of several matches is the hidden one.
 			const multi = await attempt(`tab.dblclick(".multi")`);
 			expect(multi).toContain("last check: display:none");
@@ -134,6 +149,63 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser click timeouts", () => {
 			).toContain("last check: detached");
 		} finally {
 			await prelude.invoke({ action: "close", name: tabName, kill: true }, context).catch(() => undefined);
+		}
+	}, 30_000);
+
+	test("rejects promptly when a text-click candidate evaluation is aborted", async () => {
+		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
+		const page = await browserHandle.browser.newPage();
+		try {
+			await page.setContent('<button id="abort-candidate">Abort candidate</button>');
+			const [candidate] = await page.$$("text/Abort candidate");
+			if (!candidate) throw new Error("Expected a text-query candidate");
+			await candidate.evaluate(element => {
+				Object.defineProperty(element, "closest", {
+					configurable: true,
+					value: () => {
+						// Puppeteer's page callback type cannot name DOM globals in this test environment.
+						const target = element as unknown as { dataset: { closestEntered?: string } };
+						target.dataset.closestEntered = "1";
+						return Promise.withResolvers<never>().promise;
+					},
+				});
+			});
+
+			const controller = new AbortController();
+			const reason = new Error("candidate lookup aborted");
+			const settled = clickQueryHandlerText(
+				page,
+				"text/Abort candidate",
+				'tab.click("text/Abort candidate")',
+				5_000,
+				controller.signal,
+			).then(
+				() => ({ status: "resolved" as const }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			await page.waitForFunction(
+				() => {
+					const page = globalThis as unknown as {
+						document: { querySelector(selector: string): { dataset: { closestEntered?: string } } | null };
+					};
+					return page.document.querySelector("#abort-candidate")?.dataset.closestEntered === "1";
+				},
+				{ timeout: 1_000 },
+			);
+
+			controller.abort(reason);
+			// Real Chromium CDP calls cannot run under fake timers; bound the formerly unending lookup.
+			const outcome = await Promise.race([settled, Bun.sleep(500).then(() => ({ status: "hung" as const }))]);
+			if (outcome.status !== "rejected") {
+				throw new Error(`Text-click candidate lookup ${outcome.status} after abort`);
+			}
+			if (!(outcome.error instanceof Error)) throw new Error("Expected candidate lookup to reject with an Error");
+			expect(outcome.error.name).toBe("AbortError");
+			expect(outcome.error.cause).toBe(reason);
+		} finally {
+			await page.close().catch(() => undefined);
+			if (browserHandle.browser.connected) await releaseBrowser(browserHandle, { kill: true });
 		}
 	}, 30_000);
 });
@@ -540,6 +612,7 @@ return { value: await tab.value("#q"), reported: await tab.evaluate(() => window
 		const session = makeSession();
 		const prelude = createBrowserPrelude(session);
 		const starvedHtml = `<!doctype html><input id="q" value="stale"><div id="editable" contenteditable>stale</div>
+<button id="top" onclick="this.dataset.clicked=1">Top level</button>
 <iframe id="inner" srcdoc='<!doctype html><input id="deep" value="stale"><button id="go" onclick="this.dataset.clicked=1">Go</button>'></iframe>`;
 		const context = { session, toolCallId: "browser-starved" };
 		await prelude.invoke(
@@ -559,21 +632,26 @@ const inner = await tab.frame("#inner");
 await inner.fill("#deep", "nested");
 await tab.fill("#editable", "replaced");
 await inner.click("#go");
+await tab.click("text/Top level");
 return {
 	page: await tab.value("#q"),
 	frame: await inner.value("#deep"),
 	editable: await tab.text("#editable"),
 	clicked: await inner.attr("#go", "data-clicked"),
+	textClicked: await tab.attr("#top", "data-clicked"),
 };`,
 					timeout: 25,
 				},
 				context,
 			);
-			expect(valueFrom<{ page: string; frame: string; editable: string; clicked: string }>(result)).toEqual({
+			expect(
+				valueFrom<{ page: string; frame: string; editable: string; clicked: string; textClicked: string }>(result),
+			).toEqual({
 				page: "typed",
 				frame: "nested",
 				editable: "replaced",
 				clicked: "1",
+				textClicked: "1",
 			});
 		} finally {
 			await prelude.invoke({ action: "close", name: STARVED_TAB_NAME, kill: true }, context).catch(() => undefined);
@@ -699,6 +777,351 @@ return await tab.evaluate(() => ({
 			expect(valueFrom<Record<string, unknown>>(result)).toEqual({ leave: "paternity", agree: true, changes: 3 });
 		} finally {
 			await prelude.invoke({ action: "close", name: tabName, kill: true }, context).catch(() => undefined);
+		}
+	}, 30_000);
+
+	test("scrolls below-the-fold text matches into view and clicks shadow-DOM buttons", async () => {
+		const session = makeSession();
+		const prelude = createBrowserPrelude(session);
+		const context = { session, toolCallId: "browser-text-click" };
+		const textHtml = `<!doctype html>
+<style>
+#covered-wrap { position: relative; width: max-content }
+#text-overlay { position: absolute; inset: 0; background: white }
+</style>
+<div id="covered-wrap"><button>Covered match</button><div id="text-overlay"></div></div>
+<button id="sliver" style="position: absolute; left: 0; top: calc(100vh - .5px)" onclick="window.clicks.sliver++">Sliver match</button>
+<div style="height: 4000px">Tall content</div>
+<button id="snippets" onclick="window.clicks.snippets++">View Snippets</button>
+<div style="height: 2000px"></div>
+<s-button id="save"></s-button>
+<script>
+window.clicks = { sliver: 0, snippets: 0, save: 0 };
+customElements.define("s-button", class extends HTMLElement {
+  constructor() {
+    super();
+    const root = this.attachShadow({ mode: "open" });
+    root.innerHTML = '<button id="inner-save">Save</button>';
+    root.querySelector("button").addEventListener("click", () => window.clicks.save++);
+  }
+});
+</script>`;
+		await prelude.invoke(
+			{ action: "open", name: TEXT_TAB_NAME, url: `data:text/html,${encodeURIComponent(textHtml)}` },
+			context,
+		);
+		try {
+			const result = await prelude.invoke(
+				{
+					action: "run",
+					name: TEXT_TAB_NAME,
+					code: `let blocked;
+try {
+	await tab.click("text/Covered match");
+} catch (error) {
+	blocked = error instanceof Error ? error.message : String(error);
+}
+await tab.click("text/Sliver match");
+await tab.evaluate(() => window.scrollTo(0, 0));
+await tab.click("text/View Snippets");
+const afterSnippets = await tab.evaluate(() => ({ ...window.clicks }));
+await tab.evaluate(() => window.scrollTo(0, 0));
+await tab.click("text/Save");
+await tab.evaluate(() => window.scrollTo(0, 0));
+await tab.click("pierce/#inner-save");
+return { blocked, afterSnippets, final: await tab.evaluate(() => window.clicks) };`,
+					timeout: 30,
+				},
+				context,
+			);
+			const { blocked, ...clicks } = valueFrom<{ blocked: string }>(result);
+			expect(blocked).toContain("covered by <div#text-overlay>");
+			expect(clicks).toEqual({
+				afterSnippets: { sliver: 1, snippets: 1, save: 0 },
+				final: { sliver: 1, snippets: 1, save: 2 },
+			});
+		} finally {
+			await prelude.invoke({ action: "close", name: TEXT_TAB_NAME, kill: true }, context).catch(() => undefined);
+		}
+	}, 40_000);
+
+	test("prefers an on-screen text match over one clipped by a scroll container", async () => {
+		const session = makeSession();
+		const prelude = createBrowserPrelude(session);
+		const context = { session, toolCallId: "browser-text-click-clipped" };
+		const tabName = `text-click-clipped-${crypto.randomUUID()}`;
+		const clippedHtml = `<!doctype html>
+<div id="panel" style="width: 100px; overflow: auto; white-space: nowrap"><span style="display: inline-block; width: 400px"></span><button onclick="window.picks.push('clipped')">Pick</button></div>
+<button onclick="window.picks.push('visible')">Pick</button>
+<script>window.picks = [];</script>`;
+		await prelude.invoke(
+			{ action: "open", name: tabName, url: `data:text/html,${encodeURIComponent(clippedHtml)}` },
+			context,
+		);
+		try {
+			const result = await prelude.invoke(
+				{
+					action: "run",
+					name: tabName,
+					code: `await tab.click("text/Pick");
+return { picks: await tab.evaluate(() => window.picks), panelScroll: await tab.evaluate(() => document.querySelector("#panel").scrollLeft) };`,
+					timeout: 20,
+				},
+				context,
+			);
+			expect(valueFrom<unknown>(result)).toEqual({ picks: ["visible"], panelScroll: 0 });
+		} finally {
+			await prelude.invoke({ action: "close", name: tabName, kill: true }, context).catch(() => undefined);
+		}
+	}, 30_000);
+
+	test("clicks the first text match a scroll container shows a strip of, not one an overlay leaves an edge of", async () => {
+		const session = makeSession();
+		const prelude = createBrowserPrelude(session);
+		const context = { session, toolCallId: "browser-text-click-strip" };
+		const tabName = `text-click-strip-${crypto.randomUUID()}`;
+		// Each first button shows only its edge: 1px of 120px at a scroll panel's edge, 2px beside a fixed overlay,
+		// or 2px beside its wrapper's ::after, which hit testing reports as the wrapper, an ancestor.
+		const fixtures = {
+			strip: `<div style="width: 100px; overflow: auto; white-space: nowrap"><span style="display: inline-block; width: 99px"></span><button style="width: 120px" onclick="window.picks.push('strip')">Pick</button></div>
+<button onclick="window.picks.push('later')">Pick</button>`,
+			covered: `<button style="position: absolute; left: 10px; top: 10px; width: 120px" onclick="window.picks.push('covered')">Pick</button>
+<div style="position: fixed; left: 0; top: 0; width: 128px; height: 200px; background: white"><button style="margin-top: 100px" onclick="window.picks.push('overlay')">Pick</button></div>`,
+			pseudo: `<style>#wrap { position: relative; display: inline-block } #wrap::after { content: ""; position: absolute; inset: 0 2px 0 0; background: white }</style>
+<div id="wrap"><button style="width: 120px" onclick="window.picks.push('pseudo')">Pick</button></div>
+<button onclick="window.picks.push('later')">Pick</button>`,
+		};
+		await prelude.invoke({ action: "open", name: tabName, url: "about:blank" }, context);
+		try {
+			const result = await prelude.invoke(
+				{
+					action: "run",
+					name: tabName,
+					code: `const picks = {};
+for (const [name, html] of Object.entries(${JSON.stringify(fixtures)})) {
+	await tab.evaluate(html => {
+		document.body.innerHTML = html;
+		window.picks = [];
+	}, html);
+	picks[name] = await tab.click("text/Pick").then(() => tab.evaluate(() => window.picks), error => String(error));
+}
+return picks;`,
+					timeout: 20,
+				},
+				context,
+			);
+			expect(valueFrom<unknown>(result)).toEqual({ strip: ["strip"], covered: ["overlay"], pseudo: ["later"] });
+		} finally {
+			await prelude.invoke({ action: "close", name: tabName, kill: true }, context).catch(() => undefined);
+		}
+	}, 30_000);
+
+	test("fails a click the browser does not deliver and completes the rest", async () => {
+		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
+		const page = await browserHandle.browser.newPage();
+		const outcomes = async (ids: string[]): Promise<Record<string, string>> => {
+			const result: Record<string, string> = {};
+			for (const id of ids) {
+				const handle = await page.$(`#${id}`);
+				if (!handle) throw new Error(`Expected #${id}`);
+				result[id] = await clickElement(handle, `click #${id}`).then(
+					() => "clicked",
+					error =>
+						String(error).includes("did not deliver the click")
+							? "refused"
+							: String(error).includes("covered by")
+								? "covered"
+								: String(error),
+				);
+				await handle.dispose();
+			}
+			return result;
+		};
+		try {
+			// Shadow roots hold a disabled button around the host's content, or around an alternate slot only.
+			await page.setContent(`<button id="enabled">Enabled</button>
+<button id="disabled" disabled>Disabled</button>
+<div inert><button id="inert">Inert</button></div>
+<div style="interactivity: inert"><button id="styled-inert">Styled inert</button></div>
+<span id="shadowed">Shadowed</span>
+<span id="actions">Go<span slot="alt" hidden>Alt</span></span>
+<button id="menu-item">Menu item</button>
+<script>
+document.getElementById("shadowed").attachShadow({ mode: "open" }).innerHTML = "<button disabled><slot></slot></button>";
+document.getElementById("actions").attachShadow({ mode: "open" }).innerHTML =
+	'<button disabled><slot name="alt"></slot></button><button><slot></slot></button>';
+// A menu item acts on pointerdown, consumes it (so no mouse events follow) and closes.
+document.getElementById("menu-item").addEventListener("pointerdown", event => {
+	event.preventDefault();
+	event.currentTarget.remove();
+});
+</script>`);
+			expect(
+				await outcomes(["enabled", "disabled", "inert", "styled-inert", "shadowed", "actions", "menu-item"]),
+			).toEqual({
+				enabled: "clicked",
+				disabled: "refused",
+				inert: "refused",
+				"styled-inert": "refused",
+				shadowed: "refused",
+				actions: "clicked",
+				"menu-item": "clicked",
+			});
+			// A modal dialog escapes the inert shell it sits in; the shell lies under its backdrop.
+			await page.setContent(`<div inert><button id="shell">Shell</button><dialog id="dlg"><button id="ok">OK</button></dialog></div>
+<script>document.getElementById("dlg").showModal();</script>`);
+			expect(await outcomes(["ok", "shell"])).toEqual({ ok: "clicked", shell: "covered" });
+			// A button in a closed shadow root receives the click though the window only sees its host.
+			const closed = await page.evaluateHandle(`(() => {
+	const host = document.body.appendChild(document.createElement("div"));
+	const root = host.attachShadow({ mode: "closed" });
+	root.innerHTML = "<button>Closed</button>";
+	return root.querySelector("button");
+})()`);
+			const closedButton = closed.asElement();
+			if (!closedButton) throw new Error("Expected the closed-root button");
+			await page.evaluate("document.querySelector('dialog').close()");
+			expect(await clickElement(closedButton, "click closed").then(() => "clicked")).toBe("clicked");
+			await closed.dispose();
+		} finally {
+			await page.close().catch(() => undefined);
+			if (browserHandle.browser.connected) await releaseBrowser(browserHandle, { kill: true });
+		}
+	}, 30_000);
+
+	test("skips an off-screen text match that stays clipped once scrolled to", async () => {
+		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
+		const page = await browserHandle.browser.newPage();
+		try {
+			await page.setContent(`<div style="height: 3000px"></div><div style="overflow: hidden; height: 0"><button id="clipped">Far</button></div>
+<div style="height: 3000px"></div><button id="enabled">Far</button>`);
+			const handles = await page.$$("text/Far");
+			const winner = await resolveActionableQueryHandlerClickTarget(handles);
+			const winnerId = await winner?.evaluate(el => {
+				// Puppeteer's page callback type cannot name DOM globals in this test environment.
+				const element = el as unknown as { id: string };
+				return element.id;
+			});
+			expect(winnerId).toBe("enabled");
+			await Promise.all([winner, ...handles].map(handle => handle?.dispose()));
+		} finally {
+			await page.close().catch(() => undefined);
+			if (browserHandle.browser.connected) await releaseBrowser(browserHandle, { kill: true });
+		}
+	}, 30_000);
+
+	test("scrolls off-screen text matches only until the first reachable one", async () => {
+		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
+		const page = await browserHandle.browser.newPage();
+		try {
+			await page.setContent(`<div style="height: 3000px"></div><button id="near">Far</button>
+<div style="height: 3000px"></div><button id="farther">Far</button>`);
+			const handles = await page.$$("text/Far");
+			const winner = await resolveActionableQueryHandlerClickTarget(handles);
+			// The page stays where the last probe scrolled it, so the farther match must not have been probed.
+			const probe = await page.evaluate(() => {
+				// Puppeteer's page callback type cannot name DOM globals in this test environment.
+				const page = globalThis as unknown as {
+					scrollY: number;
+					innerHeight: number;
+					document: { querySelector(selector: string): { offsetTop: number } };
+				};
+				const nearTop = page.document.querySelector("#near").offsetTop;
+				return { scrollY: page.scrollY, nearBottomScroll: nearTop + page.innerHeight };
+			});
+			const winnerId = await winner?.evaluate(el => {
+				const element = el as unknown as { id: string };
+				return element.id;
+			});
+			expect(winnerId).toBe("near");
+			expect(probe.scrollY).toBeLessThan(probe.nearBottomScroll);
+			await Promise.all([winner, ...handles].map(handle => handle?.dispose()));
+		} finally {
+			await page.close().catch(() => undefined);
+			if (browserHandle.browser.connected) await releaseBrowser(browserHandle, { kill: true });
+		}
+	}, 30_000);
+
+	test("clips query matches only by overflow boxes holding their containing block, through slots", async () => {
+		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
+		const page = await browserHandle.browser.newPage();
+		const later = `<button id="later" style="position: absolute; top: 200px; left: 10px">Pick</button>`;
+		const shadow = (id: string, html: string) =>
+			`document.getElementById(${JSON.stringify(id)}).attachShadow({ mode: "open" }).innerHTML = ${JSON.stringify(html)};`;
+		const zeroClip = `<div style="overflow: hidden; height: 0"><slot></slot></div>`;
+		// Puppeteer's text handler yields a shadow host rather than its slotted children, so slotted
+		// fixtures pass CSS-selected handles straight to the resolver.
+		const fixtures: Record<string, { html: string; winner: string; selector?: string }> = {
+			// The static overflow box is not the absolute button's containing block, so it does not clip it.
+			"absolute escaping a static clip": {
+				html: `<div style="overflow: hidden; height: 0"><button id="escaped" style="position: absolute; top: 10px; left: 10px">Pick</button></div>${later}`,
+				winner: "escaped",
+			},
+			"fixed escaping a positioned clip": {
+				html: `<div style="position: relative; overflow: hidden; height: 0"><button id="escaped" style="position: fixed; top: 10px; left: 10px">Pick</button></div>${later}`,
+				winner: "escaped",
+			},
+			"absolute inside its positioned clip": {
+				html: `<div style="position: relative; overflow: hidden; height: 0"><button id="clipped" style="position: absolute; top: 10px; left: 10px">Pick</button></div>${later}`,
+				winner: "later",
+			},
+			"clipped by paint containment": {
+				html: `<div style="contain: paint; height: 0"><button id="clipped">Pick</button></div>${later}`,
+				winner: "later",
+			},
+			"clipped by content-visibility": {
+				html: `<div style="content-visibility: auto; height: 0"><button id="clipped">Pick</button></div>${later}`,
+				winner: "later",
+			},
+			"clipped by an inline svg viewport": {
+				html: `<svg width="50" height="50"><text id="clipped" x="10" y="190">Pick</text></svg>${later}`,
+				winner: "later",
+			},
+			"inside a scaled inline svg viewport": {
+				html: `<svg width="50" height="50" style="transform: scale(4); transform-origin: 0 0"><text id="scaled" x="35" y="20">Pick</text></svg>${later}`,
+				winner: "scaled",
+			},
+			"modal dialog escaping a transformed clip": {
+				html: `<div style="transform: translateZ(0); overflow: hidden; height: 0"><dialog id="dlg" style="margin: 0"><button id="modal">Pick</button></dialog></div>${later}<script>document.getElementById("dlg").showModal();</script>`,
+				winner: "modal",
+			},
+			"fixed match inside a modal dialog in a transformed clip": {
+				html: `<div style="transform: translateZ(0); overflow: hidden; height: 0"><dialog id="dlg"><button id="modal" style="position: fixed; top: 10px; left: 10px">Pick</button></dialog></div>${later}<script>document.getElementById("dlg").showModal();</script>`,
+				winner: "modal",
+			},
+			"slotted into a clipped shadow wrapper": {
+				html: `<div id="host"><button id="slotted">Pick</button></div>${later}<script>${shadow("host", zeroClip)}</script>`,
+				selector: "#slotted, #later",
+				winner: "later",
+			},
+			"re-projected into a clipped inner shadow wrapper": {
+				html: `<div id="outer"><button id="slotted">Pick</button></div>${later}<script>${shadow("outer", `<div id="inner"><slot></slot></div>`)}
+document.getElementById("outer").shadowRoot.getElementById("inner").attachShadow({ mode: "open" }).innerHTML = ${JSON.stringify(zeroClip)};</script>`,
+				selector: "#slotted, #later",
+				winner: "later",
+			},
+		};
+		try {
+			const winners: Record<string, string | undefined> = {};
+			for (const [name, fixture] of Object.entries(fixtures)) {
+				await page.setContent(`<!doctype html><body style="margin: 0">${fixture.html}</body>`);
+				const handles = await page.$$(fixture.selector ?? "text/Pick");
+				const winner = await resolveActionableQueryHandlerClickTarget(handles);
+				winners[name] = await winner?.evaluate(el => {
+					// Puppeteer's page callback type cannot name DOM globals in this test environment.
+					const element = el as unknown as { id: string };
+					return element.id;
+				});
+				await Promise.all([winner, ...handles].map(handle => handle?.dispose()));
+			}
+			expect(winners).toEqual(Object.fromEntries(Object.entries(fixtures).map(([name, f]) => [name, f.winner])));
+		} finally {
+			await page.close().catch(() => undefined);
+			if (browserHandle.browser.connected) await releaseBrowser(browserHandle, { kill: true });
 		}
 	}, 30_000);
 });

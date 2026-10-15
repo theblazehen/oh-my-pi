@@ -360,9 +360,9 @@ describe("Context overflow error handling", () => {
 	describe("Google Antigravity (OAuth)", () => {
 		// Gemini model
 		it.skipIf(!antigravityToken)(
-			"gemini-3-flash - should detect overflow via isContextOverflow",
+			"gemini-3.8-flash - should detect overflow via isContextOverflow",
 			async () => {
-				const model = getBundledModel("google-antigravity", "gemini-3-flash");
+				const model = getBundledModel("google-antigravity", "gemini-3.8-flash");
 				const result = await testContextOverflow(model, antigravityToken!);
 				logResult(result);
 

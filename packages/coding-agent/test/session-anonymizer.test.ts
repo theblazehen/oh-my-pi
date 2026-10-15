@@ -23,6 +23,7 @@ describe("SessionAnonymizer", () => {
 				id: "01a0c9ac-8c2d",
 				timestamp: "2026-09-22T15:12:03.629Z",
 				cwd: "/home/alice/acme",
+				taskPromptCacheKey: "customer-acme:reviewer",
 			},
 			{
 				type: "message",
@@ -39,7 +40,7 @@ describe("SessionAnonymizer", () => {
 				message: {
 					role: "assistant",
 					content: [
-						{ type: "thinking", thinking: "look for invoiceParser" },
+						{ type: "thinking", thinking: "look for invoiceParser", summary: false },
 						{
 							type: "toolCall",
 							id: "toolu_01MNY3aqvM6YV4Bg",
@@ -62,6 +63,7 @@ describe("SessionAnonymizer", () => {
 					provider: "anthropic",
 					model: "claude-opus-5-5",
 					usage,
+					elidedOutputTokens: 12,
 					stopReason: "toolUse",
 					providerPayload: {
 						items: [
@@ -128,6 +130,7 @@ describe("SessionAnonymizer", () => {
 		expect(at(usageEntry, "errorMessage")).toMatch(/^400 \[redacted #\d+: \d+ chars, 1 line\]$/);
 		expect(at(ttsr, "injectedRules")).toEqual([expect.stringMatching(/^PLACEHOLDER_\d+$/)]);
 		expect(header).toMatchObject({ type: "session", id: "01a0c9ac-8c2d", timestamp: "2026-09-22T15:12:03.629Z" });
+		expect(at(header, "taskPromptCacheKey")).toMatch(/^\[redacted #\d+: 22 chars, 1 line\]$/);
 		const cwd = String(at(header, "cwd"));
 		expect(cwd).toMatch(/^\/home\/seg\d+\/seg\d+$/);
 
@@ -136,12 +139,14 @@ describe("SessionAnonymizer", () => {
 			model: "claude-opus-5-5",
 			provider: "anthropic",
 			usage,
+			elidedOutputTokens: 12,
 			stopReason: "toolUse",
 		});
 
 		const content = (index: number, ...rest: Array<string | number>) =>
 			at(assistant, "message", "content", index, ...rest);
 		expect(content(0, "thinking")).toMatch(/^\[redacted #\d+: 22 chars, 1 line\]$/);
+		expect(content(0, "summary")).toBe(false);
 		expect(content(1)).toMatchObject({ type: "toolCall", id: "toolu_01MNY3aqvM6YV4Bg", name: "grep" });
 		const pattern = String(content(1, "arguments", "pattern"));
 		const grepPath = String(content(1, "arguments", "path"));
@@ -159,6 +164,16 @@ describe("SessionAnonymizer", () => {
 
 		expect(at(toolResult, "message", "content", 0, "text")).toMatch(/^\[redacted #\d+: 53 chars, 1 line\]$/);
 		expect(at(toolResult, "message", "details")).toEqual({ matchCount: 1, searchPath: cwd });
+	});
+
+	test("preserves the suppressed Bash timing flag", () => {
+		const anonymizer = new SessionAnonymizer();
+		const result = anonymizer.entry({
+			type: "message",
+			message: { role: "toolResult", toolName: "bash", details: { wallTimeNoticeEmitted: false } },
+		});
+
+		expect(at(result, "message", "details")).toEqual({ wallTimeNoticeEmitted: false });
 	});
 
 	test("rewrites shell commands keeping programs, flags, and operators", () => {
@@ -420,6 +435,7 @@ describe("SessionAnonymizer", () => {
 					details: {
 						status: "customer-acme",
 						jobId: "account_12345",
+						wallTimeNoticeEmitted: "customer-acme",
 						results: [{ structuredOutput: { data: { status: "customer-acme" } } }],
 						progress: [{ status: "completed", tokens: 12 }],
 					},
@@ -430,5 +446,25 @@ describe("SessionAnonymizer", () => {
 		expect(json).not.toContain("account_12345");
 		expect(json).toContain('"op":"start"');
 		expect(json).toContain('"progress":[{"status":"completed","tokens":12}]');
+	});
+
+	test("keeps the build version and commit of a runtime stamp and tokenizes the rest consistently", () => {
+		const anonymizer = new SessionAnonymizer();
+		const runtime = {
+			version: "18.10.4",
+			commit: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+			branch: "alice/acme-billing",
+			diff: "3f2a9c0112345678",
+			label: "customer-acme",
+		};
+		const [first, second] = [
+			anonymizer.entry({ type: "message", runtime }),
+			anonymizer.entry({ type: "label", runtime }),
+		];
+		expect(at(first, "runtime", "version")).toBe("18.10.4");
+		expect(at(first, "runtime", "commit")).toBe(runtime.commit);
+		expect(JSON.stringify(first)).not.toMatch(/acme|3f2a9c01/);
+		// Equal stamps stay comparable after anonymization, so build changes remain visible.
+		expect(at(second, "runtime")).toEqual(at(first, "runtime"));
 	});
 });

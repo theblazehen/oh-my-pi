@@ -37,6 +37,8 @@ app.history.search: []
 | `app.history.search`         | `Ctrl+R`                                                              | Search prompt history                                                                                                                                                                |
 | `app.tools.expand`           | `Ctrl+O`                                                              | Toggle tool-output expansion                                                                                                                                                         |
 | `app.tools.toggleVisibility` | `Ctrl+Shift+O`                                                        | Show or hide tool activity                                                                                                                                                           |
+| `app.ask.hide`               | `Alt+H`                                                               | Hide a pending `ask` question to one line (the Hide button in Tern); the same key, `Enter`, or Show brings it back                                                                   |
+| `app.approval.approve`       | `Ctrl+Enter`, `Ctrl+Q`                                                | Approve a pending tool call (the Approve button in Tern); `Esc` denies. Plain `Enter` never approves                                                                                  |
 | `app.thinking.toggle`        | `Ctrl+T`                                                              | Toggle thinking-block visibility                                                                                                                                                     |
 | `app.thinking.cycle`         | `Shift+Tab`                                                           | Cycle thinking level                                                                                                                                                                 |
 | `app.editor.external`        | `Ctrl+G`                                                              | Edit the draft in `$VISUAL` / `$EDITOR`                                                                                                                                              |
@@ -53,6 +55,8 @@ app.history.search: []
 | `app.live.toggle`            | `Ctrl+L`                                                              | Start or stop live voice mode (same as `/live`)                                                                                                                                      |
 | `app.agents.hub`             | `Alt+A`                                                               | [Open the Agent Hub](./agent-hub.md)                                                                                                                                                 |
 | `app.prewalk.exit`          | `Alt+W`                                | Exit prewalk and return to the default model  |
+| `app.tree.previousBranch`    | Unbound                                                               | Jump to the previous visible branch in `/tree` ([details](./tree.md))                                                                                                                |
+| `app.tree.nextBranch`        | Unbound                                                               | Jump to the next visible branch in `/tree` ([details](./tree.md))                                                                                                                    |
 
 To disable push-to-talk while keeping speech-to-text available through a separate toggle binding:
 
@@ -62,6 +66,14 @@ app.stt.toggle: Ctrl+Shift+S
 ```
 
 While speech-to-text is enabled, non-printable keys and chords assigned to `app.stt.pushToTalk` are reserved: a tap is swallowed instead of running its normal editing or application action. A plain printable key tap still types normally. Text-assistance transformations from initial taps are preserved; only unchanged literal repeat text is removed when a hold is recognized. Each configured alternative is independent; alternating between alternatives does not combine them into one hold. Hold detection requires a terminal that delivers key auto-repeat.
+
+### Click to dictate in Tern
+
+With `stt.enabled` on, the native composer shows a microphone beside Send. Click it to start recording without holding a key. While the speech model loads, the button shows **Starting…**; click it again to cancel. Once it changes to **Recording · Stop**, click it to stop, then wait for **Transcribing…** to finish.
+
+Dictation started with this button stays in the draft, regardless of `stt.submitTrigger`. Review or edit the text, then press Enter or click Send. While dictation is recording or transcribing into the draft, Enter and Send do nothing.
+
+For live English transcription, select **Nemotron 0.6B (live streaming, English)** in `omp setup speech`, or set `modelRoles.dictation` to `local/nemotron-streaming-en-0.6b`. Words appear in the draft while you speak. The first recording waits for the model to load before opening the microphone; start speaking when the button says **Recording · Stop**. Later recordings reuse the loaded model. See [local speech models](local-models.md#speech-to-text) for download and language details.
 
 ## Recover a cleared prompt
 

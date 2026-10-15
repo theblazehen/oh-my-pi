@@ -9,6 +9,7 @@ import { type ComposerNativeState, CustomEditor } from "@oh-my-pi/pi-tui/prompt/
 import { QueuedMessagesBand } from "@oh-my-pi/pi-tui/prompt/queued-messages";
 import { createStartupStatusLine } from "@oh-my-pi/pi-tui/status-line/startup";
 import { getEditorTheme, getSelectListTheme, initTheme } from "@oh-my-pi/pi-tui/theme";
+import { TspHarness } from "./native/tsp-harness";
 import { VirtualTerminal } from "./virtual-terminal";
 
 const context = (kinds: readonly TspKind[] | "all"): DescribeContext => ({
@@ -124,6 +125,16 @@ describe("native composer", () => {
 		});
 	});
 
+	it("sends a shown prediction as ghost text in place of the placeholder", () => {
+		const editor = composer({ running: false, title: "Fix login" });
+		editor.prediction = () => "run the tests";
+		const input = () => nodes(editor.describe(cx)).find(n => n.k === "editor")?.p;
+
+		expect(input()).toMatchObject({ ghost: "run the tests", placeholder: undefined });
+		editor.setText("run");
+		expect(input()).toMatchObject({ ghost: " the tests", placeholder: undefined });
+	});
+
 	it("names the viewed subagent over the draft and routes its links to the focus handler", () => {
 		expect(byRole(composer({ running: false }).describe(cx), "omp.composer.focus")).toBeUndefined();
 
@@ -185,6 +196,121 @@ describe("native composer", () => {
 		editor.setText("hello");
 		editor.handleNativeEvent({ type: "action", key: "bar/send", act: "submit", mods: [] });
 		expect(submitted).toEqual(["hello"]);
+	});
+
+	it("rebuilds the microphone beside Send through every dictation state and hides it without a host", () => {
+		let dictation: ComposerNativeState["dictation"];
+		const editor = new CustomEditor(getEditorTheme());
+		editor.composerState = () => ({ running: false, dictation });
+		editor.onSubmit = vi.fn();
+		editor.onToggleDictation = vi.fn();
+		const hidden = editor.describe(cx);
+		expect(byRole(hidden, "omp.composer.dictation")).toBeUndefined();
+		editor.handleNativeEvent({ type: "action", key: "bar/dictation", act: "dictation.toggle", mods: [] });
+		expect(editor.onToggleDictation).not.toHaveBeenCalled();
+
+		for (const state of ["idle", "starting", "recording", "transcribing", "idle"] as const) {
+			dictation = state;
+			const root = editor.describe(cx);
+			const mic = byRole(root, "omp.composer.dictation")!;
+			const send = byRole(root, "omp.composer.send")!;
+			const bar = byRole(root, "omp.composer.bar")!;
+			const children = (bar.c ?? []).filter(isNode);
+			const holdsDraft = state === "recording" || state === "transcribing";
+			expect(children.indexOf(mic)).toBe(children.indexOf(send) - 1);
+			expect(nodes(root).find(n => n.k === "editor")?.p).toMatchObject({ sendable: !holdsDraft });
+			expect(send.p?.actions).toEqual(holdsDraft ? undefined : { click: "submit" });
+			expect(mic.p?.actions).toEqual(state === "transcribing" ? undefined : { click: "dictation.toggle" });
+
+			if (state === "starting" || state === "transcribing") {
+				expect(mic.p).toMatchObject({ tone: "pending" });
+				expect(nodes(mic).some(n => n.k === "spinner")).toBe(true);
+			} else {
+				expect(nodes(mic).find(n => n.k === "icon")?.p).toEqual({
+					name: state === "recording" ? "stop" : "mic",
+				});
+				if (state === "recording") {
+					expect(mic.p).toMatchObject({ tone: "error" });
+				}
+			}
+		}
+		dictation = undefined;
+		expect(byRole(editor.describe(cx), "omp.composer.dictation")).toBeUndefined();
+	});
+
+	it("routes microphone clicks without keyboard focus, cancels a slow start and keeps transcription as a draft", async () => {
+		let dictation: ComposerNativeState["dictation"] = "idle";
+		const editor = new CustomEditor(getEditorTheme());
+		const other = new CustomEditor(getEditorTheme());
+		const toggled: ComposerNativeState["dictation"][] = [];
+		const submitted: string[] = [];
+		editor.composerState = () => ({ running: false, dictation });
+		// Mirrors the host: idle starts, a pending start cancels, recording stops into transcription.
+		editor.onToggleDictation = () => {
+			toggled.push(dictation);
+			dictation = dictation === "idle" ? "starting" : dictation === "starting" ? "idle" : "transcribing";
+		};
+		editor.onSubmit = text => {
+			submitted.push(text);
+		};
+		other.onToggleDictation = () => {
+			throw new Error("dictation reached keyboard focus instead of its native owner");
+		};
+		editor.setText("existing draft");
+		const h = await TspHarness.start(tui => {
+			tui.addChild(editor);
+			tui.addChild(other);
+			tui.setFocus(other);
+		});
+		try {
+			const mic = h.find(n => n.p?.role === "omp.composer.dictation")!;
+			const send = h.find(n => n.p?.role === "omp.composer.send")!;
+			const input = h.find(n => n.k === "editor" && n.p?.text === "existing draft")!;
+			const clickMic = () => h.event({ ev: "action", sf: h.terminal.surface!, id: mic.id, act: "dictation.toggle" });
+			const assertSendBlocked = () => {
+				h.event({ ev: "action", sf: h.terminal.surface!, id: send.id, act: "submit" });
+				h.event({ ev: "send", sf: h.terminal.surface!, id: input.id, text: "must not replace draft" });
+				editor.handleInput("\r");
+				expect(submitted).toEqual([]);
+				expect(editor.getText()).toBe("existing draft");
+				expect(h.byId(input.id)?.p).toMatchObject({ sendable: false });
+			};
+
+			// A start still loading its model can be cancelled, and does not block sending.
+			clickMic();
+			await h.render();
+			expect(editor.composerState().dictation).toBe("starting");
+			expect(h.byId(input.id)?.p).toMatchObject({ sendable: true });
+			clickMic();
+			await h.render();
+			expect(toggled).toEqual(["idle", "starting"]);
+			expect(editor.composerState().dictation).toBe("idle");
+
+			clickMic();
+			dictation = "recording";
+			await h.render();
+			assertSendBlocked();
+			clickMic();
+			await h.render();
+			expect(toggled).toEqual(["idle", "starting", "idle", "recording"]);
+			expect(editor.composerState().dictation).toBe("transcribing");
+			clickMic();
+			expect(toggled).toHaveLength(4);
+			assertSendBlocked();
+
+			editor.setText("existing draft dictated words submit");
+			dictation = "idle";
+			await h.render();
+			expect(submitted).toEqual([]);
+			expect(editor.getText()).toBe("existing draft dictated words submit");
+			expect(h.byId(input.id)?.p).toMatchObject({ sendable: true });
+			h.event({ ev: "action", sf: h.terminal.surface!, id: send.id, act: "submit" });
+			expect(submitted).toEqual(["existing draft dictated words submit"]);
+			expect(editor.getText()).toBe("");
+			expect(h.errors).toEqual([]);
+		} finally {
+			h.stop();
+		}
 	});
 
 	it("keeps the effort chip at `off` with an empty glyph so a click can turn thinking back on", () => {
@@ -440,7 +566,7 @@ describe("native composer without a status strip", () => {
 			const model = byRole(bar, "omp.composer.model")!;
 			expect(model.p).toMatchObject({ actions: { click: "status.model" } });
 			expect(nodes(model).map(n => n.k)).toEqual(["row", "icon", "text", "icon"]);
-			// Path and branch belong to Tern's pane header; the rest stays as a fact.
+			// The path belongs to Tern's pane header; the rest stays as a fact (git shows nothing without a repo).
 			const extras = byRole(bar, "omp.composer.extras")!;
 			expect((extras.c ?? []).filter(isNode).map(n => n.key)).toEqual(["hostname"]);
 			expect(byRole(bar, "omp.composer.usage")?.p).toMatchObject({ actions: { click: "status.cost" } });

@@ -9,7 +9,7 @@ use std::{
 	fmt,
 	io::{self, Read, Write},
 	ops::BitOr,
-	path::{MAIN_SEPARATOR, Path, PathBuf},
+	path::{Component, MAIN_SEPARATOR, Path, PathBuf, Prefix},
 };
 
 use clap::{
@@ -1549,8 +1549,17 @@ fn prompt_file_permission_readonly(host: &mut Host, path: &Path, options: &Optio
 
 /// Checks if the path is referring to current or parent directory , if it is
 /// referring to current or any parent directory in the file tree e.g  '/../..'
-/// , '../..'
+/// , '../..'. A Windows drive-relative operand counts by its remainder: `C:`
+/// alone names that drive's current directory, so it is refused like `.`.
 fn path_is_current_or_parent_directory(path: &Path) -> bool {
+	let mut components = path.components();
+	if let Some(Component::Prefix(prefix)) = components.next()
+		&& matches!(prefix.kind(), Prefix::Disk(_))
+		&& !path.has_root()
+	{
+		let rest = components.as_path();
+		return rest.as_os_str().is_empty() || path_is_current_or_parent_directory(rest);
+	}
 	let path_str = os_bytes(path.as_os_str());
 	let dir_separator = MAIN_SEPARATOR as u8;
 	if let Some(path_bytes) = path_str {
@@ -1722,6 +1731,28 @@ mod tests {
 		assert_eq!(code, 0, "{}", capture.err());
 		assert!(!host_file.exists());
 		assert!(process_file.path().exists());
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn drive_relative_operands_resolve_against_host_cwd() {
+		let cwd = tempdir().unwrap();
+		let sentinel = cwd.path().join("sentinel");
+		std::fs::write(&sentinel, b"keep me").unwrap();
+		std::fs::create_dir(cwd.path().join("child")).unwrap();
+		// `C:` for a cwd of `C:\...`.
+		let drive = cwd.path().components().next().unwrap().as_os_str().to_str().unwrap().to_owned();
+
+		let (code, capture) = run_util::<Rm>(&["-rf", drive.as_str()], "", cwd.path());
+		assert_eq!(code, 1);
+		assert!(capture.err().contains("refusing to remove '.' or '..' directory"), "{}", capture.err());
+		assert!(sentinel.is_file());
+
+		let child = format!("{drive}child");
+		let (code, capture) = run_util::<Rm>(&["-r", child.as_str()], "", cwd.path());
+		assert_eq!(code, 0, "{}", capture.err());
+		assert!(!cwd.path().join("child").exists());
+		assert!(sentinel.is_file());
 	}
 
 	#[test]

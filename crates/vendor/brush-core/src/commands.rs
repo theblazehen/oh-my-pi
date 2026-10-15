@@ -24,6 +24,32 @@ use crate::{
 	sys, trace_categories, traps, variables,
 };
 
+thread_local! {
+	static BUILTIN_ON_BLOCKING_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the calling builtin runs on a Tokio blocking worker (owned-shell
+/// pipeline stages and async jobs, or virtual-file builtins). Synchronous I/O
+/// there cannot starve the async runtime, so a builtin must not offload it to
+/// another blocking worker: holding this one while queueing that can exhaust
+/// a bounded blocking pool and leave every nested read waiting forever.
+pub fn builtin_on_blocking_worker() -> bool {
+	BUILTIN_ON_BLOCKING_WORKER.with(std::cell::Cell::get)
+}
+
+/// Drives a builtin to completion on the current blocking worker, marking the
+/// thread for [`builtin_on_blocking_worker`] while it runs.
+fn block_on_builtin<F: Future>(future: F) -> F::Output {
+	struct Restore(bool);
+	impl Drop for Restore {
+		fn drop(&mut self) {
+			BUILTIN_ON_BLOCKING_WORKER.with(|flag| flag.set(self.0));
+		}
+	}
+	let _restore = Restore(BUILTIN_ON_BLOCKING_WORKER.with(|flag| flag.replace(true)));
+	tokio::runtime::Handle::current().block_on(future)
+}
+
 /// Encapsulates the result of waiting for a command to complete.
 pub enum CommandWaitResult {
 	/// The command completed.
@@ -534,8 +560,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
 		let join_handle = tokio::task::spawn_blocking(move || {
 			let cmd_context = ExecutionContext { shell: &mut shell, command_name, params };
 
-			let rt = tokio::runtime::Handle::current();
-			let result = rt.block_on(execute_builtin_command(&builtin, cmd_context, args));
+			let result = block_on_builtin(execute_builtin_command(&builtin, cmd_context, args));
 
 			// Update $_ after command execution.
 			shell.update_last_arg_variable(last_arg);
@@ -572,11 +597,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
 			let join_handle = tokio::task::spawn_blocking(move || {
 				let mut lease = lease;
 				let cmd_context = ExecutionContext { shell: &mut lease, command_name, params };
-				let result = tokio::runtime::Handle::current().block_on(execute_builtin_command(
-					&builtin,
-					cmd_context,
-					args,
-				));
+				let result = block_on_builtin(execute_builtin_command(&builtin, cmd_context, args));
 				(lease, result)
 			});
 			match join_handle.await {

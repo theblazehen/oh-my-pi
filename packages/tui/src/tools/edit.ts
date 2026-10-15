@@ -482,6 +482,21 @@ interface StreamingDiffTail {
 }
 
 /**
+ * Visual rows a raw diff line occupies once `renderDiff` gives it a code-frame
+ * gutter and `wrapEditRendererLine` hangs its continuations beneath it.
+ * Canonical `+12|` rows render a padded `max(3, digits) + 1` gutter plus `│`;
+ * rows already carrying a `│` rail keep their own prefix. Content wraps at the
+ * width left after that gutter; unnumbered rows wrap whole.
+ */
+function streamingDiffLineRows(rawLine: string, innerWidth: number): number {
+	const numbered = /^([+\-\s]\s*(\d+)[|│])(.*)$/s.exec(rawLine) ?? /^([+\-\s]\s*(\d+)\s)(.*)$/s.exec(rawLine);
+	if (!numbered) return Math.max(1, wrapTextWithAnsi(replaceTabs(rawLine), innerWidth).length);
+	const gutterWidth = Math.max(visibleWidth(numbered[1]!), Math.max(3, numbered[2]!.length) + 2);
+	const contentWidth = Math.max(1, innerWidth - gutterWidth);
+	return Math.max(1, wrapTextWithAnsi(replaceTabs(numbered[3] ?? ""), contentWidth).length);
+}
+
+/**
  * Select the trailing physical lines that fit the live preview budget.
  *
  * Walk backward from the end instead of splitting the complete diff. This keeps
@@ -500,7 +515,7 @@ function sliceStreamingDiffTail(diff: string, innerWidth: number, budget: number
 	while (cursor >= 0) {
 		const newline = cursor > 0 ? diff.lastIndexOf("\n", cursor - 1) : -1;
 		const lineStart = newline + 1;
-		const lineRows = Math.max(1, wrapTextWithAnsi(replaceTabs(diff.slice(lineStart, cursor)), innerWidth).length);
+		const lineRows = streamingDiffLineRows(diff.slice(lineStart, cursor), innerWidth);
 		if (visualRows > 0 && visualRows + lineRows > rowLimit) break;
 		visualRows += lineRows;
 		start = lineStart;
@@ -1142,7 +1157,10 @@ export const editToolRenderer = {
 				while (bodyLines.length > 0 && bodyLines[0].trim() === "") bodyLines.shift();
 				return {
 					header,
-					sections: bodyLines.length > 0 ? [{ content: bodyLines }] : [],
+					sections:
+						bodyLines.length > 0
+							? [{ content: bodyLines.flatMap(line => wrapEditRendererLine(line, Math.max(1, width - 2))) }]
+							: [],
 					phase: applyPatchError ? "error" : "pending",
 					borderColor: applyPatchError ? "error" : "borderMuted",
 					contentPaddingLeft: 0,

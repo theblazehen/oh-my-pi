@@ -24,6 +24,7 @@ import type {
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { dispatchXdevTool, resolveMountedXdevExecutable, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -256,6 +257,55 @@ it("always-ask: an ACP grant satisfies the inner wrapper's explicit prompt polic
 
 	expect(permissionSpy).toHaveBeenCalledTimes(1);
 	expect(bashTool.executeCalls).toBe(1);
+});
+
+it("ACP bash uses pattern decisions and scopes persistent grants to noncritical commands", async () => {
+	const settingsOverrides = {
+		"tools.approvalMode": "always-ask",
+		"tools.approval": { bash: "prompt" },
+		"bash.patterns": [
+			{ match: "echo safe*", approval: "allow" },
+			{ match: "echo denied*", approval: "deny" },
+		],
+	};
+	const settings = Settings.isolated(settingsOverrides);
+	const requests: string[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall) {
+			const input = toolCall.rawInput;
+			if (!input || typeof input !== "object" || !("command" in input) || typeof input.command !== "string") {
+				throw new Error("Missing bash command");
+			}
+			const command = input.command;
+			requests.push(command);
+			return { outcome: "selected", optionId: "allow_always", kind: "allow_always" };
+		},
+	};
+	const bashTool = makeFakeTool("bash");
+	bashTool.approval = new BashTool({ ...makeToolSession(bridge), settings }).approval;
+	const wrapped = new ExtensionToolWrapper(bashTool, noUiRunner()) as unknown as AgentTool;
+	session = await createSession([wrapped], bridge, settingsOverrides);
+	await session.setActiveToolsByName(["bash"]);
+	const gatedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+	if (!gatedBash) throw new Error("Missing bash tool");
+	const ctx = { settings } as never;
+	const run = (command: string) =>
+		gatedBash.execute(`call-${command}`, { command }, undefined, undefined as never, ctx);
+
+	await run("echo safe-read");
+	expect(requests).toEqual([]);
+	await expect(run("echo denied-write")).rejects.toThrow(/blocked by tool policy/);
+	expect(requests).toEqual([]);
+	await run("echo probe-1");
+	await run("echo probe-2");
+	// "Always allow" covers later ordinary commands, as before.
+	expect(requests).toEqual(["echo probe-1"]);
+	await run("rm -rf /");
+	await run("rm -rf /");
+	// Critical commands ask on every call, whatever was granted.
+	expect(requests).toEqual(["echo probe-1", "rm -rf /", "rm -rf /"]);
+	expect(bashTool.executeCalls).toBe(5);
 });
 
 it("always-ask: an ordinary edit without an ACP grant still faces the inner approval gate", async () => {
@@ -823,28 +873,6 @@ it("unknown selected permission option ID fails closed without executing", async
 		wrappedBash!.execute("call-unknown", { command: "echo hi" }, undefined, undefined as never, undefined as never),
 	).rejects.toThrow(/unknown option ID/);
 	expect(bashTool.executeCalls).toBe(0);
-});
-
-// ---------------------------------------------------------------------------
-// 3. Always allow caches: bridge called exactly once across two executions
-// ---------------------------------------------------------------------------
-
-it("allow_always: caches decision and calls bridge only once for subsequent executes", async () => {
-	const bashTool = makeFakeTool("bash");
-	const bridge = makeBridge({ outcome: "selected", optionId: "allow_always", kind: "allow_always" });
-	const permissionSpy = spyOn(bridge, "requestPermission");
-	session = await createSession([bashTool], bridge);
-
-	await session.setActiveToolsByName(["bash"]);
-	const wrappedBash = session.agent.state.tools.find(t => t.name === "bash");
-
-	// First call — bridge is consulted, decision cached.
-	await wrappedBash!.execute("call-1", { command: "echo a" }, undefined, undefined as never, undefined as never);
-	// Second call — must skip the bridge entirely.
-	await wrappedBash!.execute("call-2", { command: "echo b" }, undefined, undefined as never, undefined as never);
-
-	expect(permissionSpy).toHaveBeenCalledTimes(1);
-	expect(bashTool.executeCalls).toBe(2);
 });
 
 it.each(boundaryCases)(

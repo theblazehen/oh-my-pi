@@ -201,7 +201,7 @@ export async function loadPage(url: string, options: LoadPageOptions = {}): Prom
 
 			const reader = response.body?.getReader();
 			if (!reader) {
-				return { content: "", contentType, finalUrl, ok: false, status: response.status };
+				return { content: "", contentType, finalUrl, ok: response.ok, status: response.status };
 			}
 
 			const chunks: Uint8Array[] = [];

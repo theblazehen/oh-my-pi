@@ -786,6 +786,16 @@ pub struct RevealedLine {
 	pub text: String,
 }
 
+/// A wide unseen anchor cannot be safely promoted by a column-capped reveal.
+pub fn wide_unseen_lines_message(section_path: &str, unseen_lines: &[u32]) -> String {
+	let ranges = format_line_ranges(unseen_lines);
+	let selector = ranges.replace(", ", ",");
+	format!(
+		"This edit anchors to lines {ranges} of {section_path} that were not fully displayed. Read \
+		 `{section_path}:{selector}:raw` for their full content, then re-issue the edit."
+	)
+}
+
 /// Content preview handed to [`unseen_lines_message`].
 ///
 /// `lines` are the unseen anchor lines whose actual file content we surface

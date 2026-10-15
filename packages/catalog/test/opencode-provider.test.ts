@@ -490,6 +490,53 @@ describe("Shared models.dev catalog fallback", () => {
 });
 
 describe("OpenCode provider discovery", () => {
+	test("discovers the Zen Jev judge seed beside the served roster", async () => {
+		const fetchMock: FetchImpl = async () =>
+			Response.json({ data: [{ id: "gpt-5.6-sol", name: "GPT-5.6 Sol", context_length: 400_000 }] });
+		const options = opencodeZenModelManagerOptions({ apiKey: "user_test", fetch: fetchMock });
+		const models = ((await options.fetchDynamicModels?.()) ?? []).map(spec => buildModel(spec));
+
+		const jevRows = models.filter(model => model.id === "jev-1.13");
+		expect(jevRows).toHaveLength(1);
+		expect(jevRows[0]).toMatchObject({
+			name: "Jev 1.13",
+			api: "typesafe",
+			baseUrl: "https://opencode.ai/zen",
+			kind: "judge",
+			cost: { input: 0.042, output: 0 },
+		});
+
+		const proxied = opencodeZenModelManagerOptions({
+			apiKey: "user_test",
+			baseUrl: "https://proxy.example/zen/v1",
+			fetch: fetchMock,
+		});
+		const proxiedModels = ((await proxied.fetchDynamicModels?.()) ?? []).map(spec => buildModel(spec));
+		expect(proxiedModels.find(model => model.id === "jev-1.13")?.baseUrl).toBe("https://proxy.example/zen");
+	});
+
+	test("keeps one Zen System One jev row when the models route also lists it", async () => {
+		const fetchMock: FetchImpl = async () =>
+			Response.json({
+				data: [
+					{ id: "gpt-5.6-sol", name: "GPT-5.6 Sol", context_length: 400_000 },
+					{ id: "jev-1.13", name: "Jev 1.13", context_length: 32_000 },
+				],
+			});
+		const options = opencodeZenModelManagerOptions({ apiKey: "user_test", fetch: fetchMock });
+		const models = ((await options.fetchDynamicModels?.()) ?? []).map(spec => buildModel(spec));
+
+		const jevRows = models.filter(model => model.id === "jev-1.13");
+		expect(jevRows).toHaveLength(1);
+		expect(jevRows[0]).toMatchObject({ api: "typesafe", kind: "judge" });
+	});
+
+	test("returns null from a failed Zen discovery instead of the jev seed alone", async () => {
+		const fetchMock: FetchImpl = async () => new Response("unavailable", { status: 503 });
+		const options = opencodeZenModelManagerOptions({ apiKey: "user_test", fetch: fetchMock });
+		expect(await options.fetchDynamicModels?.()).toBeNull();
+	});
+
 	test("invalidates cached GLM-5.3 Flash effort metadata on upgrade (issue #9960)", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-opencode-glm53-flash-cache-"));
 		const cacheDbPath = path.join(tempDir, "models.db");
@@ -574,6 +621,66 @@ describe("OpenCode provider discovery", () => {
 		}
 	});
 
+	test("replaces a cached $0 Go Flash alias with the reviewed rate card on upgrade (#15357)", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-opencode-flash-alias-cache-"));
+		const cacheDbPath = path.join(tempDir, "models.db");
+		try {
+			const options = opencodeGoModelManagerOptions({
+				apiKey: "go-account-key",
+				fetch: async () => modelListResponse(["deepseek-flash"]),
+			});
+			const cacheProviderId = options.cacheProviderId;
+			if (!cacheProviderId) throw new Error("OpenCode Go cache provider id is missing");
+			// A fresh snapshot from a binary that predates the rule: the alias row
+			// carries the gateway defaults, under that binary's cache identity.
+			const priorDropIds = options.dropCachedModelIdsOnStaticMismatch?.filter(id => id !== "deepseek-flash");
+			await resolveProviderModels(
+				{
+					...options,
+					cacheDbPath,
+					modelsDev: undefined,
+					dropCachedModelIdsOnStaticMismatch: priorDropIds,
+					fetchDynamicModels: async () => [
+						{
+							id: "deepseek-flash",
+							name: "deepseek-flash",
+							api: "openai-completions",
+							provider: "opencode-go",
+							baseUrl: "https://opencode.ai/zen/go/v1",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: null,
+							maxTokens: null,
+						},
+					],
+				},
+				"online",
+			);
+			let fetches = 0;
+			const upgraded = await resolveProviderModels(
+				{
+					...options,
+					cacheDbPath,
+					modelsDev: undefined,
+					fetchDynamicModels: async () => {
+						fetches++;
+						return (await options.fetchDynamicModels?.()) ?? [];
+					},
+				},
+				"online-if-uncached",
+			);
+			const alias = upgraded.models.find(model => model.id === "deepseek-flash");
+			if (!alias) throw new Error("Go Flash alias missing after cache upgrade");
+			expect(fetches).toBe(1);
+			expect(alias.cost).toMatchObject({ input: 0.15, output: 0.6, cacheRead: 0.003 });
+			expect(alias.contextWindow).toBe(1_000_000);
+			expect(getSupportedEfforts(alias)).toEqual([Effort.Low, Effort.High, Effort.Max]);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	test("drops cached Gemini 3.7 Flash effort metadata when refresh fails (#10543)", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-catalog-opencode-gemini37-cache-"));
 		const cacheDbPath = path.join(tempDir, "models.db");
@@ -620,32 +727,61 @@ describe("OpenCode provider discovery", () => {
 
 	test("routes opencode-go deepseek-v4-flash to the responses API", () => {
 		const descriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(item => item.providerId === "opencode-go");
-		// stencil.so lists deepseek-v4-flash without provider.npm, so it would
-		// fall through to openai-completions — but the Go gateway does not serve
-		// this model at /zen/go/v1/chat/completions while /zen/go/v1/responses
-		// works (user-verified against the live gateway, 2026-08-08).
+		// The gateway serves Flash on /v1/responses, not /v1/chat/completions;
+		// the catalog has no npm hint to distinguish it (verified 2026-08-08).
 		expect(descriptor?.resolveApi?.("deepseek-v4-flash", { tool_call: true })).toEqual({
 			api: "openai-responses",
-			baseUrl: "https://opencode.ai/zen/go/v1",
+			baseUrl: "https://opencode.ai/inference/go/v1",
 		});
 		// Flash only: deepseek-v4-pro serves fine on chat completions.
 		expect(descriptor?.resolveApi?.("deepseek-v4-pro", { tool_call: true })).toEqual({
 			api: "openai-completions",
-			baseUrl: "https://opencode.ai/zen/go/v1",
+			baseUrl: "https://opencode.ai/inference/go/v1",
 		});
+	});
+
+	test("routes live Go Argon to native Gemini with supported thinking levels (#15722)", async () => {
+		const id = "gemini-4-argon-contributor";
+		const baseUrl = "https://opencode.ai/inference/go/v1";
+		const descriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(item => item.providerId === "opencode-go");
+		expect(descriptor?.resolveApi?.(id, { tool_call: true })).toEqual({ api: "google-generative-ai", baseUrl });
+
+		let requestedUrl = "";
+		const options = opencodeGoModelManagerOptions({
+			apiKey: "test-key",
+			fetch: async input => {
+				requestedUrl = String(input);
+				return modelListResponse([id]);
+			},
+		});
+		const spec = (await options.fetchDynamicModels?.())?.find(model => model.id === id);
+		if (!spec) throw new Error("Go did not discover Argon");
+		const model = buildModel(spec);
+		expect(requestedUrl).toBe(`${baseUrl}/models`);
+		expect(model).toMatchObject({
+			api: "google-generative-ai",
+			baseUrl,
+			reasoning: true,
+			input: ["text", "image"],
+			contextWindow: 1_048_576,
+			maxTokens: 65_536,
+			thinking: {
+				mode: "google-level",
+				efforts: [Effort.Low, Effort.Medium, Effort.High],
+				requiresEffort: true,
+			},
+		});
+		expect(options.dropCachedModelIdsOnStaticMismatch).toContain(id);
 	});
 
 	test("routes opencode-go muse-spark-1.2 to the responses API (#8957)", () => {
 		const descriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(item => item.providerId === "opencode-go");
-		// The Go /zen/go/v1/models discovery drops the provider.npm hint for the
-		// muse-spark ids, so without an override they fall through to
-		// openai-completions even though the gateway only serves them at
-		// /zen/go/v1/responses. Sending completions requests closes the stream
-		// with no finish_reason on every tool-call turn.
+		// Go's live model list omits transport metadata for these ids; the
+		// gateway serves them on /v1/responses, not chat completions.
 		for (const id of ["muse-spark-1.2", "muse-spark-1.2-contributor"]) {
 			expect(descriptor?.resolveApi?.(id, { tool_call: true })).toEqual({
 				api: "openai-responses",
-				baseUrl: "https://opencode.ai/zen/go/v1",
+				baseUrl: "https://opencode.ai/inference/go/v1",
 			});
 		}
 	});
@@ -659,7 +795,7 @@ describe("OpenCode provider discovery", () => {
 		const goDescriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(item => item.providerId === "opencode-go");
 		expect(goDescriptor?.resolveApi?.("muse-spark-1.3-contributor", { tool_call: true })).toEqual({
 			api: "openai-responses",
-			baseUrl: "https://opencode.ai/zen/go/v1",
+			baseUrl: "https://opencode.ai/inference/go/v1",
 		});
 		const zenDescriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(item => item.providerId === "opencode-zen");
 		expect(zenDescriptor?.resolveApi?.("muse-spark-1.3-contributor-free", { tool_call: true })).toEqual({
@@ -670,7 +806,7 @@ describe("OpenCode provider discovery", () => {
 
 	test("routes gateway-listed Union Alpha to Messages on Go and Zen (#12359)", async () => {
 		for (const [makeOptions, baseUrl] of [
-			[opencodeGoModelManagerOptions, "https://opencode.ai/zen/go"],
+			[opencodeGoModelManagerOptions, "https://opencode.ai/inference/go"],
 			[opencodeZenModelManagerOptions, "https://opencode.ai/zen"],
 		] as const) {
 			const options = makeOptions({
@@ -715,7 +851,7 @@ describe("OpenCode provider discovery", () => {
 		const [goModels, zenModels] = await Promise.all([go.fetchDynamicModels?.(), zen.fetchDynamicModels?.()]);
 		expect(goModels?.find(model => model.id === "muse-spark-1.4-contributor")).toMatchObject({
 			api: "openai-responses",
-			baseUrl: "https://opencode.ai/zen/go/v1",
+			baseUrl: "https://opencode.ai/inference/go/v1",
 		});
 		expect(zenModels?.find(model => model.id === "muse-spark-1.4-contributor-free")).toMatchObject({
 			api: "openai-responses",
@@ -758,7 +894,7 @@ describe("OpenCode provider discovery", () => {
 		for (const id of ["muse-spark-1.2", "muse-spark-1.2-contributor"]) {
 			expect(byId.get(id)).toMatchObject({
 				api: "openai-responses",
-				baseUrl: "https://opencode.ai/zen/go/v1",
+				baseUrl: "https://opencode.ai/inference/go/v1",
 			});
 		}
 		// Contrast: an unpinned id with a bundled reference keeps its route.
@@ -910,13 +1046,35 @@ describe("OpenCode provider discovery", () => {
 
 			expect(freeOptions.cacheProviderId).not.toBe(paidOptions.cacheProviderId);
 			expect(freeResult.stale).toBe(false);
-			expect(freeResult.models.map(model => model.id).sort()).toEqual([...LIVE_FREE_MODEL_IDS].sort());
+			expect(freeResult.models.map(model => model.id).sort()).toEqual(
+				[...LIVE_FREE_MODEL_IDS, "jev-1.13", "jev-1.13-free"].sort(),
+			);
 			expect(paidResult.stale).toBe(false);
-			expect(paidResult.models.map(model => model.id).sort()).toEqual([...LIVE_PAID_MODEL_IDS].sort());
+			expect(paidResult.models.map(model => model.id).sort()).toEqual(
+				[...LIVE_PAID_MODEL_IDS, "jev-1.13", "jev-1.13-free"].sort(),
+			);
 			expect([freeFetches, paidFetches]).toEqual([1, 1]);
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
 		}
+	});
+
+	test("hydrates the Go bare Flash alias like its V4.1 Flash sibling (#15357)", async () => {
+		// The Go roster lists only ids; the sibling hydrates from its bundled row,
+		// the bare alias from the provider rule.
+		const options = opencodeGoModelManagerOptions({
+			apiKey: "go-account-key",
+			fetch: async () => modelListResponse(["deepseek-flash", "deepseek-v4.1-flash"]),
+		});
+		const models = ((await options.fetchDynamicModels?.()) ?? []).map(spec => buildModel(spec));
+		const alias = models.find(model => model.id === "deepseek-flash");
+		const sibling = models.find(model => model.id === "deepseek-v4.1-flash");
+		if (!alias || !sibling) throw new Error("Go gateway Flash lanes missing");
+		expect(alias.cost).toEqual(sibling.cost);
+		expect(alias.contextWindow).toBe(sibling.contextWindow);
+		expect(alias.maxTokens).toBe(sibling.maxTokens);
+		expect(alias.reasoning).toBe(true);
+		expect(getSupportedEfforts(alias)).toEqual(getSupportedEfforts(sibling));
 	});
 
 	test("serves image input on the OpenCode Go DeepSeek Flash lanes", () => {

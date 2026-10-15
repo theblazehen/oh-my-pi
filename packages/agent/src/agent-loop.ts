@@ -2231,17 +2231,15 @@ async function streamAssistantResponse(
 							}
 						}
 						finalMessage = snapshotAssistantMessage(finalMessage);
-						// Unhealed DSML tool-call markup must never reach history: replaying
-						// it teaches the model to keep writing calls as text (#10556). Strip
-						// it before the context, the UI, and the session see the message.
-						// Only DSML-speaking models qualify; from others it is prose.
-						if (
-							dsmlLeakRecoveryEnabled &&
-							finalMessage.stopReason === "stop" &&
-							!finalMessage.content.some(block => block.type === "toolCall") &&
-							removeDsmlToolMarkupLeak(finalMessage)
-						) {
-							dsmlLeakMessages.add(finalMessage);
+						// Unhealed DSML markup must not reach history, including reasoning
+						// and turns with a valid structured call. Only a failed text-only
+						// call needs the recovery nudge.
+						if (dsmlLeakRecoveryEnabled) {
+							const hasToolCall = finalMessage.content.some(block => block.type === "toolCall");
+							const removed = removeDsmlToolMarkupLeak(finalMessage);
+							if (removed && finalMessage.stopReason === "stop" && !hasToolCall) {
+								dsmlLeakMessages.add(finalMessage);
+							}
 						}
 						// Expand inline macros (and any other registered rewrite) on the
 						// finalized message before it reaches the context, the UI, or tool
@@ -3624,13 +3622,15 @@ async function executeToolCalls(
 								executionArgs,
 								record.signal,
 								partialResult => {
-									stream.push({
+									const event: Extract<AgentEvent, { type: "tool_execution_update" }> = {
 										type: "tool_execution_update",
 										toolCallId: toolCall.id,
 										toolName: toolCall.name,
 										args: executionArgs,
 										partialResult: coerceToolResult(partialResult).result,
-									});
+									};
+									if (stream.done) config.onDetachedToolUpdate?.(event);
+									else stream.push(event);
 								},
 								toolContext,
 							);

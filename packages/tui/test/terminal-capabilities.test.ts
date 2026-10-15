@@ -1,6 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import {
 	detectStyledUnderlineSupport,
@@ -15,56 +13,107 @@ import {
 	shouldEnableHyperlinksByDefault,
 	shouldEnableSynchronizedOutputByDefault,
 	synchronizedOutputUserOverride,
-	isInsideHerdr,
+	classifyTerminalMultiplexer,
+	hasTerminalMultiplexerSession,
 	isInsideTerminalMultiplexer,
 } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { TERMINAL_MULTIPLEXER_ENV_KEYS } from "@oh-my-pi/pi-tui/terminal-multiplexer";
+import { withFakeTmux } from "./helpers/fake-tmux";
 
-describe("isInsideHerdr", () => {
-	it("is true for HERDR_ENV=1", () => {
-		expect(isInsideHerdr({ HERDR_ENV: "1" })).toBe(true);
+describe("hasTerminalMultiplexerSession", () => {
+	it("recognizes Herdr session identity while ignoring client-only settings", () => {
+		expect(hasTerminalMultiplexerSession("herdr", { HERDR_ENV: "1" })).toBe(true);
+		for (const env of [{ HERDR_PANE_ID: "abc" }, { HERDR_TAB_ID: "t1" }, { HERDR_WORKSPACE_ID: "w1" }]) {
+			expect(hasTerminalMultiplexerSession("herdr", env)).toBe(true);
+		}
+		for (const env of [
+			{ HERDR_ENV: "0" },
+			{ HERDR_PANE_ID: "" },
+			{ HERDR_TAB_ID: "" },
+			{ HERDR_WORKSPACE_ID: "" },
+			{ HERDR_SOCKET_PATH: "/tmp/x" },
+			{ HERDR_BIN_PATH: "/usr/bin/herdr" },
+			{ HERDR_SESSION: "s1" },
+			{ HERDR_CONFIG_PATH: "/tmp/herdr.toml" },
+			{ HERDR_CLIENT_SOCKET_PATH: "/tmp/client.sock" },
+		]) {
+			expect(hasTerminalMultiplexerSession("herdr", env)).toBe(false);
+		}
 	});
 
-	it("is true for each pane identity var", () => {
-		expect(isInsideHerdr({ HERDR_PANE_ID: "abc" })).toBe(true);
-		expect(isInsideHerdr({ HERDR_TAB_ID: "t1" })).toBe(true);
-		expect(isInsideHerdr({ HERDR_WORKSPACE_ID: "w1" })).toBe(true);
+	it("matches explicit provider markers and excludes TERM fallbacks", () => {
+		expect(hasTerminalMultiplexerSession("tmux", { TMUX: "/tmp/tmux,1,0" })).toBe(true);
+		expect(hasTerminalMultiplexerSession("screen", { STY: "1234.pts-0.host" })).toBe(true);
+		expect(hasTerminalMultiplexerSession("zellij", { ZELLIJ: "0" })).toBe(true);
+		expect(hasTerminalMultiplexerSession("cmux", { CMUX_WORKSPACE_ID: "workspace" })).toBe(true);
+		expect(hasTerminalMultiplexerSession("cmux", { CMUX_SURFACE_ID: "surface" })).toBe(true);
+		expect(hasTerminalMultiplexerSession("cmux", { CMUX_REMOTE_TRANSPORT: "ssh" })).toBe(true);
+		expect(hasTerminalMultiplexerSession("cmux", { CMUX_SOCKET_PATH: "/tmp/cmux.sock" })).toBe(false);
+		expect(hasTerminalMultiplexerSession("tmux", { TERM: "tmux-256color" })).toBe(false);
+		expect(classifyTerminalMultiplexer({ TERM: "tmux-256color" })).toBe("tmux");
 	});
 
-	it("is false for empty identity vars", () => {
-		expect(isInsideHerdr({ HERDR_PANE_ID: "" })).toBe(false);
-		expect(isInsideHerdr({ HERDR_TAB_ID: "" })).toBe(false);
-		expect(isInsideHerdr({ HERDR_WORKSPACE_ID: "" })).toBe(false);
+	it("recognizes wmux session markers but not CLI overrides", () => {
+		expect(hasTerminalMultiplexerSession("wmux", { WMUX: "1" })).toBe(true);
+		expect(hasTerminalMultiplexerSession("wmux", { WMUX_SURFACE_ID: "3f2a" })).toBe(true);
+		expect(hasTerminalMultiplexerSession("wmux", { WMUX: "0" })).toBe(false);
+		expect(hasTerminalMultiplexerSession("wmux", { WMUX_SURFACE_ID: "" })).toBe(false);
+		expect(hasTerminalMultiplexerSession("wmux", { WMUX_CLI: "C:/wmux/wmux.exe" })).toBe(false);
+		expect(hasTerminalMultiplexerSession("wmux", { WMUX_PIPE: "\\\\.\\pipe\\wmux" })).toBe(false);
 	});
 
-	it("is false for client-only Herdr vars", () => {
-		expect(isInsideHerdr({ HERDR_SOCKET_PATH: "/tmp/x" })).toBe(false);
-		expect(isInsideHerdr({ HERDR_BIN_PATH: "/usr/bin/herdr" })).toBe(false);
-		expect(isInsideHerdr({ HERDR_SESSION: "s1" })).toBe(false);
-		expect(isInsideHerdr({ HERDR_CONFIG_PATH: "/tmp/herdr.toml" })).toBe(false);
-		expect(isInsideHerdr({ HERDR_CLIENT_SOCKET_PATH: "/tmp/client.sock" })).toBe(false);
-	});
-
-	it("is false for HERDR_ENV=0", () => {
-		expect(isInsideHerdr({ HERDR_ENV: "0" })).toBe(false);
+	it("requires both nonempty Orca worktree identity markers", () => {
+		expect(
+			hasTerminalMultiplexerSession("orca", {
+				ORCA_PANE_KEY: "tab-1:12345678-1234-1234-1234-123456789abc",
+				ORCA_WORKTREE_ID: "worktree-1",
+			}),
+		).toBe(true);
+		for (const env of [
+			{ ORCA_PANE_KEY: "tab-1:12345678-1234-1234-1234-123456789abc" },
+			{ ORCA_WORKTREE_ID: "worktree-1" },
+			{ ORCA_PANE_KEY: "", ORCA_WORKTREE_ID: "worktree-1" },
+			{ ORCA_PANE_KEY: "tab-1:12345678-1234-1234-1234-123456789abc", ORCA_WORKTREE_ID: "" },
+			{ ORCA_PANE_KEY: " ", ORCA_WORKTREE_ID: "worktree-1" },
+			{ ORCA_PANE_KEY: "tab-1:12345678-1234-1234-1234-123456789abc", ORCA_WORKTREE_ID: " " },
+			{ TERM_PROGRAM: "orca" },
+		]) {
+			expect(hasTerminalMultiplexerSession("orca", env)).toBe(false);
+		}
 	});
 });
 
-describe("isInsideTerminalMultiplexer", () => {
-	it("is true for HERDR_PANE_ID without HERDR_ENV", () => {
-		expect(isInsideTerminalMultiplexer({ HERDR_PANE_ID: "p1" })).toBe(true);
+describe("terminal multiplexer classification", () => {
+	it("preserves nested-provider precedence and TERM-only classification", () => {
+		expect(classifyTerminalMultiplexer({ HERDR_PANE_ID: "p1", TMUX: "session" })).toBe("herdr");
+		expect(classifyTerminalMultiplexer({ TMUX: "session", STY: "screen" })).toBe("tmux");
+		expect(classifyTerminalMultiplexer({ STY: "screen", ZELLIJ: "session" })).toBe("screen");
+		expect(classifyTerminalMultiplexer({ TERM: "screen-256color" })).toBe("screen");
 	});
 
-	it("is true for a wmux pane (WMUX=1 and native WMUX_SURFACE_ID)", () => {
+	it("classifies Orca after nested multiplexers without moving it off the direct render path", () => {
+		const orcaEnv = {
+			ORCA_PANE_KEY: "tab-1:12345678-1234-1234-1234-123456789abc",
+			ORCA_WORKTREE_ID: "worktree-1",
+		};
+		expect(classifyTerminalMultiplexer(orcaEnv)).toBe("orca");
+		expect(isInsideTerminalMultiplexer(orcaEnv)).toBe(false);
+		expect(classifyTerminalMultiplexer({ ...orcaEnv, TMUX: "session" })).toBe("tmux");
+		expect(isInsideTerminalMultiplexer({ ...orcaEnv, TMUX: "session" })).toBe(true);
+		expect(classifyTerminalMultiplexer({ ...orcaEnv, ZELLIJ: "session" })).toBe("zellij");
+		expect(classifyTerminalMultiplexer({ ...orcaEnv, TERM: "tmux-256color" })).toBe("tmux");
+		expect(classifyTerminalMultiplexer({ ...orcaEnv, TERM: "screen-256color" })).toBe("screen");
+		expect(classifyTerminalMultiplexer({ TERM_PROGRAM: "orca" })).toBe(null);
+		expect(classifyTerminalMultiplexer({ ORCA_PANE_KEY: "tab-1:12345678-1234-1234-1234-123456789abc" })).toBe(null);
+		expect(classifyTerminalMultiplexer({ ORCA_WORKTREE_ID: "worktree-1" })).toBe(null);
+	});
+
+	it("recognizes session markers through the generic render-path gate", () => {
+		expect(isInsideTerminalMultiplexer({ HERDR_PANE_ID: "p1" })).toBe(true);
 		expect(isInsideTerminalMultiplexer({ WMUX: "1" })).toBe(true);
 		expect(isInsideTerminalMultiplexer({ WMUX_SURFACE_ID: "3f2a" })).toBe(true);
-	});
-
-	it("is false for WMUX=0 or an empty surface id", () => {
 		expect(isInsideTerminalMultiplexer({ WMUX: "0" })).toBe(false);
 		expect(isInsideTerminalMultiplexer({ WMUX_SURFACE_ID: "" })).toBe(false);
-	});
-
-	it("is false for client-only wmux CLI vars", () => {
 		expect(isInsideTerminalMultiplexer({ WMUX_CLI: "C:/wmux/wmux.exe" })).toBe(false);
 		expect(isInsideTerminalMultiplexer({ WMUX_PIPE: "\\\\.\\pipe\\wmux" })).toBe(false);
 	});
@@ -111,38 +160,29 @@ describe("detectTerminalId", () => {
 });
 
 describe("tmux client terminal resolution", () => {
-	it.skipIf(process.platform === "win32")("uses the attached client's terminal profile", async () => {
-		const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-tmux-client-"));
-		try {
-			const tmux = path.join(binDir, "tmux");
-			await Bun.write(
-				tmux,
-				`#!/bin/sh
-[ "$1" = "display-message" ] && [ "$2" = "-p" ] && [ "$3" = '#{client_termtype}' ] || exit 64
-printf "%s\\n" "WezTerm 20260905-175422-0f4b5596"
-`,
-			);
-			await fs.chmod(tmux, 0o755);
-			const env = subprocessEnv({
-				PI_TEST_RUNTIME: undefined,
-				BUN_ENV: undefined,
-				NODE_ENV: undefined,
-				TERM: "tmux-256color",
-				TERM_PROGRAM: "tmux",
-				TERM_PROGRAM_VERSION: "3.6b",
-				COLORTERM: "truecolor",
-				TMUX: "/tmp/tmux-1000/default,4242,0",
-				SSH_CONNECTION: "client 1 server 22",
-				PATH: `${binDir}${path.delimiter}${Bun.env.PATH ?? ""}`,
-			});
+	const CLIENT_QUERY = "display-message -p #{client_termtype}\t#{client_termname}";
+
+	async function resolveInsideFakeTmux(clientReport: string): Promise<string> {
+		return withFakeTmux({ [CLIENT_QUERY]: clientReport }, async binDir => {
 			const proc = Bun.spawn({
 				cmd: [
 					process.execPath,
 					"--eval",
 					`import { TERMINAL, TERMINAL_ID } from "@oh-my-pi/pi-tui/terminal-capabilities";
-console.log(JSON.stringify({ id: TERMINAL_ID, notifyProtocol: TERMINAL.notifyProtocol }));`,
+console.log(JSON.stringify({ id: TERMINAL_ID, notifyProtocol: TERMINAL.notifyProtocol, imageProtocol: TERMINAL.imageProtocol }));`,
 				],
-				env,
+				env: subprocessEnv({
+					PI_TEST_RUNTIME: undefined,
+					BUN_ENV: undefined,
+					NODE_ENV: undefined,
+					TERM: "tmux-256color",
+					TERM_PROGRAM: "tmux",
+					TERM_PROGRAM_VERSION: "3.6b",
+					COLORTERM: "truecolor",
+					TMUX: "/tmp/tmux-1000/default,4242,0",
+					SSH_CONNECTION: "client 1 server 22",
+					PATH: `${binDir}${path.delimiter}${Bun.env.PATH ?? ""}`,
+				}),
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -154,11 +194,26 @@ console.log(JSON.stringify({ id: TERMINAL_ID, notifyProtocol: TERMINAL.notifyPro
 
 			expect(stderr).toBe("");
 			expect(exitCode).toBe(0);
-			expect(stdout).toBe('{"id":"wezterm","notifyProtocol":"\\u001b]9;"}\n');
-		} finally {
-			await fs.rm(binDir, { force: true, recursive: true });
-		}
+			return stdout;
+		});
+	}
+
+	it.skipIf(process.platform === "win32")("uses the attached client's terminal profile", async () => {
+		const stdout = await resolveInsideFakeTmux("WezTerm 20260905-175422-0f4b5596\ttmux-256color");
+		expect(JSON.parse(stdout)).toMatchObject({ id: "wezterm", notifyProtocol: "\u001b]9;" });
 	});
+
+	// The pane TERM no longer implies Kitty, so a Kitty client must be named by
+	// tmux. Its terminal-type reply can name something else entirely (a nested
+	// tmux answers `tmux 3.4`, and tmux < 3.4 records nothing); the client's
+	// TERM still identifies the emulator. Report captured from tmux 3.4.
+	it.skipIf(process.platform === "win32")(
+		"falls back to the client's TERM when the terminal type is unknown",
+		async () => {
+			const stdout = await resolveInsideFakeTmux("tmux 3.4\txterm-kitty");
+			expect(JSON.parse(stdout)).toMatchObject({ id: "kitty", imageProtocol: ImageProtocol.Kitty });
+		},
+	);
 });
 
 describe("synchronizedOutputUserOverride", () => {
@@ -240,6 +295,9 @@ describe("shouldEnableSynchronizedOutputByDefault", () => {
 		expect(shouldEnableSynchronizedOutputByDefault({ HERDR_PANE_ID: "p1" }, "kitty")).toBe(true);
 		expect(shouldEnableSynchronizedOutputByDefault({ HERDR_PANE_ID: "p1" }, "ghostty")).toBe(true);
 		expect(shouldEnableSynchronizedOutputByDefault({ HERDR_PANE_ID: "p1", TMUX: "1" }, "kitty")).toBe(true);
+		// Any Herdr session in the path enables sync, whichever layer classifies first.
+		expect(shouldEnableSynchronizedOutputByDefault({ HERDR_PANE_ID: "p1", STY: "x" }, "base")).toBe(true);
+		expect(shouldEnableSynchronizedOutputByDefault({ HERDR_PANE_ID: "p1", ZELLIJ: "0" }, "base")).toBe(true);
 	});
 
 	it("does not treat client-only Herdr vars as inside a pane", () => {
@@ -377,11 +435,7 @@ function subprocessEnv(overrides: Record<string, string | undefined>): Record<st
 		"PASEO_TERMINAL_ID",
 		"KITTY_WINDOW_ID",
 		"GHOSTTY_RESOURCES_DIR",
-		"HERDR_ENV",
-		"HERDR_KITTY_GRAPHICS",
-		"HERDR_PANE_ID",
-		"HERDR_TAB_ID",
-		"HERDR_WORKSPACE_ID",
+		...TERMINAL_MULTIPLEXER_ENV_KEYS,
 		"WEZTERM_PANE",
 		"ITERM_SESSION_ID",
 		"VSCODE_PID",
@@ -455,6 +509,28 @@ console.log(JSON.stringify({ id: TERMINAL_ID, imageProtocol: TERMINAL.imageProto
 	});
 });
 
+describe("tmux image protocol selection", () => {
+	it("probes unknown tmux clients instead of sending Kitty graphics", () => {
+		const env = {
+			TMUX: "/tmp/tmux/default,1,0",
+			TERM_PROGRAM: "tmux",
+			TERM: "tmux-256color",
+			COLORTERM: "truecolor",
+		};
+		const id = detectTerminalId(env);
+		expect(resolveImageProtocol(id, env, true)).toBeNull();
+		expect(resolveImageProtocol("base", { ...env, TERM: "screen-256color" }, true)).toBeNull();
+		expect(resolveImageProtocol("base", { TERM: "tmux-256color" }, true)).toBeNull();
+	});
+
+	it("keeps a known Kitty client inside tmux and the GNU screen fallback", () => {
+		expect(resolveImageProtocol("ghostty", { TMUX: "/tmp/tmux/default,1,0", TERM: "tmux-256color" }, true)).toBe(
+			ImageProtocol.Kitty,
+		);
+		expect(resolveImageProtocol("base", { TERM: "screen-256color" }, true)).toBe(ImageProtocol.Kitty);
+	});
+});
+
 describe("Herdr image protocol mask", () => {
 	it("rejects a leaked Ghostty protocol when Herdr owns the pane grid", () => {
 		const env = {
@@ -468,20 +544,6 @@ describe("Herdr image protocol mask", () => {
 
 		expect(terminalId).toBe("ghostty");
 		expect(resolveImageProtocol(terminalId, env, true)).toBeNull();
-	});
-
-	it("accepts Kitty from a neutral Herdr pane when retained graphics are advertised", () => {
-		const env = {
-			COLORTERM: "truecolor",
-			HERDR_ENV: "1",
-			HERDR_KITTY_GRAPHICS: "1",
-			TERM: "xterm-256color",
-		};
-		const terminalId = detectTerminalId(env);
-
-		expect(terminalId).toBe("trueColor");
-		expect(resolveImageProtocol(terminalId, env, true)).toBe(ImageProtocol.Kitty);
-		expect(resolveImageProtocol(terminalId, env, false)).toBeNull();
 	});
 
 	it("rejects a leaked Ghostty protocol when HERDR_PANE_ID is set without HERDR_ENV", () => {
@@ -505,12 +567,11 @@ describe("Paseo embedder carve-out", () => {
 		expect(isPaseoEmbedder({ PASEO_TERMINAL_ID: "term-1" })).toBe(true);
 	});
 
-	it("drops the multiplexer-restored Kitty fallback inside Paseo", () => {
-		// Regression (getpaseo/paseo#3850): tmux inside a Paseo pane resolves to
-		// base (null static protocol) and TERM=tmux-* would restore Kitty via
-		// the fallback — the embedder carve-out must win over the fallback.
-		expect(resolveImageProtocol("base", { TERM: "tmux-256color", PASEO_TERMINAL_ID: "term-1" }, true)).toBeNull();
-		expect(resolveImageProtocol("base", { TERM: "tmux-256color" }, true)).toBe(ImageProtocol.Kitty);
+	it("drops the GNU screen Kitty fallback inside Paseo", () => {
+		// Paseo's xterm.js pane cannot draw Kitty graphics even when a multiplexer
+		// restores that protocol through its TERM fallback.
+		expect(resolveImageProtocol("base", { TERM: "screen-256color", PASEO_TERMINAL_ID: "term-1" }, true)).toBeNull();
+		expect(resolveImageProtocol("base", { TERM: "screen-256color" }, true)).toBe(ImageProtocol.Kitty);
 	});
 
 	it("drops Kitty graphics when Paseo hosts the terminal", async () => {
@@ -729,6 +790,29 @@ describe("shouldEnableHyperlinksByDefault", () => {
 			false,
 		);
 		expect(shouldEnableHyperlinksByDefault({ HERDR_ENV: "1", PI_NO_HYPERLINKS: "1" }, "base")).toBe(false);
+	});
+
+	it("keeps Herdr's own rendering when the other nested layers have no OSC 8 policy", () => {
+		// Zellij has no hyperlink policy, and a stale screen-family TERM is not a
+		// session, so neither overrides the Herdr pane.
+		expect(shouldEnableHyperlinksByDefault({ HERDR_ENV: "1", ZELLIJ: "0" }, "base")).toBe(true);
+		expect(shouldEnableHyperlinksByDefault({ HERDR_ENV: "1", TERM: "screen-256color" }, "base")).toBe(true);
+	});
+
+	it("gates a Herdr pane nested with tmux on tmux's version, and screen still vetoes it", () => {
+		const tmux34 = { TMUX: "/tmp/tmux-1000/default,1,0", TERM_PROGRAM: "tmux", TERM_PROGRAM_VERSION: "3.4" };
+		expect(shouldEnableHyperlinksByDefault({ HERDR_ENV: "1", ...tmux34 }, "kitty")).toBe(true);
+		expect(
+			shouldEnableHyperlinksByDefault({ HERDR_ENV: "1", ...tmux34, TERM_PROGRAM_VERSION: "3.3a" }, "kitty"),
+		).toBe(false);
+		expect(shouldEnableHyperlinksByDefault({ HERDR_ENV: "1", ...tmux34, STY: "1234.pts-0.host" }, "kitty")).toBe(
+			false,
+		);
+	});
+
+	it("treats a multiplexer TERM as off under a session without an OSC 8 policy", () => {
+		expect(shouldEnableHyperlinksByDefault({ ZELLIJ: "0", TERM: "screen-256color" }, "kitty")).toBe(false);
+		expect(shouldEnableHyperlinksByDefault({ ZELLIJ: "0", TERM: "xterm-256color" }, "kitty")).toBe(true);
 	});
 
 	it("lets PI_NO_HYPERLINKS beat every positive heuristic", () => {

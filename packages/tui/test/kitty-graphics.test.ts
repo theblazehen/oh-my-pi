@@ -123,21 +123,16 @@ describe("detectKittyUnicodePlaceholdersSupport", () => {
 		expect(detectKittyUnicodePlaceholdersSupport("monstar", env({ TMUX: "/tmp/tmux-1000/default,1,0" }))).toBe(true);
 	});
 
-	it("ignores leaked Kitty-capable terminal identities inside Herdr without a capability or explicit override", () => {
+	it("ignores leaked Kitty-capable terminal identities inside Herdr unless placeholders are explicitly forced", () => {
 		const leaked = env({ HERDR_ENV: "1", GHOSTTY_RESOURCES_DIR: "/usr/share/ghostty" });
 		expect(detectKittyUnicodePlaceholdersSupport("ghostty", leaked)).toBe(false);
 		expect(detectKittyUnicodePlaceholdersSupport("ghostty", { ...leaked, PI_KITTY_PLACEHOLDERS: "1" })).toBe(true);
 		const paneOnly = env({ HERDR_PANE_ID: "p1", GHOSTTY_RESOURCES_DIR: "/usr/share/ghostty" });
 		expect(detectKittyUnicodePlaceholdersSupport("ghostty", paneOnly)).toBe(false);
 		expect(detectKittyUnicodePlaceholdersSupport("ghostty", { ...paneOnly, PI_KITTY_PLACEHOLDERS: "1" })).toBe(true);
-	});
-
-	it("uses scroll-aware placeholders only when Herdr advertises Kitty graphics", () => {
-		const capable = env({ HERDR_PANE_ID: "p1", HERDR_KITTY_GRAPHICS: "1" });
-		expect(detectKittyUnicodePlaceholdersSupport("base", capable)).toBe(true);
-		expect(detectKittyUnicodePlaceholdersSupport("ghostty", { ...capable, HERDR_KITTY_GRAPHICS: "0" })).toBe(false);
-		expect(detectKittyUnicodePlaceholdersSupport("base", { ...capable, PI_NO_KITTY_PLACEHOLDERS: "1" })).toBe(false);
-		expect(detectKittyUnicodePlaceholdersSupport("base", { ...capable, PI_KITTY_PLACEHOLDERS: "0" })).toBe(false);
+		// tmux inside the pane does not restore the automatic path that tmux alone allows.
+		const nested = env({ HERDR_PANE_ID: "p1", TMUX: "/tmp/tmux-1000/default,1,0" });
+		expect(detectKittyUnicodePlaceholdersSupport("ghostty", nested)).toBe(false);
 	});
 
 	it("honors PI_NO_KITTY_PLACEHOLDERS=1 as a hard off override on supporting terminals", () => {

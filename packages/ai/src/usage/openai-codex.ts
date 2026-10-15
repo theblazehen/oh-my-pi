@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { planRequirementFor, quotaTierFor } from "@oh-my-pi/pi-catalog/compat/behavior";
 import { toNumber } from "@oh-my-pi/pi-catalog/utils";
 import { USER_AGENT } from "@oh-my-pi/pi-utils";
+import { ProviderHttpError } from "../error";
 import type {
 	CredentialRankingContext,
 	CredentialRankingStrategy,
@@ -542,11 +543,21 @@ export const openaiCodexUsageProvider: UsageProvider = {
 		try {
 			const response = await ctx.fetch(url, { headers, signal: params.signal });
 			if (!response.ok) {
+				// A rejected token must purge the cached report and fail the health
+				// check: only a thrown auth status does that, while `null` is the
+				// transient-failure path that keeps serving last-good quota.
+				if (response.status === 401 || response.status === 403) {
+					throw new ProviderHttpError(
+						`Codex usage endpoint returned ${response.status} ${response.statusText}`.trim(),
+						response.status,
+					);
+				}
 				ctx.logger?.warn("Codex usage request failed", { status: response.status, provider: params.provider });
 				return null;
 			}
 			payload = await response.json();
 		} catch (error) {
+			if (error instanceof ProviderHttpError) throw error;
 			ctx.logger?.warn("Codex usage request error", { provider: params.provider, error: String(error) });
 			return null;
 		}

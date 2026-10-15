@@ -10,10 +10,13 @@ import {
 } from "@oh-my-pi/pi-utils/marked";
 import {
 	type MathBlockOpener,
+	type MathOpener,
 	mathBlockCloserIndex,
 	mathBlockInContext,
 	mathBlockMayCloseAt,
 	mathBlockOpenerAt,
+	mathOpenerAt,
+	mathSpanAt,
 	mathSpanInContext,
 	mathStartIndex,
 } from "@oh-my-pi/pi-utils/math-delimiters";
@@ -50,6 +53,361 @@ const OSC8_ST_PREFIX_REGEX = /(\x1b\]8;[^\x07\x1b]*)\x1b\\/g;
 
 function normalizeOsc8Terminators(text: string): string {
 	return text.replace(OSC8_ST_PREFIX_REGEX, "$1\x07");
+}
+
+/**
+ * `text` as the streaming renderer lexes it: OSC 8 terminators unified and
+ * tabs expanded. {@link Markdown.getLastRenderStableText} is a prefix of this
+ * form, not of the raw source, so append-only publishers that mix settled
+ * prefixes with whole blocks must compare both in this form. Rendering it is
+ * byte-identical to rendering `text`.
+ */
+export function streamingMarkdownSource(text: string): string {
+	if (!text.includes("\t") && !text.includes("\x1b")) return text;
+	return replaceTabs(normalizeOsc8Terminators(text));
+}
+
+// A leading-pipe table line: optional indent / blockquote markers, then `|`.
+const TABLE_LINE_AT = /[ \t>]*\|/y;
+// A line holding an unescaped `|`: a GFM table line needs no outer pipes.
+const PIPE_IN_LINE_AT = /[^\n]*?(?<!\\)\|/y;
+// A whole GFM delimiter row (`| --- | :-: |`, `--- | ---`). Without a leading pipe it needs an inner one; a lone
+// `---` is a rule or setext underline.
+const DELIMITER_ROW_AT =
+	/[ \t>]*(?:\|[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?|[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?)[ \t]*\r?(?=\n|$)/y;
+const UNESCAPED_PIPE = /(?<!\\)\|/g;
+const UNESCAPED_PIPE_END = /(?<!\\)\|$/;
+// A fence line (opener or closer) after any blockquote markers: indentation, marker, info string.
+const FENCE_LINE = /^(?:[ \t]*>)*([ \t]*)(`{3,}|~{3,})([^\n]*)$/gm;
+// A list item's marker line after any blockquote markers: indentation, marker, spacing.
+const LIST_ITEM_LINE = /^(?:[ \t]*>)*([ \t]*)([-*+]|\d{1,9}[.)])([ \t]+)\S/;
+
+function matchesAt(pattern: RegExp, text: string, lineStart: number): boolean {
+	pattern.lastIndex = lineStart;
+	return pattern.test(text);
+}
+
+/** Column width of leading whitespace, tabs to the next multiple of four. */
+function indentWidth(whitespace: string): number {
+	let width = 0;
+	for (const ch of whitespace) width = ch === "\t" ? width + 4 - (width % 4) : width + 1;
+	return width;
+}
+
+/**
+ * Whether the fence line at `lineStart`, indented `indent` columns, is a real
+ * fence: at most three columns in, or inside a list item whose content column
+ * it sits within three columns of. Deeper lines elsewhere are indented code.
+ */
+function fenceIndentValid(text: string, lineStart: number, indent: number): boolean {
+	if (indent <= 3) return true;
+	for (let end = lineStart - 1; end > 0;) {
+		const start = text.lastIndexOf("\n", end - 1) + 1;
+		const line = text.slice(start, end);
+		end = start - 1;
+		if (!line.trim()) continue;
+		const lineIndent = indentWidth(/^(?:[ \t]*>)*([ \t]*)/.exec(line)![1]);
+		if (lineIndent >= indent) continue;
+		const item = LIST_ITEM_LINE.exec(line);
+		if (item) {
+			const content = indentWidth(item[1]) + item[2].length + indentWidth(item[3]);
+			return indent >= content && indent <= content + 3;
+		}
+		// A less indented line that is no list item: only a list item's continuation text keeps looking.
+		if (lineIndent === 0) return false;
+	}
+	return false;
+}
+
+/** Whether a code fence is still open at `end` of `text`. */
+function fenceOpenAt(text: string, end: number): boolean {
+	let open: string | undefined;
+	FENCE_LINE.lastIndex = 0;
+	for (let match = FENCE_LINE.exec(text); match !== null && match.index < end; match = FENCE_LINE.exec(text)) {
+		const [, indent, marker, rest] = match;
+		if (!fenceIndentValid(text, match.index, indentWidth(indent))) continue;
+		if (open === undefined) {
+			// A backtick fence's info string cannot hold a backtick (that line is inline code).
+			if (marker[0] !== "`" || !rest.includes("`")) open = marker;
+		} else if (marker[0] === open[0] && marker.length >= open.length && !rest.trim()) {
+			open = undefined;
+		}
+	}
+	return open !== undefined;
+}
+
+/**
+ * Streaming `md` source for a native terminal, minus a still-growing table row:
+ * the unterminated last line when a GFM table (a run of pipe lines holding a
+ * header and its delimiter row, outer pipes optional) sits right above it,
+ * outside any open code fence. GFM continues a table on any non-blank line, so
+ * that line is a row whatever it holds so far. The terminal sizes columns by
+ * every row it gets, so a half-streamed row (an unclosed link shows its whole
+ * URL) would rewrap the table each frame, and TSP cannot ask it to skip one.
+ * The result keeps the newline before the held line, so it is a prefix of
+ * `text` and of the result for every append to it: streaming stays
+ * append-only. Pass untrimmed source: trimming first drops the newline that
+ * marks the last row finished, so that row would be held too.
+ */
+export function holdPartialTableRow(text: string): string {
+	const lastBreak = text.lastIndexOf("\n");
+	if (lastBreak <= 0 || lastBreak === text.length - 1) return text;
+	// Walk up the run of pipe lines above the growing row to a delimiter row with a header above it.
+	let lineStart = text.lastIndexOf("\n", lastBreak - 1) + 1;
+	let table = false;
+	while (matchesAt(PIPE_IN_LINE_AT, text, lineStart)) {
+		const above = lineStart > 0 ? text.lastIndexOf("\n", lineStart - 2) + 1 : -1;
+		if (matchesAt(DELIMITER_ROW_AT, text, lineStart)) {
+			table = above >= 0 && matchesAt(PIPE_IN_LINE_AT, text, above);
+			lineStart = above;
+			break;
+		}
+		if (above < 0) break;
+		lineStart = above;
+	}
+	if (!table || fenceOpenAt(text, lineStart)) return text;
+	return text.slice(0, lastBreak + 1);
+}
+
+/**
+ * Index of the cell a streaming table's last row is still writing: the cell
+ * after its last `|`, or -1 when a newline or trailing `|` closed the row.
+ * `raw` is the table token's source; GFM splits cells on every unescaped pipe.
+ */
+function growingTableCell(raw: string): number {
+	if (raw.endsWith("\n")) return -1;
+	const line = raw.slice(raw.lastIndexOf("\n") + 1).trimEnd();
+	if (UNESCAPED_PIPE_END.test(line)) return -1;
+	const pipes = line.match(UNESCAPED_PIPE)?.length ?? 0;
+	return matchesAt(TABLE_LINE_AT, line, 0) ? pipes - 1 : pipes;
+}
+
+const MATH_CLOSERS: Record<MathOpener, string> = { $: "$", $$: "$$", "\\(": "\\)", "\\[": "\\]" };
+// The end of a math body that is not yet valid LaTeX: a half-typed command, a lone `\`, or a dangling `^`/`_`.
+const PARTIAL_LATEX_TAIL = /(?:\\[A-Za-z]*|[\^_])$/;
+// A body opened by anything but `$$` needs one of these: `$5` is a price and `\[docs]` an escaped bracket until
+// LaTeX shows up, so they stay literal until they close.
+const LATEX_HINT = /[\\^_{}]/;
+// Math openers tried from the end of the run; the one being written is almost always the last.
+const MATH_OPENER_TRIES = 3;
+
+/** Whether the character at `at` follows an odd run of backslashes. */
+function escapedAt(text: string, at: number): boolean {
+	let slashes = 0;
+	while (at - slashes - 1 >= 0 && text[at - slashes - 1] === "\\") slashes++;
+	return slashes % 2 === 1;
+}
+
+/**
+ * Where `text` is inline prose rather than code: the closed code spans, and
+ * the start of a backtick run no later run closes. While streaming, that run
+ * is a code span still being written, so nothing after it is prose.
+ */
+class InlineCode {
+	readonly #spans: number[] = [];
+	readonly #openFrom: number;
+
+	constructor(text: string) {
+		let at = text.indexOf("`");
+		let openFrom = text.length;
+		while (at >= 0) {
+			let runEnd = at;
+			while (text[runEnd] === "`") runEnd++;
+			if (escapedAt(text, at) && runEnd - at === 1) {
+				at = text.indexOf("`", runEnd);
+				continue;
+			}
+			const length = runEnd - at;
+			let close = text.indexOf("`", runEnd);
+			let closeEnd = close;
+			while (close >= 0) {
+				closeEnd = close;
+				while (text[closeEnd] === "`") closeEnd++;
+				if (closeEnd - close === length) break;
+				close = text.indexOf("`", closeEnd);
+			}
+			if (close < 0) {
+				openFrom = at;
+				break;
+			}
+			this.#spans.push(at, closeEnd);
+			at = text.indexOf("`", closeEnd);
+		}
+		this.#openFrom = openFrom;
+	}
+
+	/** Whether `at` is prose: outside every code span, and before any span still open. */
+	prose(at: number): boolean {
+		if (at >= this.#openFrom) return false;
+		for (let i = 0; i < this.#spans.length; i += 2) {
+			if (at >= this.#spans[i]! && at < this.#spans[i + 1]!) return false;
+		}
+		return true;
+	}
+}
+
+/** `text` with its trailing open link closed, or `undefined` when its end is not inside a link destination. */
+function closeOpenLink(text: string, code: () => InlineCode): string | undefined {
+	const destination = text.lastIndexOf("](");
+	if (destination < 0 || escapedAt(text, destination)) return undefined;
+	// A destination may hold balanced parentheses; `<…>` destinations and titles are not guessed.
+	if (text[destination + 2] === "<") return undefined;
+	let depth = 1;
+	for (let i = destination + 2; i < text.length; i++) {
+		const ch = text[i];
+		if (ch === "\\") i++;
+		else if (ch === "(") depth++;
+		else if (ch === ")" && --depth === 0) return undefined;
+		else if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") return undefined;
+	}
+	let nested = 0;
+	let label = -1;
+	for (let i = destination - 1; i >= 0; i--) {
+		const ch = text[i];
+		if ((ch !== "[" && ch !== "]") || escapedAt(text, i)) continue;
+		if (ch === "]") nested++;
+		else if (nested > 0) nested--;
+		else {
+			label = i;
+			break;
+		}
+	}
+	// An image keeps its literal form: its alt text and source are not a link.
+	if (label < 0 || (text[label - 1] === "!" && !escapedAt(text, label - 1))) return undefined;
+	const spans = code();
+	if (!spans.prose(label) || !spans.prose(destination)) return undefined;
+	return text + ")".repeat(depth);
+}
+
+/** `text` with its trailing open math span closed in its last valid form, or `undefined`. */
+function closeOpenMath(text: string, code: () => InlineCode): string | undefined {
+	let from = text.length;
+	for (let tries = 0; tries < MATH_OPENER_TRIES && from > 0;) {
+		const at = Math.max(
+			text.lastIndexOf("$", from - 1),
+			text.lastIndexOf("\\(", from - 1),
+			text.lastIndexOf("\\[", from - 1),
+		);
+		if (at < 0) return undefined;
+		from = at;
+		const opener = mathOpenerAt(text, at);
+		// The second `$` of a `$$` opener is not an opener of its own.
+		if (opener === undefined || (opener === "$" && text[at - 1] === "$")) continue;
+		tries++;
+		if (!code().prose(at)) continue;
+		const bodyStart = at + opener.length;
+		let written = text.slice(bodyStart);
+		// A `$$` span whose closer is half written ends in that closer's first `$`.
+		if (opener === "$$" && written.endsWith("$") && !escapedAt(text, text.length - 1)) written = written.slice(0, -1);
+		const body = written.replace(PARTIAL_LATEX_TAIL, "");
+		if (!body.trim() || (opener !== "$$" && !LATEX_HINT.test(written))) continue;
+		let depth = 0;
+		for (let i = 0; i < body.length; i++) {
+			if (body[i] === "\\") i++;
+			else if (body[i] === "{") depth++;
+			else if (body[i] === "}" && depth > 0) depth--;
+		}
+		const closed = `${text.slice(0, bodyStart)}${body}${"}".repeat(depth)}${MATH_CLOSERS[opener]}`;
+		// The grammar decides: escaped, currency-like, or space-padded openers stay literal.
+		if (mathSpanAt(closed, at)?.end === closed.length) return closed;
+	}
+	return undefined;
+}
+
+/**
+ * `text`, one inline run whose end is still streaming, with a trailing open
+ * link or math span closed the way the finished text most likely closes it,
+ * or `undefined` when nothing at its end is open. A link gains its missing
+ * `)` (one per open parenthesis in its destination), so it renders as the
+ * link it becomes instead of literal brackets and URL. A math body is cut back
+ * to its last valid form (a half-typed command, dangling `^`/`_`, or the first
+ * `$` of a `$$` closer dropped, open braces closed) and closed, so the
+ * rendered math grows in place instead of raw LaTeX turning into symbols at
+ * the closer. A `$` body needs a LaTeX character, so a price (`$5 per`) is
+ * never speculated. Only prose is: escaped openers and anything inside a code
+ * span, closed or still being written, stay literal.
+ */
+export function speculativeInlineClose(text: string): string | undefined {
+	let spans: InlineCode | undefined;
+	const code = () => (spans ??= new InlineCode(text));
+	return closeOpenLink(text, code) ?? closeOpenMath(text, code);
+}
+
+/**
+ * Streaming `md` source for a native terminal with the open link or math span
+ * at its end speculatively closed ({@link speculativeInlineClose}), as the TUI
+ * renders it. Only the last block is read (a span cannot cross a blank line),
+ * and source inside an open code fence is left as it is. Each frame rewrites
+ * only the guessed closers at the end, which the reconciler sends as a small
+ * `splice`.
+ */
+export function speculativeStreamingSource(text: string): string {
+	const blockBreak = text.lastIndexOf("\n\n");
+	const blockStart = blockBreak < 0 ? 0 : blockBreak + 2;
+	const closed = speculativeInlineClose(text.slice(blockStart));
+	if (closed === undefined || fenceOpenAt(text, text.length)) return text;
+	return text.slice(0, blockStart) + closed;
+}
+
+/** `raw` with its last `from` replaced by `to`, or `undefined` when `from` is not in it. */
+function replaceLast(raw: string, from: string, to: string): string | undefined {
+	const at = raw.lastIndexOf(from);
+	return at < 0 ? undefined : raw.slice(0, at) + to + raw.slice(at + from.length);
+}
+
+/**
+ * A copy of `token`, the last block of a streaming render, whose still-written
+ * inline run is speculatively closed ({@link speculativeInlineClose}), or
+ * `undefined` when nothing in it is open. Follows the run into the last list
+ * item, blockquote child, or the open cell of a table's last row. `raw` is
+ * rewritten to match, so row caches keyed on it never mistake the copy for
+ * the source as it stands.
+ */
+function speculateStreamingToken(token: Token): Token | undefined {
+	switch (token.type) {
+		case "paragraph":
+		case "heading":
+		case "text": {
+			const closed = speculativeInlineClose(token.text);
+			const raw = closed === undefined ? undefined : replaceLast(token.raw, token.text, closed);
+			if (closed === undefined || raw === undefined) return undefined;
+			return { ...token, raw, text: closed, tokens: lexInlineTokens(closed) };
+		}
+		case "blockquote": {
+			const children: Token[] = token.tokens ?? [];
+			const inner = children.at(-1);
+			const patched = inner && speculateStreamingToken(inner);
+			const raw = inner && patched && replaceLast(token.raw, inner.raw, patched.raw);
+			if (!patched || raw === undefined) return undefined;
+			return { ...token, raw, tokens: [...children.slice(0, -1), patched] };
+		}
+		case "list": {
+			const items: Tokens.ListItem[] = token.items;
+			const item = items.at(-1);
+			const inner = item?.tokens.at(-1);
+			if (!item || !inner) return undefined;
+			const patched = speculateStreamingToken(inner);
+			const itemRaw = patched && replaceLast(item.raw, inner.raw, patched.raw);
+			const raw = itemRaw === undefined ? undefined : replaceLast(token.raw, item.raw, itemRaw);
+			if (!patched || itemRaw === undefined || raw === undefined) return undefined;
+			const grown = { ...item, raw: itemRaw, tokens: [...item.tokens.slice(0, -1), patched] };
+			return { ...token, raw, items: [...items.slice(0, -1), grown] };
+		}
+		case "table": {
+			const rows: Tokens.TableCell[][] = token.rows;
+			const open = growingTableCell(token.raw);
+			const row = rows.at(-1);
+			const cell = open >= 0 ? row?.[open] : undefined;
+			if (!row || !cell) return undefined;
+			const closed = speculativeInlineClose(cell.text);
+			const raw = closed === undefined ? undefined : replaceLast(token.raw, cell.text, closed);
+			if (closed === undefined || raw === undefined) return undefined;
+			const cells = row.map((c, i) => (i === open ? { ...c, text: closed, tokens: lexInlineTokens(closed) } : c));
+			return { ...token, raw, rows: [...rows.slice(0, -1), cells] };
+		}
+		default:
+			return undefined;
+	}
 }
 
 /** The longest suffix of `text` a future append could still complete into a
@@ -1313,6 +1671,13 @@ function objectId(o: object): number {
 export interface DefaultTextStyle {
 	/** Foreground color function */
 	color?: (text: string) => string;
+	/**
+	 * The `color` foreground is prose-level: semantically-themed markdown spans
+	 * (headings, links) keep their own `md*` theme colors instead of being
+	 * painted over by it, while plain text runs still use `color`. Unset keeps
+	 * the historical behavior where `color` paints every run.
+	 */
+	proseFg?: boolean;
 	/** Background color function */
 	bgColor?: (text: string) => string;
 	/** Bold text */
@@ -1389,6 +1754,8 @@ export interface MarkdownTheme {
 interface InlineStyleContext {
 	applyText: (text: string) => string;
 	stylePrefix: string;
+	/** True when the context came from the component's own default style (vs. a caller-supplied one). */
+	isDefault?: boolean;
 }
 
 type ListToken = Token & {
@@ -2035,8 +2402,10 @@ export class Markdown implements Component {
 		const cached = this.#native;
 		if (cached?.text === this.#text && cached.stream === stream) return cached.node;
 		// Sources are model text; OSC 8 / SGR bytes a caller spliced in are the terminal's to style, not ours.
-		const source = this.#text.includes("\x1b") ? plainText(this.#text) : this.#text;
-		const described = md(source, stream ? { stream: true } : undefined);
+		const plain = this.#text.includes("\x1b") ? plainText(this.#text) : this.#text;
+		const described = stream
+			? md(speculativeStreamingSource(holdPartialTableRow(plain)), { stream: true })
+			: md(plain);
 		this.#native = { text: this.#text, stream, node: described };
 		return described;
 	}
@@ -2511,7 +2880,9 @@ export class Markdown implements Component {
 					// into a table on a marker-free delta (`| --` + `--- | -`).
 					!FAST_TABLE_DELIM_ROW_RE.test(grownLastLine) &&
 					(!markerDelta || (!this.#lastTailCapture?.open && !pairSeamHazard && !inlineHasOpen(deltaTokens!))) &&
-					!FAST_URL_ANYWHERE_RE.test(seamWindow)
+					!FAST_URL_ANYWHERE_RE.test(seamWindow) &&
+					// A link or math span the grown row leaves open renders speculatively closed: re-lex.
+					speculativeInlineClose(grownLastLine) === undefined
 				) {
 					// Same text paths a full re-lex applies: real pipeline for marker
 					// deltas, plain swatch/entity render for inert deltas.
@@ -2615,8 +2986,12 @@ export class Markdown implements Component {
 			}
 		}
 
-		// Parse markdown to HTML-like tokens
-		const tokens = this.#lexTokens(normalizedText);
+		// Parse markdown to HTML-like tokens. While streaming, the block still
+		// being written renders its open link or math span as already closed.
+		const lexed = this.#lexTokens(normalizedText);
+		const tail = lexed.at(-1);
+		const speculated = this.transientRenderCache && tail ? speculateStreamingToken(tail) : undefined;
+		const tokens = speculated ? [...lexed.slice(0, -1), speculated] : lexed;
 		let contentLines: string[];
 		this.#activeRenderSignature = signature;
 		try {
@@ -2643,6 +3018,8 @@ export class Markdown implements Component {
 
 		const fastEligible =
 			this.transientRenderCache &&
+			// A speculated frame's rows come from source the stream does not hold yet.
+			speculated === undefined &&
 			contentLines.length > 0 &&
 			// B+ invariant: only the FINAL #renderContentLines call captures;
 			// the all-cache-hit prefix path clears #lastTailCapture at its top.
@@ -3290,6 +3667,37 @@ export class Markdown implements Component {
 		return {
 			applyText: (text: string) => this.#applyDefaultStyle(text),
 			stylePrefix: this.#getDefaultStylePrefix(),
+			isDefault: true,
+		};
+	}
+
+	/**
+	 * Style context for semantically-themed spans (headings, links) under a
+	 * `proseFg` default style: plain runs keep the prose foreground, but the
+	 * span's own `md*` theme color must stay the innermost (winning) SGR, so
+	 * `applyText` keeps decorations (bold/italic/…) while dropping the
+	 * prose color. Non-`proseFg` styles and caller-supplied contexts pass
+	 * through unchanged.
+	 */
+	#proseFgExemptContext(styleContext: InlineStyleContext | undefined): InlineStyleContext | undefined {
+		// A caller-supplied context (blockquote identity styling) already governs
+		// this subtree and wins; exemption applies only to the component's own
+		// default style (undefined resolves to it downstream), and stays applied
+		// through nested recursion.
+		if (styleContext && !styleContext.isDefault) return styleContext;
+		if (!this.#defaultTextStyle?.color || !this.#defaultTextStyle?.proseFg) return styleContext;
+		const applyExceptColor = (text: string): string => {
+			let styled = text;
+			if (this.#defaultTextStyle?.bold) styled = this.#theme.bold(styled);
+			if (this.#defaultTextStyle?.italic) styled = this.#theme.italic(styled);
+			if (this.#defaultTextStyle?.strikethrough) styled = this.#theme.strikethrough(styled);
+			if (this.#defaultTextStyle?.underline) styled = this.#theme.underline(styled);
+			return styled;
+		};
+		return {
+			applyText: applyExceptColor,
+			stylePrefix: this.#getStylePrefix(applyExceptColor),
+			isDefault: true,
 		};
 	}
 
@@ -3321,7 +3729,7 @@ export class Markdown implements Component {
 			case "heading": {
 				const headingLevel = token.depth;
 				const headingPrefix = `${"#".repeat(headingLevel)} `;
-				const headingText = this.#renderInlineTokens(token.tokens || [], styleContext);
+				const headingText = this.#renderInlineTokens(token.tokens || [], this.#proseFgExemptContext(styleContext));
 				const headingPlainText = plainInlineTokens(token.tokens || []);
 				let styledHeading: string;
 				if (headingLevel === 1 && TERMINAL.textSizing) {
@@ -3639,7 +4047,10 @@ export class Markdown implements Component {
 
 				case "link": {
 					markHtmlItemWhenContent(token.text);
-					const linkText = this.#renderInlineTokens(token.tokens || [], resolvedStyleContext);
+					const linkText = this.#renderInlineTokens(
+						token.tokens || [],
+						this.#proseFgExemptContext(resolvedStyleContext),
+					);
 					const styledLinkText = this.#theme.link(this.#theme.underline(linkText));
 					const href = typeof token.href === "string" ? token.href : "";
 					const target = (href && this.#theme.resolveLink?.(href)) || href;
@@ -3999,8 +4410,21 @@ export class Markdown implements Component {
 			naturalWidths[i] = Math.max(...headerLineWidths, 0);
 			minWordWidths[i] = Math.max(1, this.#getLongestWordWidth(headerText, maxUnbrokenWordWidth));
 		}
-		for (const row of token.rows) {
+		// While streaming, the last row's open cell is still growing (an unclosed
+		// link even shows its whole URL): sizing columns by it would rewrap every
+		// row above it on each frame. Lay that cell out in the measured widths
+		// instead; it counts once a `|` or newline closes it. The row's closed
+		// cells are final and count already. The first data row has no finished
+		// rows to borrow from, so it counts whole.
+		const openCell =
+			this.#transientRenderCache && !this.#renderingStablePrefix && token.rows.length > 1
+				? growingTableCell(token.raw)
+				: -1;
+		const lastRow = token.rows.length - 1;
+		for (let rowIndex = 0; rowIndex <= lastRow; rowIndex++) {
+			const row = token.rows[rowIndex];
 			for (let i = 0; i < row.length; i++) {
+				if (rowIndex === lastRow && i === openCell) continue;
 				const cellText = this.#renderInlineTokens(row[i].tokens || [], styleContext);
 				const cellLineWidths = this.#terminalLineWidths(cellText);
 				naturalWidths[i] = Math.max(naturalWidths[i] || 0, ...cellLineWidths);

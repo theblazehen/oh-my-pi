@@ -102,6 +102,8 @@ Tools can add approval-prompt body lines with `formatApprovalDetails(args)`. The
 - `Reason: <reason>` when the tool decision supplies one
 - tool-specific details such as command, path, code, browser action, or subagent assignment
 
+In the interactive UI the prompt docks above the composer until answered: `Ctrl+Enter` (or `Ctrl+Q`; rebind `app.approval.approve`) approves, `Esc` denies, and `Enter` on an empty composer does nothing, so typing into the composer as the prompt appears cannot approve a call. The approve key is ignored for the first half second, since it is also the follow-up key. The composer keeps taking typing: sending a message while calls wait (from the composer, Tern, or a collab guest) denies every pending approval, and any the same tool batch asks for before the message is delivered, then steers the turn with that message, so the agent learns why instead of guessing at a bare denial; `Ctrl+C` clears a typed message rather than denying. To leave the composer its room, the prompt summarizes the tool's details to one row (each detail's first line, `…` when more is left out), always built from the input that will run; `Ctrl+O` (`app.tools.expand`, or Details in Tern) shows every detail in full, and with an empty composer the arrow keys scroll them. RPC, ACP, and other hosts without an approval dialog get an Approve/Deny select with the full details.
+
 ## Defining approval on tools
 
 Built-in and custom tools share the same shape:
@@ -163,9 +165,11 @@ omp acp --config ./acp-yolo.yml   # file contains tools.approvalMode: yolo
 
 Precedence is the normal settings precedence: runtime flags (`--approval-mode`, `--auto-approve`, `--yolo`) override `--config` overlays, which override project config, which overrides global config. ACP does not currently define a `session/new`, `session/load`, or `session/resume` approval-policy field, so ACP clients that need per-session yolo should launch a separate `omp acp` process with one of the flags above or with a session-specific `--config` overlay.
 
-`tools.approvalMode: yolo` fully applies to ACP when it is explicitly configured or supplied by a runtime flag. It skips ordinary tier-based OMP prompts and also skips the ACP client permission gate for `bash` and destructive `edit`/`delete`/`move` actions unless a per-tool policy requires that gate. Explicit tool policies and provider safety checks still apply. The schema default is `yolo`, but default-config ACP sessions still keep the client permission gate; set `tools.approvalMode: yolo` explicitly when the client wants unattended execution.
+`tools.approvalMode: yolo` fully applies to ACP when explicitly configured or supplied by a runtime flag: it skips ordinary tier-based OMP prompts and the ACP client gate unless the resolved tool or user policy requires a prompt or denies the call. The schema default is also `yolo`, but without an explicit opt-in, unmatched bash commands and destructive file operations still require an ACP client grant.
 
-When ACP approval is required, OMP routes it through the ACP client instead of the terminal TUI. Client-gated `bash`, `delete`, `move`, and `edit` patches containing deletion or rename operations use ACP `session/request_permission`; ordinary file-content edits do not use this extra destructive-action gate. Generic approval prompts use form elicitation when the client advertises `elicitation.form`. A rejected, cancelled, or unsupported prompt rejects/cancels the tool call; OMP does not silently allow it.
+For `bash`, ACP resolves `bash.patterns`, critical-command overrides, per-tool policies, and the approval mode before requesting permission: `allow` runs without a card, `deny` blocks without a card, and `prompt` uses `session/request_permission`. An “Always allow” choice covers later ordinary `bash` calls in the session; critical commands and explicit prompt patterns still require a card on every call.
+
+For `delete`, `move`, and `edit` patches containing deletion or rename operations, the additional editor-side gate remains operation-category scoped. Ordinary file-content edits do not use that extra gate. Generic approval prompts use form elicitation when the client advertises `elicitation.form`. A rejected, cancelled, or unsupported prompt rejects or cancels the tool call.
 
 ## Subagents
 

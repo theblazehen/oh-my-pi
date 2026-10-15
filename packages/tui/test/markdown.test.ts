@@ -3,7 +3,9 @@ import { stripVTControlCharacters } from "node:util";
 import {
 	clearRenderCache,
 	extractMarkdownLinks,
+	holdPartialTableRow,
 	Markdown,
+	speculativeStreamingSource,
 	renderInlineMarkdown,
 } from "@oh-my-pi/pi-tui/components/markdown";
 import { setTerminalTextSizing, TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
@@ -376,6 +378,140 @@ Average Latency: 1,240 ms
 			const dividerLines = plainLines.filter(line => line.includes("+"));
 
 			expect(dividerLines.length >= 2, "Expected header + row divider").toBeTruthy();
+		});
+
+		it("shows a streaming table's growing row without re-laying out the rows above it", () => {
+			const table = "| PR | Title |\n| --- | --- |\n| [#1](https://example.com/pull/1) | short title |\n";
+			const plain = (md: Markdown) => md.render(60).map(line => stripVTControlCharacters(line).trimEnd());
+			const markdown = new Markdown(table, 0, 0, defaultMarkdownTheme);
+			markdown.transientRenderCache = true;
+			const settled = plain(markdown);
+			// Until its `)` arrives the link renders speculatively closed, with the URL so far.
+			for (const [partial, shown] of [
+				["| [#2](https://example.com/pull/2", "#2 (https://example.com/pull/2)"],
+				["| [#2](https://example.com/pull/2) | a much longer title than the others", "a much"],
+			]) {
+				clearRenderCache();
+				markdown.setText(table + partial);
+				const rendered = plain(markdown);
+				expect(rendered.slice(0, settled.length - 1)).toEqual(settled.slice(0, -1));
+				expect(rendered.slice(settled.length - 1).some(line => line.includes(shown))).toBe(true);
+			}
+		});
+
+		it("measures a streaming table's finished last row even without its trailing newline", () => {
+			// Assistant text reaches Markdown trimmed, so a finished row is told apart by its closing `|`.
+			const text =
+				"| PR | Title |\n| --- | --- |\n| #1 | short |\n| #2 | a considerably longer finished title here |";
+			const streaming = new Markdown(text, 0, 0, defaultMarkdownTheme);
+			streaming.transientRenderCache = true;
+			clearRenderCache();
+			const rendered = streaming.render(80);
+			clearRenderCache();
+			expect(rendered).toEqual(new Markdown(text, 0, 0, defaultMarkdownTheme).render(80));
+		});
+
+		describe("holdPartialTableRow", () => {
+			const table = "Intro.\n\n| PR | Title |\n| --- | :-: |\n| #1 | one |";
+
+			it("drops only the growing row of a table, keeping the newline before it", () => {
+				expect(holdPartialTableRow(`${table}\n| [#2](https://exa`)).toBe(`${table}\n`);
+				expect(holdPartialTableRow(`${table}\n`)).toBe(`${table}\n`);
+			});
+
+			it("holds the growing row of a table without outer pipes", () => {
+				const bare = "PR | Title\n--- | ---\n#1 | one";
+				expect(holdPartialTableRow(`${bare}\n#2 | tw`)).toBe(`${bare}\n`);
+			});
+
+			it("only grows while a blockquote table streams, whatever the chunk boundaries", () => {
+				// GFM keeps any non-blank line in the table, so the quote's prose follows a blank quoted line.
+				const stream = "> | h |\n> | - |\n> | a |\n> | b |\n>\n> after";
+				let sent = "";
+				for (let length = 1; length <= stream.length; length++) {
+					const next = holdPartialTableRow(stream.slice(0, length));
+					expect(next.startsWith(sent)).toBe(true);
+					sent = next;
+				}
+				expect(sent).toBe(stream);
+			});
+
+			it("keeps pipe lines that are not a table: no delimiter row yet, or inside an open code fence", () => {
+				for (const text of [
+					"| a |\n| b",
+					"| a |\n| --- | -",
+					`\`\`\`md\n${table}\n| #2`,
+					`~~~~\n\`\`\`\n~~~\n${table}\n| #2`,
+				]) {
+					expect(holdPartialTableRow(text)).toBe(text);
+				}
+			});
+
+			it("holds a table row again once the fence before it closes", () => {
+				expect(holdPartialTableRow(`\`\`\`ts\nx\n\`\`\`\n\n${table}\n| #2`)).toBe(
+					`\`\`\`ts\nx\n\`\`\`\n\n${table}\n`,
+				);
+				// Four columns in, outside a list item, is indented code, not a fence.
+				expect(holdPartialTableRow(`    \`\`\`\n    code\n\n${table}\n| #2`)).toBe(
+					`    \`\`\`\n    code\n\n${table}\n`,
+				);
+			});
+		});
+
+		describe("speculatively closed spans while streaming", () => {
+			const transient = (text: string) => {
+				clearRenderCache();
+				const markdown = new Markdown(text, 0, 0, defaultMarkdownTheme);
+				markdown.transientRenderCache = true;
+				return markdown.render(60);
+			};
+			const final = (text: string) => {
+				clearRenderCache();
+				return new Markdown(text, 0, 0, defaultMarkdownTheme).render(60);
+			};
+			const prose = "Opening prose long enough to wrap across a couple of terminal rows here.";
+
+			it("renders an open link, math span, or table-cell link as the closed form it streams toward", () => {
+				for (const [open, closed] of [
+					[`${prose} See [the docs](https://example.com/a/b`, `${prose} See [the docs](https://example.com/a/b)`],
+					[`${prose} Value $\\frac{a+b}{c`, `${prose} Value $\\frac{a+b}{c}$`],
+					[`${prose} Value \\(x^2 + \\sqr`, `${prose} Value \\(x^2 + \\)`],
+					[`- item\n- see [docs](https://ex`, `- item\n- see [docs](https://ex)`],
+					[`${prose} See [wiki](https://e.org/F_(m`, `${prose} See [wiki](https://e.org/F_(m))`],
+					[`${prose} Value $$x^2$`, `${prose} Value $$x^2$$`],
+				]) {
+					expect(transient(open)).toEqual(final(closed));
+				}
+			});
+
+			it("leaves currency, escapes, images, and code spans literal", () => {
+				for (const text of [
+					`${prose} It costs $5 per mo`,
+					`${prose} Escaped \\$x^2`,
+					`${prose} Escaped \\[docs](https://ex`,
+					`${prose} ![alt](https://ex`,
+					`${prose} Code \`[docs](https://ex`,
+					`${prose} Code \`$x^2`,
+					`${prose} Code \`$x^2\` and`,
+				]) {
+					expect(transient(text)).toEqual(final(text));
+				}
+			});
+
+			it("closes only the last block's span in a native terminal's source, and nothing inside an open fence", () => {
+				expect(speculativeStreamingSource("Paid $5 and $\n\nValue $x^")).toBe("Paid $5 and $\n\nValue $x$");
+				expect(speculativeStreamingSource("Value $x^\n\nNext")).toBe("Value $x^\n\nNext");
+				expect(speculativeStreamingSource("Done.\n\n```md\nSee [docs](https://ex")).toBe(
+					"Done.\n\n```md\nSee [docs](https://ex",
+				);
+				// A fence nested in a list item may sit four columns in; indented code elsewhere is no fence.
+				expect(speculativeStreamingSource("- item\n\n    ```md\n    See [docs](https://ex")).toBe(
+					"- item\n\n    ```md\n    See [docs](https://ex",
+				);
+				expect(speculativeStreamingSource("    ```\n    code\n\nSee [docs](https://ex")).toBe(
+					"    ```\n    code\n\nSee [docs](https://ex)",
+				);
+			});
 		});
 
 		it("should keep column width at least the longest word", () => {
@@ -2748,19 +2884,27 @@ describe("large documents", () => {
 	];
 	for (const [name, doc] of displayMathScans) {
 		it(`lexes ${name} in time proportional to the document`, () => {
-			const elapsed = (text: string): number => {
-				const start = Bun.nanoseconds();
+			// CPU time, not wall time: a parallel run deschedules this process,
+			// which stretches wall time without adding work.
+			const cost = (text: string): number => {
+				const start = process.cpuUsage();
 				extractMarkdownLinks(text);
-				return Bun.nanoseconds() - start;
+				const { user, system } = process.cpuUsage(start);
+				return user + system;
 			};
 			const small = doc(32 * 1024);
 			const large = doc(512 * 1024);
-			const smallNs = Math.min(elapsed(small), elapsed(small), elapsed(small));
-			// 16 times the text: linear work takes about 16 times as long. The
-			// best of up to three runs absorbs a load spike.
-			let largeNs = Number.POSITIVE_INFINITY;
-			for (let run = 0; run < 3 && largeNs >= 48 * smallNs; run++) largeNs = Math.min(largeNs, elapsed(large));
-			expect(largeNs).toBeLessThan(48 * smallNs);
+			cost(small); // warm the lexer so the first small sample is not the cold one
+			// 16 times the text: linear work costs about 16 times as much, a rescan
+			// per opener about 256 times. Interleaved best-of-five rounds keep a
+			// burst from landing on one size only.
+			let smallCost = Number.POSITIVE_INFINITY;
+			let largeCost = Number.POSITIVE_INFINITY;
+			for (let round = 0; round < 5 && !(largeCost < 48 * smallCost); round++) {
+				smallCost = Math.min(smallCost, cost(small));
+				largeCost = Math.min(largeCost, cost(large));
+			}
+			expect(largeCost).toBeLessThan(48 * smallCost);
 		});
 	}
 

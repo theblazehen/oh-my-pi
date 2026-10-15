@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Effort, type FetchImpl, type Model, type OpenAICompat, type ThinkingConfig } from "@oh-my-pi/pi-ai";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
+import { resolveOpenAIRequestSetup } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resolveMaxContextWindow } from "@oh-my-pi/pi-catalog/compat/context-window";
@@ -1135,6 +1136,25 @@ describe("ModelRegistry", () => {
 			expect(flash).toMatchObject({
 				api: "openai-completions",
 				baseUrl: "https://api.z.ai/api/coding/paas/v4",
+			});
+		});
+
+		test("unscoped OpenRouter relay override keeps Decisions judges on the relay /api/alpha root", () => {
+			const relayRegistry = readonlyRegistry({
+				providers: {
+					openrouter: {
+						baseUrl: "http://127.0.0.1:7700/agents/openrouter/api/v1",
+						auth: "none",
+					},
+				},
+			});
+			expect(relayRegistry.find("openrouter", "~typesafe/jev-latest")).toMatchObject({
+				api: "openrouter-decisions",
+				baseUrl: "http://127.0.0.1:7700/agents/openrouter/api/alpha",
+			});
+			expect(relayRegistry.find("openrouter", "openai/gpt-5.5")).toMatchObject({
+				api: "openrouter",
+				baseUrl: "http://127.0.0.1:7700/agents/openrouter/api/v1",
 			});
 		});
 
@@ -2810,8 +2830,9 @@ describe("ModelRegistry", () => {
 			expect(registry.find("openai-codex", "gpt-5.6-sol")?.contextWindow).toBe(272_000);
 			// Standard-priced 1M models (no long-context tier) keep their window.
 			expect(registry.find("anthropic", "claude-opus-4-8")?.contextWindow).toBe(1_000_000);
-			// SuperGrok carries public xAI tiers for stats estimates, not billing.
-			expect(registry.find("xai-oauth", "grok-4.20-0309-reasoning")?.contextWindow).toBe(2_000_000);
+			// SuperGrok carries public xAI tiers (200K threshold) for stats estimates,
+			// not billing, so it keeps its full 1M window.
+			expect(registry.find("xai-oauth", "grok-4.20-0309-reasoning")?.contextWindow).toBe(1_000_000);
 		});
 
 		test("reapplyModelPolicies re-clamps and restores premium windows on toggle", async () => {
@@ -3386,7 +3407,7 @@ describe("ModelRegistry", () => {
 				{
 					seedCache: dbPath =>
 						writeModelCache(
-							"cached-compact-proxy:openai-models-list-context-v3",
+							"cached-compact-proxy:openai-models-list-context-v4",
 							Date.now(),
 							[
 								buildModel({
@@ -3423,7 +3444,7 @@ describe("ModelRegistry", () => {
 				buildModel({
 					id: "minimax/minimax-m3",
 					name,
-					api: "openai-completions",
+					api: "openai-responses",
 					provider: "litellm-proxy",
 					baseUrl: "http://litellm-proxy.example:4000/v1",
 					reasoning: true,
@@ -3469,11 +3490,11 @@ describe("ModelRegistry", () => {
 					},
 				},
 				{
-					// Row under the retired pre-modality namespace; the context-v3
-					// bump must orphan it instead of serving the stale text-only row.
+					// Row under the retired pre-`top_provider` namespace; the context-v4
+					// bump must orphan it instead of serving the stale output limit.
 					seedCache: dbPath =>
 						writeModelCache(
-							"stale-openai-proxy:openai-models-list-context-v2",
+							"stale-openai-proxy:openai-models-list-context-v3",
 							Date.now(),
 							[
 								buildModel({
@@ -3486,7 +3507,7 @@ describe("ModelRegistry", () => {
 									input: ["text"],
 									cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 									contextWindow: 128_000,
-									maxTokens: 16_384,
+									maxTokens: 65_536,
 								}),
 							],
 							true,
@@ -3533,15 +3554,26 @@ describe("ModelRegistry", () => {
 			expect(getModelsForProvider(litellmStaleNamespaceCache, "litellm-proxy")).toHaveLength(0);
 		});
 
-		test("loads litellm discovery rows cached under the rich-v5 namespace", () => {
+		test("restores LiteLLM backend session policy from rich-v5 alias rows without changing their API", () => {
 			const model = litellmCurrentNamespaceCache.find("litellm-proxy", "minimax/minimax-m3");
 			expect(model?.name).toBe("MiniMax-M3");
 			expect(model?.provider).toBe("litellm-proxy");
+			if (!model) throw new Error("Missing cached LiteLLM model");
+			expect(model.api).toBe("openai-responses");
+			expect(model.providerType).toBe("litellm");
+			if (model.api !== "openai-responses") throw new Error("Expected cached Responses API");
+			expect(
+				resolveOpenAIRequestSetup(model as Model<"openai-responses">, {
+					apiKey: "test",
+					messages: [],
+					sessionId: "cached-alias-session",
+				}).requestHeaders["x-litellm-session-id"],
+			).toBe("cached-alias-session");
 		});
 
-		test("ignores openai-models-list rows cached under the retired context-v2 namespace", () => {
-			// PR #7584 added server-advertised input-modality parsing; warm v2 rows
-			// pinned vision-capable ids at text-only and must not load.
+		test("ignores openai-models-list rows cached under the retired context-v3 namespace", () => {
+			// PR #15652 reads `top_provider.max_completion_tokens`; warm v3 rows
+			// kept the bundled reference's larger output limit and must not load.
 			expect(openaiModelsListStaleNamespaceCache.find("stale-openai-proxy", "stale-vlm")).toBeUndefined();
 			expect(getModelsForProvider(openaiModelsListStaleNamespaceCache, "stale-openai-proxy")).toHaveLength(0);
 		});

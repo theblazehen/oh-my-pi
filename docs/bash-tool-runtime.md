@@ -117,7 +117,7 @@ A nonblank `name` routes to `startService()` before finite-command timeout, asyn
 - Services execute the configured external shell with its args, prefix, and shell environment, not the embedded shell or finite-command direnv preflight.
 - `pty` defaults to `true`; no command deadline is imposed.
 - `ready` must include a log regex or TCP port (1–65535). When both are present, both must pass. TCP host defaults to `127.0.0.1`; readiness timeout defaults to 30 seconds and is clamped to 0.05–3600 seconds.
-- Without a readiness condition, startup returns the running service. With one, startup waits for readiness, exit, or the readiness deadline. A readiness timeout is reported without stopping the process.
+- Without a readiness condition, startup returns the running service. With one, startup waits for readiness, exit, or the readiness deadline. A readiness timeout is reported without stopping the process. A queued steering message ends the readiness wait early: the call returns `starting` and the service keeps starting.
 - New services use session lifetime, no automatic restart, and are not detached. Completion notifications are associated with their owning session.
 - `read proc://<name>` inspects state and logs; `write proc://<name>` sends input (empty content sends Enter), `write proc://<name>/kill` stops it, and `/mode` accepts `persist`, `session`, or `detached`.
 

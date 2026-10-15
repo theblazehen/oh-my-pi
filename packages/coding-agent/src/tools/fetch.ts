@@ -1143,6 +1143,19 @@ async function renderUrl(
 		};
 	}
 
+	if (response.status === 204) {
+		return {
+			url,
+			finalUrl: response.finalUrl,
+			contentType: response.contentType || "unknown",
+			method: "no-content",
+			content: "",
+			fetchedAt,
+			truncated: false,
+			notes: ["HTTP 204 No Content"],
+		};
+	}
+
 	const { finalUrl, content: rawContent } = response;
 	if (response.truncated) {
 		notes.push(`Response body exceeded ${formatBytes(MAX_BYTES)} and was cut mid-stream; content is incomplete`);

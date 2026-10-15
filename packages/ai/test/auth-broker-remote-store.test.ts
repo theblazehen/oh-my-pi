@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -53,7 +54,7 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			delete process.env[key];
 		}
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "auth-broker-remote-store-"));
-		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		store = new SqliteAuthCredentialStore(new Database(":memory:"));
 		await store.saveOAuth("anthropic", mintOAuthCredential("a", Date.now() + 60_000));
 		storage = new AuthStorage(store);
 		await storage.credentials.reload();
@@ -179,18 +180,15 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 			expect(await gatewayStorage.credentials.poll()).toBe(true);
 			expect(await gatewayStorage.credentials.poll()).toBe(false);
 
-			// Stop the broker, replace its persisted credential set, and boot a
-			// fresh AuthStorage whose in-memory generation starts below the
-			// client's previously acknowledged value.
+			// Stop the broker and boot a replacement over a different credential
+			// set whose AuthStorage generation starts below the client's
+			// previously acknowledged value.
 			const brokerUrl = new URL(handle!.url);
 			const bind = `${brokerUrl.hostname}:${brokerUrl.port}`;
 			await handle!.close();
 			storage!.close();
 
-			store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
-			for (const provider of ["anthropic", "deepseek", "openai", "xai"]) {
-				await store.deleteProvider(provider);
-			}
+			store = new SqliteAuthCredentialStore(new Database(":memory:"));
 			await store.saveApiKey("google", "sk-restarted");
 			storage = new AuthStorage(store);
 			await storage.credentials.reload();
@@ -557,6 +555,31 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 				}
 			},
 		);
+	});
+
+	test("evicts cold sticky sessions while preserving recently accessed sessions", () => {
+		remote = new RemoteAuthCredentialStore({ client: new AuthBrokerClient({ url: handle!.url, token }) });
+		const expires = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+		for (let i = 0; i < 4096; i++) remote.setCache(`session:sticky:mock:${i}`, "credential-1", expires);
+		expect(remote.getCache("session:sticky:mock:0")).toBe("credential-1");
+		for (let i = 4096; i < 5000; i++) remote.setCache(`session:sticky:mock:${i}`, "credential-1", expires);
+		expect(remote.getCache("session:sticky:mock:0")).toBe("credential-1");
+		expect(remote.getCache("session:sticky:mock:1")).toBeNull();
+		expect(remote.getCache("session:sticky:mock:4999")).toBe("credential-1");
+	});
+
+	test("bounds cached request data even when one session key or value is large", () => {
+		remote = new RemoteAuthCredentialStore({ client: new AuthBrokerClient({ url: handle!.url, token }) });
+		const expires = Math.floor(Date.now() / 1000) + 60;
+		const payload = "x".repeat(2 * 1024 * 1024);
+		remote.setCache("first", payload, expires);
+		remote.setCache("second", payload, expires);
+		remote.setCache("third", payload, expires);
+		expect(remote.getCache("first")).toBeNull();
+		expect(remote.getCache("third")).toBe(payload);
+		remote.setCache("oversized", payload + payload + "!", expires);
+		expect(remote.getCache("oversized")).toBeNull();
+		expect(remote.getCache("third")).toBe(payload);
 	});
 });
 

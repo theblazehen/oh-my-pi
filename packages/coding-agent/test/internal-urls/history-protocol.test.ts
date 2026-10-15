@@ -412,6 +412,25 @@ describe("history:// protocol", () => {
 		expect(output.text).not.toContain("hello from live");
 	});
 
+	it("reads a closed raw history range without appending paging text", async () => {
+		AgentRegistry.global().register({
+			id: "HubAgent",
+			displayName: "task",
+			kind: "sub",
+			session: fakeLiveSession([{ role: "user", content: "hello from live", timestamp: 1 }]),
+			status: "idle",
+		});
+		const resource = await InternalUrlRouter.instance().resolve("history://HubAgent");
+		const result = await new ReadTool(makeToolSession(os.tmpdir())).execute("history-raw-range", {
+			path: "history://HubAgent:raw:1-2",
+		});
+		const output = result.content.find(content => content.type === "text");
+
+		expect(output?.type).toBe("text");
+		if (output?.type !== "text") throw new Error("Expected text output");
+		expect(output.text).toBe(resource.content.split("\n").slice(0, 2).join("\n"));
+	});
+
 	it("resolves agent ids case-insensitively", async () => {
 		AgentRegistry.global().register({
 			id: "HubAgent",

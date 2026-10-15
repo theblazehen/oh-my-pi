@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { readImageMetadata, removeSyncWithRetries } from "@oh-my-pi/pi-utils";
-import { loadImageInput } from "../src/utils/image-loading";
+import { loadImageAttachmentInput, loadImageInput } from "../src/utils/image-loading";
 import { InvalidImageDataError } from "@oh-my-pi/pi-tui/chat/image-loading";
 
 describe("readImageMetadata", () => {
@@ -69,5 +69,71 @@ describe("readImageMetadata", () => {
 
 		const loading = loadImageInput({ path: imagePath, cwd: testDir, autoResize: false });
 		await expect(loading).rejects.toBeInstanceOf(InvalidImageDataError);
+	});
+});
+
+describe("loadImageAttachmentInput", () => {
+	const paddedPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+	const unpaddedPng = paddedPng.slice(0, -2);
+
+	async function load(data: string, mimeType = "image/png") {
+		return loadImageAttachmentInput({
+			image: { type: "image", data, mimeType },
+			label: "fixture.png",
+			uri: "fixture",
+			autoResize: false,
+		});
+	}
+
+	it("fully decodes real PNG attachments with padded and unpadded base64", async () => {
+		for (const data of [paddedPng, unpaddedPng]) {
+			const result = await load(data);
+			expect(result?.data).toBe(data);
+			expect(result?.bytes).toBe(Buffer.from(data, "base64").byteLength);
+		}
+	});
+
+	it("normalizes supported attachment MIME types case-insensitively", async () => {
+		const image = {
+			type: "image" as const,
+			data: paddedPng,
+			mimeType: "IMAGE/PNG",
+			detail: "high" as const,
+		};
+		const attachment = {
+			image,
+			label: "fixture.png",
+			uri: "fixture",
+			autoResize: false,
+		};
+
+		const result = await loadImageAttachmentInput(attachment);
+		expect(result?.mimeType).toBe("image/png");
+		expect(result?.data).toBe(paddedPng);
+		expect(result?.bytes).toBe(Buffer.from(paddedPng, "base64").byteLength);
+		expect(attachment.image).toBe(image);
+		expect(image).toEqual({
+			type: "image",
+			data: paddedPng,
+			mimeType: "IMAGE/PNG",
+			detail: "high",
+		});
+		expect(await load(paddedPng, "IMAGE/HEIC")).toBeNull();
+	});
+
+	it("rejects malformed base64 padding before image decoding", async () => {
+		for (const data of [paddedPng.slice(0, -1), `${paddedPng}=`, `${paddedPng.slice(0, 8)}=${paddedPng.slice(8)}`]) {
+			await expect(load(data)).rejects.toMatchObject({
+				name: "InvalidImageDataError",
+				reason: "invalid base64 image data",
+			});
+		}
+	});
+
+	it("rejects an image whose decoded format disagrees with its declared MIME type", async () => {
+		await expect(load(paddedPng, "image/jpeg")).rejects.toMatchObject({
+			name: "InvalidImageDataError",
+			reason: "declared image/jpeg but contains image/png",
+		});
 	});
 });

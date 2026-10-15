@@ -113,6 +113,12 @@ export interface StructuredSubagentRequest {
 	/** Presence, rather than truthiness, makes this the highest-priority schema. */
 	outputSchema?: unknown;
 	schemaMode?: StructuredSubagentSchemaMode;
+	/**
+	 * `false` = no output schema (caller, agent, or session) and no `yield` tool:
+	 * the child's final assistant message is its result. An agent declaring
+	 * `structured: true` keeps both, resolved as if this were `true`. Default `true`.
+	 */
+	structured?: boolean;
 	/** Per-spawn thinking effort mapped onto the resolved model's supported range; overrides the agent's default selector. */
 	effort?: TaskEffort;
 	/** Caller's description of how open-ended the work is; steers the child's `auto` thinking classification. */
@@ -170,6 +176,8 @@ export interface EffectiveSubagentPolicy {
 	/** Exact-name `task.agentAccountPools` entry: the only OAuth accounts the child may use, per listed provider. */
 	oauthAccountPools?: OAuthAccountPools;
 	parentActiveModelPattern?: string;
+	/** Whether the child gets the `yield` tool; see {@link StructuredSubagentRequest.structured}. */
+	structured: boolean;
 	schema: StructuredSubagentSchemaResolution;
 	planMode: boolean;
 	isIsolated: boolean;
@@ -224,8 +232,15 @@ function sanitizeAgentId(value: string | undefined): string | undefined {
 	return sanitized || undefined;
 }
 
-function resolveSchema(request: StructuredSubagentRequest, agent: AgentDefinition): StructuredSubagentSchemaResolution {
+function resolveSchema(
+	request: StructuredSubagentRequest,
+	agent: AgentDefinition,
+	structured: boolean,
+): StructuredSubagentSchemaResolution {
 	const mode = request.schemaMode ?? request.session.outputSchemaMode ?? "permissive";
+	if (!structured) {
+		return { schema: undefined, source: "none", mode, outputSchemaOverridesAgent: false };
+	}
 	if (Object.hasOwn(request, "outputSchema")) {
 		return { schema: request.outputSchema, source: "caller", mode, outputSchemaOverridesAgent: true };
 	}
@@ -362,7 +377,9 @@ export async function resolveEffectiveSubagentPolicy(
 	}
 
 	const effectiveAgent = planMode ? createPlanModeAgent(agent) : agent;
-	const schema = resolveSchema(request, effectiveAgent);
+	// An agent declaring `structured: true` keeps its result contract when the caller opts out (`task.structured` off).
+	const structured = request.structured !== false || effectiveAgent.structured === true;
+	const schema = resolveSchema(request, effectiveAgent, structured);
 	if (schema.source === "caller" || (schema.source !== "none" && schema.mode === "strict")) {
 		const { error } = buildOutputValidator(schema.schema);
 		if (error) {
@@ -418,6 +435,7 @@ export async function resolveEffectiveSubagentPolicy(
 		compactionThresholdOverride,
 		oauthAccountPools,
 		parentActiveModelPattern,
+		structured,
 		schema,
 		planMode,
 		isIsolated,
@@ -508,6 +526,19 @@ async function leaseArtifacts(
 	return { sessionFile: null, artifactsDir, temporary: true, unregister: registerArtifactsDir(artifactsDir) };
 }
 
+/**
+ * Agents are rediscovered on every spawn, but the session's skill list is
+ * fixed at startup. Rediscover skills once when an agent autoloads a skill the
+ * session has not seen, so a skill added after startup is not silently dropped.
+ */
+async function refreshSkillsForAutoload(session: ToolSession, agent: AgentDefinition): Promise<void> {
+	const names = agent.autoloadSkills;
+	if (!names?.length || !session.refreshSkills) return;
+	const known = new Set((session.skills ?? []).map(skill => skill.name));
+	if (names.every(name => known.has(name))) return;
+	await session.refreshSkills();
+}
+
 function resolveAutoloadSkills(session: ToolSession, agent: AgentDefinition) {
 	const skills = [...(session.skills ?? [])];
 	const autoloadSkills = agent.autoloadSkills?.length
@@ -557,6 +588,7 @@ function buildExecutorOptions(
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: request.effort,
 		solutionSpace: request.solutionSpace?.trim() || undefined,
+		structured: policy.structured,
 		...(policy.schema.source === "none"
 			? {}
 			: {
@@ -580,6 +612,7 @@ function buildExecutorOptions(
 		authStorage: session.authStorage,
 		modelRegistry: session.modelRegistry,
 		settings: session.settings,
+		asyncJobManager: session.asyncJobManager,
 		inheritedSessionAgents: session.getSessionAgents?.(),
 		mcpManager: enableMCP ? (session.mcpManager ?? MCPManager.instance()) : undefined,
 		enableMCP,
@@ -604,6 +637,7 @@ function buildExecutorOptions(
 		parentMnemopiSessionState: session.getMnemopiSessionState?.(),
 		parentTelemetry: session.getTelemetry?.(),
 		parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
+		parentPromptCacheKey: session.getPromptCacheKey?.(),
 		parentServiceTier: session.getServiceTierByFamily ? (session.getServiceTierByFamily() ?? null) : undefined,
 	};
 }
@@ -770,6 +804,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			...request.identity,
 			label: request.identity?.label ?? (request.invocationKind === "eval" ? "EvalAgent" : undefined),
 		});
+		await refreshSkillsForAutoload(request.session, policy.agent);
 		const baseOptions = buildExecutorOptions(request, policy, lease, id);
 		baseOptions.onCleanupDeferred = completion => {
 			deferredCleanup = completion;

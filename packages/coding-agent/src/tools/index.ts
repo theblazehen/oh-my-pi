@@ -130,6 +130,7 @@ export * from "./ida";
 export * from "./essential-tools";
 export * from "./eval";
 export * from "./eval-backends";
+export * from "./file-mutation-queue";
 export * from "./file-write-fallback";
 export * from "./gh";
 export * from "./glob";
@@ -214,6 +215,8 @@ export interface ToolSession {
 	hasUI: boolean;
 	/** Whether `ask` can reach a human. Defaults to `hasUI`. */
 	canPromptUser?: boolean;
+	/** Keep `ask` in a headless fork's roster; execution still requires UI. */
+	advertiseHeadlessAsk?: boolean;
 	/** The user approves `cfg://` writes for this session (top-level TUI session only). */
 	settingsApproval?: boolean;
 	/** Whether this session has begun disposal. */
@@ -364,6 +367,8 @@ export interface ToolSession {
 	getMnemopiSessionState?: () => MnemopiSessionState | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "Main", "AuthLoader"). */
 	getAgentId?: () => string | null;
+	/** Parent cache identity for sibling sharing, only when the parent model opts in. */
+	getPromptCacheKey?: () => string | undefined;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;
 	/** Look up an enabled tool through the eval bridge's normal permission pipeline. */
@@ -372,8 +377,6 @@ export interface ToolSession {
 	getToolContext?: () => AgentToolContext | undefined;
 	/** Names currently authorized for invocation through the eval bridge. */
 	getEvalBridgeToolNames?: () => readonly string[];
-	/** Direct partition of the active Code Mode surface; undefined when Code Mode is inactive. */
-	getCodeModeDirectToolNames?: () => readonly string[] | undefined;
 	/** Return whether a built-in tool is active in this turn's tool set. */
 	isToolActive?: (name: string) => boolean;
 	/** Update the active built-in tool predicate when a session changes tools mid-run. */
@@ -441,20 +444,7 @@ export interface ToolSession {
 	modelRegistry?: import("../config/model-registry").ModelRegistry;
 	/** Agent output manager for unique agent:// IDs across task invocations */
 	agentOutputManager?: AgentOutputManager;
-	/**
-	 * Async job manager scoped to this session.
-	 *
-	 * - Top-level session that constructed one: its own manager.
-	 * - Subagent (`parentTaskPrefix` set): the parent's manager, so background
-	 *   bash/task work and `onJobComplete` deliveries flow into the conversation
-	 *   that spawned it.
-	 * - Secondary in-process top-level session that found a singleton already
-	 *   installed (issue #1923): `undefined`. Tools refuse async work rather
-	 *   than silently route completions into the owning session's `yieldQueue`.
-	 *
-	 * Tools MUST use this instead of `AsyncJobManager.instance()` so a secondary
-	 * session never borrows the owning session's manager by accident.
-	 */
+	/** Manager of this session's root, shared only with that root's subagents. */
 	asyncJobManager?: AsyncJobManager;
 	/** MCP manager visible to subagents without relying on the process-global singleton. */
 	mcpManager?: MCPManager;

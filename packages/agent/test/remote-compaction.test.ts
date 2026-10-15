@@ -892,6 +892,24 @@ describe("remote compaction input forwarding", () => {
 		expect(result.estimatedTokensAfter).toBeLessThanOrEqual(3_000);
 	});
 
+	test("counts tool output as the model reads it, not as escaped JSON", () => {
+		// Disassembly-style output: quotes, backslashes, tabs and newlines each
+		// grow on JSON serialization, which used to refuse requests that fit.
+		const output = '\tmov\trax, qword ptr [rip+0x1f]\t; "C:\\\\Windows\\\\System32"\n'.repeat(2_000);
+		const input = [{ type: "function_call_output", call_id: "call_1", output }];
+		const tokenizer = new Tokenizer();
+		const contextWindow = tokenizer.countTokens(output, "strict") + 1_000;
+		expect(tokenizer.countTokens(JSON.stringify({ instructions: "compact", input }), "strict")).toBeGreaterThan(
+			contextWindow,
+		);
+
+		const result = trimRemoteCompactionInputToContextWindow(input, tokenizer, contextWindow, "compact");
+
+		expect(result.fits).toBe(true);
+		expect(result.rewrittenOutputs).toBe(0);
+		expect(result.input[0].output).toBe(output);
+	});
+
 	test("scans past a synthetic tool-image attachment to rewrite its output", () => {
 		const attachment = {
 			type: "message",
@@ -1044,6 +1062,31 @@ describe("requestCompactionV2Streaming", () => {
 		expect(result.usedTokens).toBe(123);
 		expect(result.usage?.cachedInputTokens).toBe(7);
 		expect(result.usage?.reasoningOutputTokens).toBe(1);
+	});
+	test("keeps the LiteLLM conversation session header on the compaction request", async () => {
+		const model = makeOpenAiModel({
+			provider: "litellm",
+			baseUrl: "https://litellm.example/v1",
+			remoteCompaction: { enabled: true, v2StreamingEnabled: true },
+		});
+		const userItem = { type: "message", role: "user", content: [{ type: "input_text", text: "real user" }] };
+		const request = buildCompactionV2Request(model, [userItem], "instructions", { sessionId: "session-1" });
+		const sessionHeaders: (string | null)[] = [];
+		const fetchMock: FetchImpl = async (_input, init) => {
+			sessionHeaders.push(new Headers(init?.headers).get("x-litellm-session-id"));
+			return sseResponse([
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: { type: "compaction", encrypted_content: "enc" },
+				},
+				{ type: "response.completed", response: { usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } },
+			]);
+		};
+
+		await requestCompactionV2Streaming(model, "test-key", request, undefined, { fetch: fetchMock });
+
+		expect(sessionHeaders).toEqual(["session-1"]);
 	});
 	test.each(["The socket connection was closed unexpectedly", "socket connection closed unexpectedly"] as const)(
 		"retries a transient socket closure: %s",
@@ -2006,6 +2049,28 @@ test("uses configured OpenAI-compatible compaction for custom providers", async 
 	expect(requestBody).toMatchObject({ model: "gpt-5.5" });
 });
 
+test("keeps the LiteLLM conversation session header on V1 compaction unless configured", async () => {
+	const sessionHeaders: (string | null)[] = [];
+	const fetchMock: FetchImpl = async (_input, init) => {
+		sessionHeaders.push(new Headers(init?.headers).get("x-litellm-session-id"));
+		return Response.json({ output: [{ type: "compaction_summary", summary: "compacted" }] });
+	};
+	const input = [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }];
+	for (const headers of [undefined, { "X-LiteLLM-Session-Id": "run-42" }]) {
+		const model = makeOpenAiModel({
+			provider: "litellm",
+			baseUrl: "https://litellm.example/v1",
+			headers,
+			remoteCompaction: { enabled: true },
+		});
+		await requestOpenAiRemoteCompaction(model, "test-key", input, "instructions", undefined, {
+			fetch: fetchMock,
+			sessionId: "session-1",
+		});
+	}
+	expect(sessionHeaders).toEqual(["session-1", "run-42"]);
+});
+
 test("uses Azure request shape for Azure Responses remote compaction", async () => {
 	const previousDeploymentMap = Bun.env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP;
 	Bun.env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP = "gpt-5-compact=azure-gpt-5-compact";
@@ -2752,6 +2817,120 @@ describe("compact() remote compaction failure handling", () => {
 			CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE,
 		);
 		expect(requestInput.at(-1)).toEqual({ type: "compaction_trigger" });
+	});
+
+	test("compacts the history before the kept tail when a final response pushes it over the window", async () => {
+		const preparation = makePreparation();
+		preparation.settings = { ...preparation.settings, remoteStreamingV2Enabled: true };
+		preparation.lastSummarizedEntryId = "summarized-last";
+		const tailText = "final answer paragraph ".repeat(8_000);
+		preparation.recentMessages = [
+			{ role: "user", content: "recent", timestamp: 2 },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: tailText }],
+				api: "openai-responses",
+				provider: "openai",
+				model: "gpt-5",
+				usage: ZERO_USAGE,
+				stopReason: "stop",
+				timestamp: 3,
+			},
+		];
+		const model = makeOpenAiModel({
+			contextWindow: 20_000,
+			remoteCompaction: {
+				enabled: true,
+				v2StreamingEnabled: true,
+				v2Endpoint: "https://compact.example/v1/responses",
+			},
+		});
+		const requestInputs: string[] = [];
+		const fetchMock: FetchImpl = async (_input, init) => {
+			const body: unknown = JSON.parse(String(init?.body));
+			if (!isRecord(body) || !Array.isArray(body.input)) throw new Error("expected V2 compaction input");
+			requestInputs.push(JSON.stringify(body.input));
+			return sseResponse([
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: { type: "compaction", encrypted_content: "enc_prefix" },
+				},
+				{
+					type: "response.completed",
+					response: { usage: { input_tokens: 100, output_tokens: 2, total_tokens: 102 } },
+				},
+			]);
+		};
+
+		const result = await compact(preparation, model, "test-key", undefined, undefined, { fetch: fetchMock });
+
+		expect(requestInputs).toHaveLength(1);
+		expect(requestInputs[0]).toContain("long history");
+		expect(requestInputs[0]).not.toContain("final answer paragraph");
+		expect(requestInputs[0]).not.toContain('"recent"');
+		expect(result.providerReplayThroughEntryId).toBe("summarized-last");
+		expect(result.preserveData?.openaiRemoteCompaction).toBeDefined();
+	});
+
+	test("replays an oversized kept tool result instead of rewriting it when the prefix fits", async () => {
+		const preparation = makePreparation();
+		preparation.settings = { ...preparation.settings, remoteStreamingV2Enabled: true };
+		preparation.lastSummarizedEntryId = "summarized-last";
+		preparation.recentMessages = [
+			{ role: "user", content: "read the large file", timestamp: 2 },
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "call_kept|fc_kept", name: "read", arguments: { path: "/tmp/x" } }],
+				timestamp: 3,
+				provider: "openai",
+				model: "gpt-5",
+				api: "openai-responses",
+				usage: ZERO_USAGE,
+				stopReason: "toolUse",
+			},
+			{
+				role: "toolResult",
+				toolCallId: "call_kept|fc_kept",
+				toolName: "read",
+				content: [{ type: "text", text: "kept tool output ".repeat(8_000) }],
+				isError: false,
+				timestamp: 4,
+			},
+		];
+		const model = makeOpenAiModel({
+			contextWindow: 20_000,
+			remoteCompaction: {
+				enabled: true,
+				v2StreamingEnabled: true,
+				v2Endpoint: "https://compact.example/v1/responses",
+			},
+		});
+		const requestInputs: string[] = [];
+		const fetchMock: FetchImpl = async (_input, init) => {
+			const body: unknown = JSON.parse(String(init?.body));
+			if (!isRecord(body) || !Array.isArray(body.input)) throw new Error("expected V2 compaction input");
+			requestInputs.push(JSON.stringify(body.input));
+			return sseResponse([
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: { type: "compaction", encrypted_content: "enc_prefix" },
+				},
+				{
+					type: "response.completed",
+					response: { usage: { input_tokens: 100, output_tokens: 2, total_tokens: 102 } },
+				},
+			]);
+		};
+
+		const result = await compact(preparation, model, "test-key", undefined, undefined, { fetch: fetchMock });
+
+		expect(requestInputs).toHaveLength(1);
+		expect(requestInputs[0]).toContain("long history");
+		expect(requestInputs[0]).not.toContain("call_kept");
+		expect(requestInputs[0]).not.toContain(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE);
+		expect(result.providerReplayThroughEntryId).toBe("summarized-last");
 	});
 
 	test("re-expands native history for local preparation when new native compaction is disabled", async () => {

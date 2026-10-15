@@ -309,22 +309,29 @@ base = [
 "util.base32" = []
 "util.base64" = ["util.base32"]
 "util.basename" = []
-# Shared POSIX BRE translation behind grep/sed.
+# Shared POSIX BRE translation behind grep/sed/nl.
 "util.bre" = []
 "util.cat" = []
+"util.chmod" = []
 "util.cksum" = []
 "util.cmp" = []
 "util.comm" = []
 "util.cp" = []
 "util.cut" = []
 "util.date" = []
+"util.dd" = []
+"util.df" = []
 "util.diff" = []
 "util.dirname" = []
+"util.du" = []
+"util.env" = []
 "util.fd" = []
 "util.find" = []
+"util.fold" = []
 "util.grep" = ["util.bre"]
 "util.head" = []
 "util.hostname" = []
+"util.id" = []
 "util.jq" = []
 "util.ln" = []
 "util.ls" = []
@@ -338,7 +345,9 @@ base = [
 "util.sponge" = []
 "util.ts" = []
 "util.mv" = []
+"util.nl" = ["util.bre"]
 "util.nproc" = []
+"util.od" = []
 "util.paste" = []
 "util.nohup" = ["util.procs"]
 "util.pgrep" = ["util.proc-match"]
@@ -358,6 +367,7 @@ base = [
 # Shares the PCRE2 JIT probe with `grep`.
 "util.rg" = ["util.grep"]
 "util.rm" = []
+"util.rmdir" = []
 "util.sed" = ["util.bre"]
 "util.seq" = []
 "util.sha1sum" = ["util.cksum"]
@@ -375,6 +385,7 @@ base = [
 "util.truncate" = []
 "util.uname" = []
 "util.uniq" = []
+"util.uptime" = []
 "util.wc" = []
 "util.which" = []
 "util.whoami" = []
@@ -388,19 +399,26 @@ utils = [
   "util.basename",
   "util.bre",
   "util.cat",
+  "util.chmod",
   "util.cksum",
   "util.cmp",
   "util.comm",
   "util.cp",
   "util.cut",
   "util.date",
+  "util.dd",
+  "util.df",
   "util.diff",
   "util.dirname",
+  "util.du",
+  "util.env",
   "util.fd",
   "util.find",
+  "util.fold",
   "util.grep",
   "util.head",
   "util.hostname",
+  "util.id",
   "util.jq",
   "util.ln",
   "util.ls",
@@ -414,7 +432,9 @@ utils = [
   "util.sponge",
   "util.ts",
   "util.mv",
+  "util.nl",
   "util.nproc",
+  "util.od",
   "util.paste",
   "util.nohup",
   "util.pgrep",
@@ -431,6 +451,7 @@ utils = [
   "util.realpath",
   "util.rg",
   "util.rm",
+  "util.rmdir",
   "util.sed",
   "util.seq",
   "util.sha1sum",
@@ -448,6 +469,7 @@ utils = [
   "util.truncate",
   "util.uname",
   "util.uniq",
+  "util.uptime",
   "util.wc",
   "util.which",
   "util.whoami",

@@ -46,6 +46,7 @@ import {
 	kimiCodeMaxTokens,
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
 	mapModelsDevToModels,
+	openCodeGoBaseUrlForApi,
 	projectOpenAIProReasoningAliases,
 	stripFireworksDeepSeekThinkingToggle,
 } from "../src/provider-models/openai-compat";
@@ -84,7 +85,7 @@ const DISCOVERY_ONLY_PROVIDERS = new Set(["ollama", "vllm", "lm-studio", "litell
  * runtime discovery is authoritative per credential (mirrors the GitLab Duo
  * fallback-only policy below).
  */
-const CREDENTIAL_SCOPED_PROVIDERS = new Set(["devin"]);
+const CREDENTIAL_SCOPED_PROVIDERS = new Set(["devin", "sambanova"]);
 /**
  * Providers whose authored seed is the complete documented fallback
  * catalog: their previous-snapshot rows are never resurrected, so an id
@@ -688,6 +689,11 @@ async function generateModels(selectedProvider?: string) {
 	allModels = applyFireworksDeepSeekReasoningShape(allModels);
 	allModels = filterModelsDevCatalogRows(allModels);
 	allModels = normalizeAntigravityEndpoint(allModels);
+	// Previous-snapshot fallbacks keep their old baseUrl; re-base every OpenCode
+	// Go row so retained rows follow gateway endpoint moves (#15722).
+	allModels = allModels.map(model =>
+		model.provider === "opencode-go" ? { ...model, baseUrl: openCodeGoBaseUrlForApi(model.api) } : model,
+	);
 	// Normalize display names: gateway author prefixes ("OpenAI: …"), alias
 	// markers ("(latest)"), provider attribution ("(Antigravity)"), and
 	// price/promo tags are model-extrinsic — strip them from the bundle.

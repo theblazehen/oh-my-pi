@@ -118,6 +118,14 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser semantic selectors and queries", (
 		expect(await call("isChecked", ["#missing"])).toBe(false);
 	});
 
+	it("reads the whole page body when text or html gets no selector", async () => {
+		const text = (await call("text")) as string;
+		expect(text).toContain("Titled content");
+		expect(text).toContain("Hello world");
+		expect(await call("html")).toContain('<div id="copy">Hello <strong>world</strong></div>');
+		expect(await run(`return (await tab.text()).includes("Save Changes")`)).toBe(true);
+	});
+
 	it("exposes the same read queries on element handles", async () => {
 		expect(
 			await run(`const element = await tab.waitFor("#username"); return {

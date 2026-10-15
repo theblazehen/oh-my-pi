@@ -7,11 +7,11 @@
  * — about one {@link JudgmentState}. Every question in a request sees the same
  * state and is answered independently, so callers batch independent questions
  * into one call. The shape mirrors TypeSafe's System One API so the native
- * backend ({@link TypeSafeJudge}) forwards requests verbatim, while the text
+ * backend ({@link NativeJudge}) forwards requests verbatim, while the text
  * bridge ({@link TextJudge}) renders the same questions into keyword prompts
  * for an ordinary chat model.
  */
-import type { Usage } from "../types";
+import type { ImageContent, Usage } from "../types";
 
 /** JSON-compatible value; readonly containers are accepted so `as const` state passes through. */
 export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [key: string]: JsonValue };
@@ -80,10 +80,12 @@ export type AnswerFor<Q extends Question> =
 export interface JudgmentRequest<Q extends Questions = Questions> {
 	state: JudgmentState;
 	questions: Q;
+	/** Images evaluated alongside the state; never part of the JSON state itself. */
+	images?: readonly ImageContent[];
 }
 
 export interface JudgmentResult<Q extends Questions = Questions> {
-	/** Transport that produced the answers (`typesafe`, or the chat model's api). */
+	/** Transport that produced the answers (a judgment api such as `typesafe`, or the chat model's api). */
 	api: string;
 	provider: string;
 	model: string;
@@ -97,6 +99,8 @@ export interface JudgeOptions {
 
 /** Answers typed questions about a state. Implementations are stateless and safe to share. */
 export interface Judge {
+	/** Whether this backend can consume separate image content blocks. */
+	readonly supportsImages?: boolean;
 	/** Backend description for logs, e.g. `typesafe/jev-latest`. */
 	readonly label: string;
 	judge<Q extends Questions>(request: JudgmentRequest<Q>, options?: JudgeOptions): Promise<JudgmentResult<Q>>;

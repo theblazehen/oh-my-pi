@@ -1061,6 +1061,9 @@ export async function getOrCreateClient(
 	const clientPromise = (async () => {
 		const baseCommand = config.resolvedCommand ?? config.command;
 		const baseArgs = config.args ?? [];
+		// Sent in both the mux handshake and `initialize`: a reused shared server
+		// answers `initialize` from cache, so the mux keys servers on these options.
+		const initializationOptions = config.initOptions ?? {};
 
 		// Wrap with lspmux if available and supported
 		const { command, args, env } = isLspmuxSupported(baseCommand)
@@ -1072,7 +1075,7 @@ export async function getOrCreateClient(
 		// to a private spawn so LSP never regresses on broker trouble.
 		let proc: LspTransport | null = null;
 		if (sharedLspEnabled && command === baseCommand) {
-			proc = await connectSharedLspTransport({ command, args, cwd, env, signal });
+			proc = await connectSharedLspTransport({ command, args, cwd, env, initializationOptions, signal });
 		}
 		proc ??= ptree.spawn([command, ...args], {
 			cwd,
@@ -1154,7 +1157,7 @@ export async function getOrCreateClient(
 					rootUri: fileToUri(cwd),
 					rootPath: cwd,
 					capabilities: CLIENT_CAPABILITIES,
-					initializationOptions: config.initOptions ?? {},
+					initializationOptions,
 					workspaceFolders: currentWorkspaceFolders(client),
 				},
 				signal,

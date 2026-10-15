@@ -396,12 +396,13 @@ export async function loadSvgImageInput(options: LoadImageInputOptions): Promise
 export async function loadImageAttachmentInput(
 	options: LoadImageAttachmentInputOptions,
 ): Promise<LoadedImageInput | null> {
-	if (!SUPPORTED_INPUT_IMAGE_MIME_TYPES.has(options.image.mimeType)) {
+	const image = { ...options.image, mimeType: options.image.mimeType.toLowerCase() };
+	if (!SUPPORTED_INPUT_IMAGE_MIME_TYPES.has(image.mimeType)) {
 		return null;
 	}
 
 	return loadInMemoryImageInput({
-		image: options.image,
+		image,
 		resolvedPath: options.uri,
 		textNotePrefix: `Read image attachment ${options.label}`,
 		autoResize: options.autoResize,

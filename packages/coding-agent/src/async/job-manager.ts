@@ -266,7 +266,7 @@ export interface AsyncJobFilter {
 export class AsyncJobManager {
 	static #instance: AsyncJobManager | undefined;
 
-	/** Process-global instance shared by internal URL protocol handlers and tools. */
+	/** Legacy pointer to the first live root; child routing uses the parent's scoped manager instead. */
 	static instance(): AsyncJobManager | undefined {
 		return AsyncJobManager.#instance;
 	}
@@ -920,8 +920,9 @@ export class AsyncJobManager {
 		// #suppressedDeliveries; evicting now would clear that marker (#evictJob)
 		// before the queue's isStale check drains it, letting the already-consumed
 		// result inject a duplicate async-result follow-up. A parked entry keeps
-		// the full retention window instead. Clamping inside #scheduleEviction
-		// keeps a shorter configured retention the effective cap.
+		// the row until its delivery settles (see #scheduleEviction), which then
+		// arms the consumed grace. Clamping inside #scheduleEviction keeps a
+		// shorter configured retention the effective cap.
 		const deliveryPending =
 			this.#deliveries.some(delivery => delivery.jobId === jobId) ||
 			this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId);
@@ -1075,6 +1076,13 @@ export class AsyncJobManager {
 	 * retention window; a consumed result passes the shorter
 	 * {@link #consumedResultEvictionMs}. The delay is clamped to the configured
 	 * retention so an explicit short retention always stays the effective cap.
+	 * A timer that fires while a suppressed job's delivery is in flight (its
+	 * async-result entry parked on a busy owner's yield queue) evicts only once
+	 * that attempt settles: the parked entry's isStale check resolves through
+	 * the suppression marker #evictJob clears, so evicting mid-park would
+	 * re-inject a result a foreground snapshot already consumed. Unsuppressed
+	 * in-flight deliveries keep the bounded lifecycle, so a receipt that never
+	 * settles cannot pin the row and its retained artifacts.
 	 */
 	#scheduleEviction(jobId: string, delayMs: number = this.#retentionMs): void {
 		if (this.#disposed) return;
@@ -1085,7 +1093,16 @@ export class AsyncJobManager {
 		const delay = Math.max(0, Math.min(this.#retentionMs, delayMs));
 		clearTimeout(this.#evictionTimers.get(jobId));
 		const timer = setTimeout(() => {
-			this.#evictJob(jobId);
+			const inFlight = this.#inFlightDeliveries.find(delivery => delivery.jobId === jobId)?.promise;
+			if (!inFlight || !this.isDeliverySuppressed(jobId)) {
+				this.#evictJob(jobId);
+				return;
+			}
+			// The settled attempt may re-arm this job's timer (consumed grace);
+			// only evict when nothing replaced this one in the meantime.
+			void inFlight.then(() => {
+				if (this.#evictionTimers.get(jobId) === timer) this.#evictJob(jobId);
+			});
 		}, delay);
 		timer.unref();
 		this.#evictionTimers.set(jobId, timer);

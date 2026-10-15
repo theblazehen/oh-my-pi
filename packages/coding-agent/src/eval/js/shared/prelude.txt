@@ -56,6 +56,13 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 
 	const read = async (path, opts, ...rest) => {
 		const options = optionsArg("read", opts, rest, ["offset", "limit"], "{ offset, limit }");
+		if (typeof path === "string" && /^artifact:\/\/\d+$/i.test(path)) {
+			const rawPath = withReadLineSelector(`${path}:raw`, options);
+			if (rawPath === null) return "";
+			const text = callHelper("hasRoot", path) ? await callHelper("read", path, options) : undefined;
+			// Another session's, or no artifacts dir was injected: the read tool searches every registered one.
+			return text ?? readToolText(rawPath);
+		}
 		if (shouldDelegateRead(path)) {
 			const toolPath = withReadLineSelector(path, options);
 			return toolPath === null ? "" : readToolText(toolPath);
@@ -308,9 +315,13 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 		}
 	};
 
-	const judge = async (state, questions) => {
+	// Optional `images` is a list of local paths or embedded `{ type: "image", data, mimeType }` attachments.
+	const judge = async (state, questions, opts) => {
 		checkQuestions(questions);
-		const result = await globalThis.__omp_call_tool__("__judge__", { state, questions });
+		const { images } = optionsArg("judge", opts, [], ["images"], "{ images }");
+		const args = { state, questions };
+		if (images !== undefined) args.images = images;
+		const result = await globalThis.__omp_call_tool__("__judge__", args);
 		if (!result || !isPlainObject(result.answers)) throw new Error("judge() did not return answers");
 		return result.answers;
 	};
@@ -402,17 +413,18 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 	};
 
 	// Judge every state with the same questions on the host. `states` is
-	// `{ key: state }` or an array (keys are indices). `intent` is an optional
-	// nonempty progress/job label. Item failures land in `JudgmentItem.error`;
-	// only a run that dies wholesale rejects `drain()`.
+	// `{ key: state }` or an array (keys are indices); `images` maps keys to
+	// lists of local paths or embedded image attachments. `intent` is an
+	// optional nonempty progress/job label. Item failures land in
+	// `JudgmentItem.error`; only a run that dies wholesale rejects `drain()`.
 	const judgeBatch = async (states, questions, opts, ...rest) => {
 		checkQuestions(questions);
 		const options = optionsArg(
 			"judgeBatch",
 			opts,
 			rest,
-			["concurrency", "retries", "minOk", "intent"],
-			"{ intent, concurrency, retries, minOk }",
+			["concurrency", "retries", "minOk", "intent", "images"],
+			"{ intent, concurrency, retries, minOk, images }",
 		);
 		if (
 			options.intent !== undefined &&
@@ -424,8 +436,18 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 		if (Array.isArray(states)) items = states.map((state, key) => ({ key, state }));
 		else if (isPlainObject(states)) items = Object.entries(states).map(([key, state]) => ({ key, state }));
 		else throw new TypeError("judgeBatch(states, questions) expects states as an object or array");
+		const { images, ...batchOptions } = options;
+		if (images !== undefined) {
+			if (!isPlainObject(images)) throw new TypeError("judgeBatch() images must be an object keyed by state key");
+			const itemsByKey = new Map(items.map(item => [String(item.key), item]));
+			for (const key of Object.keys(images)) {
+				const item = itemsByKey.get(key);
+				if (!item) throw new TypeError(`images contains unknown input key ${JSON.stringify(key)}`);
+				item.images = images[key];
+			}
+		}
 		return judgeBatchFrom(
-			await globalThis.__omp_call_tool__("__judge_batch__", { op: "create", items, questions, ...options }),
+			await globalThis.__omp_call_tool__("__judge_batch__", { op: "create", items, questions, ...batchOptions }),
 		);
 	};
 
