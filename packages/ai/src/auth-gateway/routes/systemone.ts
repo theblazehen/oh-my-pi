@@ -77,7 +77,7 @@ export async function handleSystemOne(
 			error instanceof Error ? error.message : String(error),
 		);
 	}
-	const client = resolveClientIdentity(req.headers);
+	const client = resolveClientIdentity(req);
 	// Judgments carry no conversation to derive a session from. One sticky
 	// session per model keeps credential selection stable across calls and
 	// still lets `markUsageLimitReached` hand off to a sibling account.

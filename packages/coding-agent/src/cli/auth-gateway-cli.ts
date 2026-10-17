@@ -11,7 +11,10 @@
  *   - `serve [--bind=…] [--trust-proxy-headers]` — boots the gateway against the configured broker.
  *   - `stdio` — serves the same routes as JSON lines on stdin/stdout with this omp's own credentials
  *     and model roles (`auth-gateway-stdio.ts`).
- *   - `token` / `token --regenerate` — manages the gateway bearer token file.
+ *   - `token` / `token --regenerate` — manages the unnamed gateway bearer token file.
+ *   - `token --name <key> [--regenerate|--revoke]` — prints (creating on first use), rotates or removes a
+ *     named API key; usage from its requests is attributed to the name.
+ *   - `keys` — lists the named API keys.
  *   - `status` — prints the locally-stored gateway token and bind hint.
  */
 import * as fs from "node:fs/promises";
@@ -32,7 +35,12 @@ import {
 	RemoteAuthCredentialStore,
 	type SnapshotResponse,
 } from "@oh-my-pi/pi-ai/auth-broker";
-import { DEFAULT_AUTH_GATEWAY_BIND, startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
+import {
+	type AuthGatewayApiKey,
+	type AuthGatewayApiKeyScope,
+	DEFAULT_AUTH_GATEWAY_BIND,
+	startAuthGateway,
+} from "@oh-my-pi/pi-ai/auth-gateway";
 import { type GeneratedProvider, getBundledModels, getEffectiveTokenCost } from "@oh-my-pi/pi-catalog/models";
 import { type ModelKind, modelKind } from "@oh-my-pi/pi-catalog/types";
 import { getConfigRootDir, logger, VERSION } from "@oh-my-pi/pi-utils";
@@ -47,10 +55,16 @@ import {
 	resolveAuthBrokerConfig,
 	resolveEffectiveSettings,
 } from "../session/auth-broker-config";
+import {
+	assertGatewayApiKeyName,
+	getGatewayApiKeysFilePath,
+	readGatewayApiKeys,
+	writeGatewayApiKeys,
+} from "./auth-gateway-keys";
 import { runAuthGatewayStdio } from "./auth-gateway-stdio";
 import { generateToken, readTokenFile, writeTokenFile } from "./token-file";
 
-export type AuthGatewayAction = "serve" | "stdio" | "token" | "status" | "check";
+export type AuthGatewayAction = "serve" | "stdio" | "token" | "keys" | "status" | "check";
 
 export interface AuthGatewayCommandArgs {
 	action: AuthGatewayAction;
@@ -58,6 +72,12 @@ export interface AuthGatewayCommandArgs {
 		json?: boolean;
 		bind?: string;
 		regenerate?: boolean;
+		/** Named API key `token` prints, creates, rotates (`regenerate`) or removes (`revoke`). */
+		name?: string;
+		/** Remove the named API key given by `name` (`token`). */
+		revoke?: boolean;
+		/** Scope for the `name` key (`token`): set on creation (default `inference`) or changed in place. */
+		scope?: AuthGatewayApiKeyScope;
 		trustProxyHeaders?: boolean;
 		/**
 		 * Disable bearer-token auth on inbound requests. Useful when the gateway
@@ -76,7 +96,7 @@ export interface AuthGatewayCommandArgs {
 	};
 }
 
-const ACTIONS: readonly AuthGatewayAction[] = ["serve", "stdio", "token", "status", "check"];
+const ACTIONS: readonly AuthGatewayAction[] = ["serve", "stdio", "token", "keys", "status", "check"];
 
 function getTokenFilePath(): string {
 	return path.join(getConfigRootDir(), "auth-gateway.token");
@@ -147,6 +167,13 @@ const CATALOG_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
  * advertised.
  */
 const CREDENTIAL_SYNC_INTERVAL_MS = 10 * 1000;
+
+/**
+ * How often a long-lived `serve` re-reads the named API keys file, so keys
+ * provisioned or revoked with `omp auth-gateway token --name` apply without a
+ * restart.
+ */
+const API_KEYS_SYNC_INTERVAL_MS = 10 * 1000;
 
 /**
  * Catalog kinds the gateway has a route for: chat (`/v1/chat/completions`,
@@ -268,6 +295,8 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	}
 	const bind = flags.bind ?? DEFAULT_AUTH_GATEWAY_BIND;
 	const gatewayToken = flags.noAuth ? null : await ensureToken();
+	const apiKeysFile = getGatewayApiKeysFilePath();
+	let apiKeys: readonly AuthGatewayApiKey[] = flags.noAuth ? [] : await readGatewayApiKeys(apiKeysFile);
 
 	// Build a broker-backed AuthStorage — same pattern as discoverAuthStorage()
 	// in sdk.ts. The gateway never touches local SQLite.
@@ -328,6 +357,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		storage,
 		bind,
 		bearerTokens: gatewayToken ? [gatewayToken] : [],
+		apiKeys: flags.noAuth ? undefined : () => apiKeys,
 		trustProxyHeaders: flags.trustProxyHeaders,
 		version: VERSION,
 		resolveModel: (id: string) => resolveGatewayModel(id, modelById, routable),
@@ -337,6 +367,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	process.stdout.write(`auth-gateway listening on ${handle.url}\n`);
 	if (gatewayToken) {
 		process.stdout.write(`bearer token: ${getTokenFilePath()} (chmod 0600)\n`);
+		process.stdout.write(`api keys: ${apiKeys.length} named in ${apiKeysFile}\n`);
 	} else {
 		process.stdout.write(`auth: disabled (--no-auth) — any client can call this gateway\n`);
 	}
@@ -375,6 +406,35 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	}, CREDENTIAL_SYNC_INTERVAL_MS);
 	credentialSync.unref();
 
+	// Re-read the named API keys on a timer: a key provisioned with `token
+	// --name` works, and a revoked one stops working, without a restart. A
+	// malformed file keeps the previous set rather than locking every client out.
+	const apiKeysSync = flags.noAuth
+		? undefined
+		: setInterval(() => {
+				void readGatewayApiKeys(apiKeysFile).then(
+					next => {
+						const changed =
+							next.length !== apiKeys.length ||
+							next.some(
+								(key, i) =>
+									key.name !== apiKeys[i].name ||
+									key.token !== apiKeys[i].token ||
+									key.scope !== apiKeys[i].scope,
+							);
+						if (!changed) return;
+						apiKeys = next;
+						logger.info("auth-gateway API keys reloaded", { count: next.length });
+					},
+					error => {
+						logger.warn("auth-gateway API key reload failed; keeping the previous keys", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					},
+				);
+			}, API_KEYS_SYNC_INTERVAL_MS);
+	apiKeysSync?.unref();
+
 	const stopped = Promise.withResolvers<void>();
 	let shutdownStarted = false;
 	const stop = async (signal: NodeJS.Signals): Promise<void> => {
@@ -383,6 +443,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		process.stdout.write(`\nReceived ${signal}, shutting down...\n`);
 		clearInterval(catalogRefresh);
 		clearInterval(credentialSync);
+		clearInterval(apiKeysSync);
 		let closeError: unknown;
 		try {
 			await handle.close();
@@ -415,6 +476,13 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 }
 
 async function runToken(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
+	if (flags.name !== undefined) {
+		await runNamedApiKey(flags.name, flags);
+		return;
+	}
+	if (flags.revoke) {
+		throw new Error("`--revoke` needs `--name <key>`; the unnamed gateway token can only be regenerated");
+	}
 	if (flags.regenerate) {
 		const next = generateToken();
 		await writeTokenFile(getTokenFilePath(), next);
@@ -433,8 +501,64 @@ async function runToken(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	}
 }
 
+/**
+ * `token --name <key>`: print the named API key (creating it on first use with
+ * `--scope`, default `inference`), rotate it with `--regenerate`, change its
+ * scope with `--scope`, or remove it with `--revoke`. A running `serve` picks
+ * the change up on its next keys-file poll.
+ */
+async function runNamedApiKey(name: string, flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
+	assertGatewayApiKeyName(name);
+	const file = getGatewayApiKeysFilePath();
+	const keys = await readGatewayApiKeys(file);
+	const index = keys.findIndex(key => key.name === name);
+	if (flags.revoke) {
+		if (index === -1) throw new Error(`No gateway API key named ${name} in ${file}`);
+		keys.splice(index, 1);
+		await writeGatewayApiKeys(file, keys);
+		if (flags.json) {
+			process.stdout.write(`${JSON.stringify({ name, revoked: true, path: file })}\n`);
+		} else {
+			process.stdout.write(`revoked ${name}\n`);
+		}
+		return;
+	}
+	const existing = index === -1 ? undefined : keys[index];
+	const scope = flags.scope ?? existing?.scope ?? "inference";
+	const token = existing === undefined || flags.regenerate ? generateToken() : existing.token;
+	if (existing === undefined || existing.token !== token || existing.scope !== scope) {
+		if (existing === undefined) keys.push({ name, token, scope });
+		else keys[index] = { name, token, scope };
+		await writeGatewayApiKeys(file, keys);
+	}
+	if (flags.json) {
+		process.stdout.write(`${JSON.stringify({ name, token, scope, path: file })}\n`);
+	} else {
+		process.stdout.write(`${token}\n`);
+	}
+}
+
+/** `keys`: list the named API keys by name and scope (never their tokens). */
+async function runKeys(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
+	const file = getGatewayApiKeysFilePath();
+	const keys = (await readGatewayApiKeys(file)).map(({ name, scope }) => ({ name, scope }));
+	if (flags.json) {
+		process.stdout.write(`${JSON.stringify({ path: file, keys })}\n`);
+		return;
+	}
+	if (keys.length === 0) {
+		process.stdout.write(`No named API keys in ${file}. Create one with \`omp auth-gateway token --name <name>\`.\n`);
+		return;
+	}
+	const width = Math.max(...keys.map(key => key.name.length));
+	process.stdout.write(`${keys.map(key => `${key.name.padEnd(width)}  ${key.scope}`).join("\n")}\n`);
+}
+
 async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	const token = await readTokenFile(getTokenFilePath());
+	const apiKeysFile = getGatewayApiKeysFilePath();
+	const apiKeyCount = (await readGatewayApiKeys(apiKeysFile)).length;
+	const apiKeysLine = `api keys: ${apiKeyCount} named in ${apiKeysFile}\n`;
 	const brokerConfig = await resolveAuthBrokerConfig();
 	const tokenFile = getTokenFilePath();
 	if (!brokerConfig) {
@@ -443,6 +567,7 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 			reason: "not_configured",
 			tokenFile,
 			tokenPresent: token !== null,
+			apiKeyCount,
 			broker: null,
 			brokerConfigured: false,
 			brokerAuthenticated: false,
@@ -454,6 +579,7 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 			process.stdout.write(
 				`token: ${status.tokenPresent ? chalk.green("present") : chalk.red("missing")} at ${status.tokenFile}\n`,
 			);
+			process.stdout.write(apiKeysLine);
 		}
 		process.exitCode = 1;
 		return;
@@ -467,6 +593,7 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 			reason: tokenPresent ? null : "token_missing",
 			tokenFile,
 			tokenPresent,
+			apiKeyCount,
 			broker: brokerConfig.url,
 			brokerConfigured: true,
 			brokerAuthenticated: true,
@@ -482,6 +609,7 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 			process.stdout.write(
 				`token: ${tokenPresent ? chalk.green("present") : chalk.red("missing")} at ${status.tokenFile}\n`,
 			);
+			process.stdout.write(apiKeysLine);
 			if (!tokenPresent) {
 				process.stdout.write(
 					"Run `omp auth-gateway token` or `omp auth-gateway serve` to create a bearer token.\n",
@@ -496,6 +624,7 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 			reason: "broker_unavailable",
 			tokenFile,
 			tokenPresent: token !== null,
+			apiKeyCount,
 			broker: brokerConfig.url,
 			brokerConfigured: true,
 			brokerAuthenticated: false,
@@ -508,6 +637,7 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 			process.stdout.write(
 				`token: ${status.tokenPresent ? chalk.green("present") : chalk.red("missing")} at ${status.tokenFile}\n`,
 			);
+			process.stdout.write(apiKeysLine);
 		}
 		process.exitCode = 1;
 	}
@@ -523,6 +653,9 @@ export async function runAuthGatewayCommand(cmd: AuthGatewayCommandArgs): Promis
 			return;
 		case "token":
 			await runToken(cmd.flags);
+			return;
+		case "keys":
+			await runKeys(cmd.flags);
 			return;
 		case "status":
 			await runStatus(cmd.flags);

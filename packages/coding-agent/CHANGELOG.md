@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `omp auth-gateway token --name <key> [--scope inference|full] [--regenerate|--revoke]` and `omp auth-gateway keys` provision named gateway API keys in `<config-dir>/auth-gateway.keys`; `serve` reloads the file every 10 s, so new, rotated, re-scoped, and revoked keys apply without a restart, and `omp usage clients` reports burn per key.
+
 ### Changed
 
 - Integrated fullscreen history with the shared transcript-block and Composer interfaces, retaining bounded block paging independently of native scrollback retirement.

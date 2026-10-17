@@ -13,6 +13,7 @@
 
 - Added image support for native OpenAI Decisions and Workers AI judgments, prompted vision chat, and auth-gateway System One requests; images exceeding a judgment API's documented caps (e.g. Clef's 4 images, 4 MiB each) are rejected locally ([#15471](https://github.com/can1357/oh-my-pi/pull/15471) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy)).
 - `isSurvivingAssistant` in `providers/transform-messages`: whether an assistant turn reaches a replay, malformed tool calls dropped first, so callers outside `transformMessages` pick the same latest turn ([#15791](https://github.com/can1357/oh-my-pi/pull/15791) by [@will-bogusz](https://github.com/will-bogusz))
+- Auth-gateway named API keys (`AuthGatewayServerOptions.apiKeys`): each key is accepted as `Authorization: Bearer` or `x-api-key`, re-read per request, attributes its usage to `gateway-key:<name>` regardless of client `x-omp-*` headers, and carries a scope — `inference` keys reach only inference routes and `/v1/models` (allow-listed, so new routes stay closed), `full` keys reach every route. The unnamed bearer tokens are now also accepted as `x-api-key`, so Claude Code's `ANTHROPIC_API_KEY` works against the gateway.
 
 ### Fixed
 

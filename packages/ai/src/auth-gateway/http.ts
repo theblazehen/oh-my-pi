@@ -9,6 +9,7 @@ import * as os from "node:os";
 import { getInstallId } from "@oh-my-pi/pi-utils";
 import type { Api, Model } from "../types";
 import type { ClientUsageIdentity } from "../usage";
+import type { AuthGatewayApiKey, AuthGatewayApiKeyScope } from "./types";
 
 const JSON_HEADERS = {
 	"Content-Type": "application/json",
@@ -67,12 +68,17 @@ function decodeUrlLeniently(location: string): string {
 }
 
 /** Keep configured gateway credentials out of URL and forwarded/logged request fields. */
-export function hasMisplacedBearer(req: Request, url: URL, tokens: ReadonlySet<string>): boolean {
-	if (tokens.size === 0) return false;
+export function hasMisplacedBearer(
+	req: Request,
+	url: URL,
+	tokens: ReadonlySet<string>,
+	apiKeys: readonly AuthGatewayApiKey[] = [],
+): boolean {
+	if (tokens.size === 0 && apiKeys.length === 0) return false;
 	const location = url.pathname + url.search;
 	const decodedLocation = decodeUrlLeniently(location);
 	const headers = req.headers;
-	for (const token of tokens) {
+	const misplaced = (token: string): boolean => {
 		if (location.includes(token) || decodedLocation.includes(token)) return true;
 		for (const [name, value] of headers) {
 			if (
@@ -87,6 +93,13 @@ export function hasMisplacedBearer(req: Request, url: URL, tokens: ReadonlySet<s
 				return true;
 			}
 		}
+		return false;
+	};
+	for (const token of tokens) {
+		if (misplaced(token)) return true;
+	}
+	for (const key of apiKeys) {
+		if (misplaced(key.token)) return true;
 	}
 	return false;
 }
@@ -113,22 +126,72 @@ export function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 const TOKEN_ENCODER = new TextEncoder();
 
-export function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean {
-	if (tokens.size === 0) return true;
-	const header = req.headers.get("authorization");
-	if (!header) return false;
-	const match = header.match(/^Bearer\s+(.+)$/i);
-	if (!match) return false;
-	const presented = TOKEN_ENCODER.encode(match[1].trim());
-	// Iterate every allowed token regardless of early hits so the result
-	// timing reflects the full set, not the position of the match.
-	let ok = false;
-	for (const tok of tokens) {
-		const expected = TOKEN_ENCODER.encode(tok);
-		if (timingSafeEqual(presented, expected)) ok = true;
-	}
-	return ok;
+/**
+ * Gateway credentials a request presents: `Authorization: Bearer <token>`
+ * (OpenAI SDKs, Claude Code's `ANTHROPIC_AUTH_TOKEN`) and `x-api-key: <token>`
+ * (Anthropic SDKs, Claude Code's `ANTHROPIC_API_KEY`).
+ */
+function presentedGatewayCredentials(headers: Headers): string[] {
+	const presented: string[] = [];
+	const bearer = headers
+		.get("authorization")
+		?.match(/^Bearer\s+(.+)$/i)?.[1]
+		.trim();
+	if (bearer) presented.push(bearer);
+	const apiKey = headers.get("x-api-key")?.trim();
+	if (apiKey) presented.push(apiKey);
+	return presented;
 }
+
+/**
+ * An admitted request: `apiKeyName` names the {@link AuthGatewayApiKey} that
+ * matched, and `scope` bounds the routes it may call. Unnamed bearer tokens
+ * and an unauthenticated gateway reach every route.
+ */
+export interface GatewayAdmission {
+	apiKeyName?: string;
+	scope: AuthGatewayApiKeyScope;
+}
+
+/**
+ * Admit a request presenting one of the unnamed bearer `tokens` or a named API
+ * key. Returns `undefined` when credentials are configured and none matched;
+ * with neither configured every request is admitted. A matching named key
+ * wins over an unnamed token presented alongside it, so its narrower scope
+ * applies. Every presented value is compared against every configured
+ * credential so the timing reflects the full set, not the position of a match.
+ */
+export function admitGatewayRequest(
+	req: Request,
+	tokens: ReadonlySet<string>,
+	apiKeys: readonly AuthGatewayApiKey[],
+): GatewayAdmission | undefined {
+	if (tokens.size === 0 && apiKeys.length === 0) return { scope: "full" };
+	let unnamedMatch = false;
+	let namedMatch: AuthGatewayApiKey | undefined;
+	for (const value of presentedGatewayCredentials(req.headers)) {
+		const presented = TOKEN_ENCODER.encode(value);
+		for (const tok of tokens) {
+			if (timingSafeEqual(presented, TOKEN_ENCODER.encode(tok))) unnamedMatch = true;
+		}
+		for (const key of apiKeys) {
+			if (timingSafeEqual(presented, TOKEN_ENCODER.encode(key.token))) namedMatch ??= key;
+		}
+	}
+	if (namedMatch) return { apiKeyName: namedMatch.name, scope: namedMatch.scope };
+	return unnamedMatch ? { scope: "full" } : undefined;
+}
+
+/** Named API key that admitted each in-flight request, recorded by the HTTP transport. */
+const admittedApiKeyNames = new WeakMap<Request, string>();
+
+/** Attribute the usage `req` burns to the named API key that admitted it. */
+export function bindAdmittedApiKey(req: Request, apiKeyName: string): void {
+	admittedApiKeyNames.set(req, apiKeyName);
+}
+
+/** Install-id prefix under which named API keys appear in per-client usage. */
+export const GATEWAY_API_KEY_INSTALL_PREFIX = "gateway-key:";
 
 /**
  * Allow-list of inbound request headers that the gateway captures and forwards
@@ -178,26 +241,33 @@ export function captureRequestHeaders(headers: Headers): Record<string, string> 
 /**
  * Resolve the usage-attribution identity for an inbound gateway request.
  *
- * pi-native omp clients send `x-omp-install-id` / `x-omp-hostname` /
- * `x-omp-app` (see `providers/pi-native-client.ts`); any client may set them.
- * Requests without an install id fall back to the gateway host's identity
- * under the `gateway` app label, so unlabeled foreign-SDK traffic (llm-git,
- * openai/anthropic SDKs) still lands in per-client burn tracking instead of
- * vanishing. These headers are attribution-only — they are deliberately
- * absent from {@link captureRequestHeaders}'s allow-list and never reach the
- * upstream provider.
+ * A request a named API key admitted (see {@link bindAdmittedApiKey}) is
+ * attributed to that key — `gateway-key:<name>` — whatever identity headers it
+ * sends; only its `x-omp-app` label is kept. Otherwise pi-native omp clients
+ * send `x-omp-install-id` / `x-omp-hostname` / `x-omp-app` (see
+ * `providers/pi-native-client.ts`); any client may set them. Requests without
+ * an install id fall back to the gateway host's identity under the `gateway`
+ * app label, so unlabeled foreign-SDK traffic (llm-git, openai/anthropic SDKs)
+ * still lands in per-client burn tracking instead of vanishing. These headers
+ * are attribution-only — they are deliberately absent from
+ * {@link captureRequestHeaders}'s allow-list and never reach the upstream
+ * provider.
  */
-export function resolveClientIdentity(headers: Headers): ClientUsageIdentity {
+export function resolveClientIdentity(req: Request): ClientUsageIdentity {
 	const read = (name: string): string | undefined => {
-		const value = headers.get(name)?.trim();
+		const value = req.headers.get(name)?.trim();
 		return value ? value : undefined;
 	};
-	const installId = read("x-omp-install-id");
-	const app = read("x-omp-app");
-	if (!installId) {
-		return { installId: getInstallId(), hostname: os.hostname(), app: app ?? "gateway" };
+	const app = read("x-omp-app") ?? "gateway";
+	const apiKeyName = admittedApiKeyNames.get(req);
+	if (apiKeyName !== undefined) {
+		return { installId: `${GATEWAY_API_KEY_INSTALL_PREFIX}${apiKeyName}`, hostname: apiKeyName, app };
 	}
-	return { installId, hostname: read("x-omp-hostname"), app: app ?? "gateway" };
+	const installId = read("x-omp-install-id");
+	if (!installId) {
+		return { installId: getInstallId(), hostname: os.hostname(), app };
+	}
+	return { installId, hostname: read("x-omp-hostname"), app };
 }
 
 /**

@@ -53,7 +53,7 @@ export async function handleSpeech(bootOpts: AuthGatewayRouteOptions, req: Reque
 		return speechWire.formatError(400, "invalid_request_error", message);
 	}
 
-	const client = resolveClientIdentity(req.headers);
+	const client = resolveClientIdentity(req);
 	const sessionId = deterministicUuid(`speech\u0000${model.provider}/${model.id}`);
 	const apiKey = await resolveGatewayApiKey(bootOpts.storage, model, sessionId, controller.signal, peer);
 	if (controller.signal.aborted) return aborted();

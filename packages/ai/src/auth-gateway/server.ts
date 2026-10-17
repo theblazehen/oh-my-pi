@@ -52,11 +52,12 @@ import {
 	resolveGatewayApiKey,
 } from "./dispatch";
 import {
+	admitGatewayRequest,
+	bindAdmittedApiKey,
 	captureRequestHeaders,
 	corsHeaders,
 	gatewayResponseHeaders,
 	hasMisplacedBearer,
-	isAuthorized,
 	json,
 	resolveClientIdentity,
 	withCors,
@@ -297,7 +298,7 @@ async function handleFormatEndpoint(
 	}
 	const kindRejection = chatRouteRejection(model);
 	if (kindRejection) return route.module.formatError(400, "invalid_request_error", kindRejection);
-	const client = resolveClientIdentity(req.headers);
+	const client = resolveClientIdentity(req);
 
 	// Parse the wire-format request BEFORE resolving the credential so we
 	// have a stable per-conversation `sessionId` to thread into AuthStorage.
@@ -542,7 +543,7 @@ async function handlePiNative(
 	}
 	const kindRejection = chatRouteRejection(model);
 	if (kindRejection) return piNative.formatError(400, "invalid_request_error", kindRejection);
-	const client = resolveClientIdentity(req.headers);
+	const client = resolveClientIdentity(req);
 	// Pi-native already parsed `streamOpts.sessionId` (when set by the
 	// client); fall back to the derived key so credential-stickiness lines
 	// up with cache-prefix stickiness — same identity used for both means
@@ -804,6 +805,30 @@ const LOGGABLE_PATHS: Record<string, true> = {
 	"/v1/models": true,
 };
 
+/**
+ * Routes an `inference`-scoped API key may call (the router still matches
+ * methods). An allow-list, so a route added later — including any that reports
+ * account usage or identity — stays closed to inference keys until it is
+ * listed here. Video job polling ({@link VIDEO_JOB_PATH}) is allowed separately.
+ */
+const INFERENCE_SCOPE_PATHS: Record<string, true> = {
+	"/v1/chat/completions": true,
+	"/v1/messages": true,
+	"/v1/responses": true,
+	"/v1/pi/stream": true,
+	"/v1/systemone": true,
+	"/alpha/decisions": true,
+	"/v1/images/generations": true,
+	"/v1/images": true,
+	"/v1/images/edits": true,
+	"/v1/audio/speech": true,
+	"/v1/audio/transcriptions": true,
+	"/v1/embeddings": true,
+	"/v1/rerank": true,
+	"/v1/videos": true,
+	"/v1/models": true,
+};
+
 /** Only static routes reach logs verbatim; dynamic or unknown paths may carry caller-supplied secrets. */
 function loggablePath(pathname: string): string {
 	return Object.hasOwn(FORMAT_ROUTES, pathname) || Object.hasOwn(LOGGABLE_PATHS, pathname) ? pathname : "<unrouted>";
@@ -928,6 +953,7 @@ export function createAuthGatewayRouter(opts: AuthGatewayRouteOptions): AuthGate
 export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServerHandle {
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_GATEWAY_BIND);
 	const tokens = new Set<string>(opts.bearerTokens);
+	const apiKeys = opts.apiKeys;
 	const version = opts.version;
 	const router = createAuthGatewayRouter(opts);
 
@@ -947,7 +973,9 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 			if (req.method === "GET" && pathname === "/healthz") {
 				return withCors(json(200, { ok: true, version }), req);
 			}
-			if (!isAuthorized(req, tokens)) {
+			const keys = apiKeys?.() ?? [];
+			const admission = admitGatewayRequest(req, tokens, keys);
+			if (!admission) {
 				logger.info("auth-gateway request unauthorized", {
 					method: req.method,
 					path: loggablePath(pathname),
@@ -955,9 +983,17 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 				});
 				return withCors(json(401, { error: "unauthorized" }), req);
 			}
-			if (hasMisplacedBearer(req, url, tokens)) {
-				return withCors(json(400, { error: "gateway bearer token outside Authorization" }), req);
+			if (hasMisplacedBearer(req, url, tokens, keys)) {
+				return withCors(json(400, { error: "gateway credential outside Authorization or x-api-key" }), req);
 			}
+			if (
+				admission.scope === "inference" &&
+				!Object.hasOwn(INFERENCE_SCOPE_PATHS, pathname) &&
+				!VIDEO_JOB_PATH.test(pathname)
+			) {
+				return withCors(json(403, { error: "this API key is limited to inference routes" }), req);
+			}
+			if (admission.apiKeyName !== undefined) bindAdmittedApiKey(req, admission.apiKeyName);
 			const peer = resolvePeer(req, socketPeer, opts.trustProxyHeaders);
 			return withCors(await router.route(req, peer), req);
 		},

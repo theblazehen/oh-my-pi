@@ -6,7 +6,7 @@ The auth broker centralizes credential storage and OAuth refreshes. The auth gat
 - **`omp auth-gateway serve`** is a forward-proxy. It accepts OpenAI Chat Completions, Anthropic Messages, OpenAI Responses, pi-native stream, TypeSafe System One judgment, and OpenAI/OpenRouter-style image, speech, transcription, embedding, rerank, and video requests, resolves the broker-backed credential, and dispatches through `pi-ai` provider logic. Clients (containerised omp, llm-git, the macOS usage widget, …) never see the access token.
 - **`omp auth-gateway stdio`** serves the same routes to its parent process as JSON lines on stdin/stdout, on the CLI's own credentials and model roles; see [stdio](#stdio).
 
-Transport security between operator, broker, and gateway is delegated to the operator (Tailscale / Wireguard / reverse proxy + TLS). Every endpoint except `/v1/healthz` (broker) and `/healthz` (gateway) requires a bearer token by default. The gateway also answers CORS `OPTIONS` preflights without authentication; `--no-auth` disables inbound gateway authentication.
+Transport security between operator, broker, and gateway is delegated to the operator (Tailscale / Wireguard / reverse proxy + TLS). Every endpoint except `/v1/healthz` (broker) and `/healthz` (gateway) requires a bearer token by default. The gateway also accepts [named API keys](#named-api-keys), as `Authorization: Bearer` or `x-api-key`, each scoped and attributed separately. It answers CORS `OPTIONS` preflights without authentication; `--no-auth` disables inbound gateway authentication.
 
 Source: `packages/ai/src/auth-broker/`, `packages/ai/src/auth-gateway/`, `packages/ai/src/auth/`, `packages/coding-agent/src/cli/auth-broker-cli.ts`, `packages/coding-agent/src/cli/auth-gateway-cli.ts`, `packages/coding-agent/src/cli/auth-gateway-stdio.ts`, `packages/coding-agent/src/session/auth-broker-config.ts`.
 
@@ -153,14 +153,34 @@ The CLI broker refresh hook also handles managed `mcp_oauth:*` credentials using
 omp auth-gateway serve   [--bind=host:port] [--no-auth] [--trust-proxy-headers]
 omp auth-gateway stdio
 omp auth-gateway token   [--regenerate] [--json]
+omp auth-gateway token   --name=<key> [--scope=inference|full] [--regenerate | --revoke] [--json]
+omp auth-gateway keys    [--json]
 omp auth-gateway status  [--json]
 omp auth-gateway check   [--strict] [--json]
 ```
 
 - `serve` requires `OMP_AUTH_BROKER_URL` (or `auth.broker.url` in `config.yml`) — the gateway is itself a broker client. It fetches a live snapshot, wraps it in `RemoteAuthCredentialStore`, and constructs `AuthStorage` with the configured account pool and account policies. Unlike normal client discovery, gateway startup does not use the encrypted snapshot cache. Default bind is `127.0.0.1:4000`. The gateway token is stored at `<config-dir>/auth-gateway.token` (`0600`); `--no-auth` disables the bearer check entirely. Use that flag only on trusted loopback listeners; it does not enforce a loopback bind.
-- Logs attribute requests to the socket peer address. Behind a trusted reverse proxy, pass `--trust-proxy-headers` to use `X-Forwarded-For` / `X-Real-IP` for authenticated requests; unauthorized requests are always logged with the socket peer. An authenticated request that also carries the gateway token in its URL or in a forwarded, logged, or identity header is rejected with `400` before any credential lookup.
-- `token` manages the token file; `--regenerate` requires a running gateway to restart before accepting the replacement. `status` checks the local token file and an authenticated broker snapshot; it does not probe the gateway listener.
+- Logs attribute requests to the socket peer address. Behind a trusted reverse proxy, pass `--trust-proxy-headers` to use `X-Forwarded-For` / `X-Real-IP` for authenticated requests; unauthorized requests are always logged with the socket peer. An authenticated request that also carries the gateway token or a named API key in its URL or in a forwarded, logged, or identity header is rejected with `400` before any credential lookup.
+- `token` manages the unnamed operator token file; `--regenerate` requires a running gateway to restart before accepting the replacement. `token --name` and `keys` manage [named API keys](#named-api-keys). `status` checks the local token file, counts named keys, and checks an authenticated broker snapshot; it does not probe the gateway listener.
 - `check` constructs its own broker-backed store and probes the credentials the gateway would use, without calling a running gateway. Without `--strict` it uses provider usage probes. `--strict` additionally tries suitable bundled chat models and can consume quota; providers with no suitable candidate (including pi-native forwarding, Bedrock, Vertex, and Cursor transports) cannot be completion-probed.
+
+### Named API keys
+
+Named API keys let one gateway serve several clients, each with its own key, scope, and usage ledger. They live in `<config-dir>/auth-gateway.keys` (mode `0600`) as a JSON object mapping each name (1–64 letters, digits, `.`, `_`, `-`) to `{ "token": "…", "scope": "inference" | "full" }`; a missing `scope` means `inference`. Tokens must be distinct.
+
+```
+omp auth-gateway token --name laptop                    # print laptop's key, creating it (scope inference) on first use
+omp auth-gateway token --name widget --scope full       # create or re-scope a full-access key
+omp auth-gateway token --name laptop --regenerate       # rotate
+omp auth-gateway token --name laptop --revoke           # remove
+omp auth-gateway keys                                   # names and scopes, never tokens
+```
+
+- **Presenting a key.** Clients send it as `Authorization: Bearer <key>` (OpenAI SDKs, Claude Code's `ANTHROPIC_AUTH_TOKEN`) or `x-api-key: <key>` (Anthropic SDKs, Claude Code's `ANTHROPIC_API_KEY`). The unnamed operator token is accepted the same way.
+- **Scope.** An `inference` key reaches only the inference routes and `/v1/models`; every other route — `/v1/usage` and `/v1/credentials/check`, which report account identities and usage, and any route the gateway adds later — answers `403`. A `full` key and the unnamed operator token reach every route.
+- **Attribution.** Usage from a request a named key admitted is recorded under install id `gateway-key:<name>` with hostname `<name>`, whatever `x-omp-*` identity headers the client sends (its `x-omp-app` label is kept). `omp usage clients` therefore reports per-key burn.
+- **Live reload.** `serve` re-reads the keys file every 10 s, so new, rotated, re-scoped, and revoked keys apply without a restart. Writes are atomic; a malformed file is logged and the previous key set stays in force. `--no-auth` ignores the file.
+- **What scope does not cover.** Inference responses carry no account identity from the gateway itself, but upstream provider error text is relayed as-is and can name provider-side identifiers (for example a Google Cloud project number).
 
 ### stdio
 
@@ -213,7 +233,7 @@ The served catalog includes bundled, cached, and broker-discovered models. The g
 
 Live OpenRouter discovery covers image and Decisions rosters, `/embeddings/models`, `/videos/models`, and rerank-flagged `/models` rows. Speech/transcription models use catalog kinds and seeds. Bundled fallbacks and `kind-apis` runner mappings are authored in `packages/catalog/src/compat/rules/providers/openrouter.kdl`. Per-search, per-second, and per-character billing have no catalog cost axis, so those rows carry zero token cost and the provider-reported `cost` in the response is authoritative.
 
-Inference routes record observed usage against `x-omp-install-id`, `x-omp-hostname`, and `x-omp-app`; unlabeled requests fall back to the gateway host's identity. These attribution headers are not forwarded upstream. Completed non-streaming responses carry computed cost in `x-litellm-response-cost` when known; streaming chat responses send headers before usage arrives and do not include that cost header. Video cost may become available only while polling. Upstreams that report tokens only (TypeSafe) are priced from the catalog model; the response body's own `cost` field (OpenRouter shape) is only present when the upstream billed one.
+Inference routes record observed usage against the admitting named API key (see [Named API keys](#named-api-keys)); otherwise against `x-omp-install-id`, `x-omp-hostname`, and `x-omp-app`, and unlabeled requests fall back to the gateway host's identity. These attribution headers are not forwarded upstream. Completed non-streaming responses carry computed cost in `x-litellm-response-cost` when known; streaming chat responses send headers before usage arrives and do not include that cost header. Video cost may become available only while polling. Upstreams that report tokens only (TypeSafe) are priced from the catalog model; the response body's own `cost` field (OpenRouter shape) is only present when the upstream billed one.
 
 TypeSafe clients using the default base-URL resolver can set `TYPESAFE_BASE_URL=http://gateway:4000` with `TYPESAFE_API_KEY=<gateway token>`. omp's catalog-backed `judge` role passes the model's explicit `baseUrl`, which takes precedence over that environment fallback; configure the TypeSafe provider's `baseUrl` and `apiKey` in `models.yml` to use the gateway. OpenAI-SDK-style clients use `http://gateway:4000/v1`.
 

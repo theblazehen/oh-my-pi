@@ -145,11 +145,32 @@ export interface AuthGatewayFormatModule {
 	formatError(status: number, type: string, message: string): Response;
 }
 
+/**
+ * What a gateway API key may call. `inference` reaches only the inference
+ * routes and `/v1/models` — never account usage, credential health, or any
+ * other route that identifies the broker's accounts. `full` reaches every route.
+ */
+export type AuthGatewayApiKeyScope = "inference" | "full";
+
+/** A named gateway API key: usage from the requests it admits is attributed to `name`. */
+export interface AuthGatewayApiKey {
+	name: string;
+	token: string;
+	scope: AuthGatewayApiKeyScope;
+}
+
 export interface AuthGatewayServerOptions {
 	/** Listen address. Default `127.0.0.1:4000`. */
 	bind?: string;
-	/** Accept any of these bearer tokens. Empty allows unauthenticated calls. */
+	/** Accept any of these unnamed bearer tokens. With no `apiKeys` either, every request is admitted. */
 	bearerTokens: string[];
+	/**
+	 * Named API keys, accepted like `bearerTokens` (as `Authorization: Bearer` or
+	 * `x-api-key`). Read on every request, so a reloaded set applies without a
+	 * restart. Usage from a request a named key admitted is attributed to that
+	 * key instead of the caller's `x-omp-*` identity headers.
+	 */
+	apiKeys?: () => readonly AuthGatewayApiKey[];
 	/** Honor forwarded peer headers only when the connecting proxy is trusted. Default false. */
 	trustProxyHeaders?: boolean;
 	/** Version surfaced on `/healthz`. */

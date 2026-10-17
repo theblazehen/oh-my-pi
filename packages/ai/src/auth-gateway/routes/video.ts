@@ -108,7 +108,7 @@ function recordCompletedUsage(
 		model: resolved.model.id,
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		costUsd: job.usage.cost.total,
-		client: resolveClientIdentity(req.headers),
+		client: resolveClientIdentity(req),
 	});
 }
 
