@@ -337,13 +337,7 @@ export interface ToolSession {
 	 */
 	sessionManager?: Pick<
 		SessionManager,
-		| "appendCustomEntry"
-		| "ensureOnDisk"
-		| "flush"
-		| "getBranch"
-		| "getBranchAsync"
-		| "getEntries"
-		| "getAllEntries"
+		"appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getBranchAsync" | "getEntries" | "getAllEntries"
 	> &
 		Partial<Pick<SessionManager, "getSessionId" | "getLeafId" | "appendModelUsage">>;
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */
