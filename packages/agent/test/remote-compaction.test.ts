@@ -17,11 +17,13 @@ import {
 	countResponsesHistoryTokens,
 	getCompactionV2PreserveData,
 	requestCompactionV2Streaming,
+	REMOTE_COMPACTION_TIMEOUT_MS,
 	requestOpenAiRemoteCompaction,
 	requestRemoteCompaction,
 	shouldUseCompactionV2Streaming,
 	shouldUseOpenAiRemoteCompaction,
 	trimRemoteCompactionInputToContextWindow,
+	V2_COMPACTION_TIMEOUT_MS,
 } from "@oh-my-pi/pi-agent-core/compaction/openai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { NO_AUTH_SENTINEL } from "@oh-my-pi/pi-ai/auth-retry";
@@ -1210,7 +1212,7 @@ describe("requestCompactionV2Streaming", () => {
 		expect(clientMetadata?.["x-codex-installation-id"]).toBe(TEST_INSTALLATION_ID);
 	});
 
-	test("keeps the 180-second timeout for direct helper callers", async () => {
+	test("keeps the library timeout for direct helper callers", async () => {
 		const timeoutSignal = new AbortController().signal;
 		const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeoutSignal);
 		const model = makeOpenAiModel({
@@ -1243,7 +1245,7 @@ describe("requestCompactionV2Streaming", () => {
 		await requestCompactionV2Streaming(model, "test-key", request, undefined, { fetch: fetchMock });
 
 		expect(timeoutSpy).toHaveBeenCalledTimes(1);
-		expect(timeoutSpy).toHaveBeenCalledWith(180_000);
+		expect(timeoutSpy).toHaveBeenCalledWith(V2_COMPACTION_TIMEOUT_MS);
 	});
 
 	test("retries transient V2 stream failures with a fresh request attempt", async () => {
@@ -2161,7 +2163,7 @@ describe("requestOpenAiRemoteCompaction abort", () => {
 });
 
 describe("requestOpenAiRemoteCompaction timeout", () => {
-	test("keeps the 180-second timeout for direct helper callers", async () => {
+	test("keeps the library timeout for direct helper callers", async () => {
 		const timeoutSignal = new AbortController().signal;
 		const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeoutSignal);
 		const fetchMock: FetchImpl = async (_input, init) => {
@@ -2179,7 +2181,7 @@ describe("requestOpenAiRemoteCompaction timeout", () => {
 		);
 
 		expect(timeoutSpy).toHaveBeenCalledTimes(1);
-		expect(timeoutSpy).toHaveBeenCalledWith(180_000);
+		expect(timeoutSpy).toHaveBeenCalledWith(REMOTE_COMPACTION_TIMEOUT_MS);
 	});
 
 	test("a never-responding endpoint rejects with TimeoutError instead of hanging", async () => {
