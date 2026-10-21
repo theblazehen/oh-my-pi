@@ -126,19 +126,24 @@ export function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
 
 const TOKEN_ENCODER = new TextEncoder();
 
+/** The token of an `Authorization: Bearer <token>` header, trimmed; `undefined` without one. */
+export function readBearerToken(req: Request): string | undefined {
+	const header = req.headers.get("authorization");
+	if (!header) return undefined;
+	const match = header.match(/^Bearer\s+(.+)$/i);
+	return match ? match[1].trim() : undefined;
+}
+
 /**
  * Gateway credentials a request presents: `Authorization: Bearer <token>`
  * (OpenAI SDKs, Claude Code's `ANTHROPIC_AUTH_TOKEN`) and `x-api-key: <token>`
  * (Anthropic SDKs, Claude Code's `ANTHROPIC_API_KEY`).
  */
-function presentedGatewayCredentials(headers: Headers): string[] {
+function presentedGatewayCredentials(req: Request): string[] {
 	const presented: string[] = [];
-	const bearer = headers
-		.get("authorization")
-		?.match(/^Bearer\s+(.+)$/i)?.[1]
-		.trim();
+	const bearer = readBearerToken(req);
 	if (bearer) presented.push(bearer);
-	const apiKey = headers.get("x-api-key")?.trim();
+	const apiKey = req.headers.get("x-api-key")?.trim();
 	if (apiKey) presented.push(apiKey);
 	return presented;
 }
@@ -169,7 +174,7 @@ export function admitGatewayRequest(
 	if (tokens.size === 0 && apiKeys.length === 0) return { scope: "full" };
 	let unnamedMatch = false;
 	let namedMatch: AuthGatewayApiKey | undefined;
-	for (const value of presentedGatewayCredentials(req.headers)) {
+	for (const value of presentedGatewayCredentials(req)) {
 		const presented = TOKEN_ENCODER.encode(value);
 		for (const tok of tokens) {
 			if (timingSafeEqual(presented, TOKEN_ENCODER.encode(tok))) unnamedMatch = true;

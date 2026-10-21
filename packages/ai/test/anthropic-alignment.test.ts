@@ -37,6 +37,7 @@ import type {
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 import { withEnv, withOfficialAnthropicEndpoint } from "./helpers";
+import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
 
 const ANTHROPIC_MODEL_SPEC: ModelSpec<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -3095,14 +3096,14 @@ describe("Anthropic request fingerprint alignment", () => {
 });
 
 describe("cch attestation", () => {
-	it("wrapFetchForCch: replaces cch=00000 with correct XXHash64 in outgoing request body", async () => {
+	it("wrapFetchForCch: patches cch over the uncompressed body before the transport gzips it", async () => {
 		const { promise: bodyPromise, resolve: bodyResolve } = Promise.withResolvers<string>();
 		const controller = new AbortController();
 
+		let gzipped = false;
 		const fakeFetch = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-			const raw = init?.body;
-			const body = typeof raw === "string" ? raw : new TextDecoder().decode(raw as Uint8Array);
-			bodyResolve(body);
+			gzipped = new Headers(init?.headers).get("content-encoding") === "gzip";
+			bodyResolve(requestBodyText(init) ?? "");
 			controller.abort();
 			return new Response('event: message_stop\ndata: {"type":"message_stop"}\n\n', {
 				status: 200,
@@ -3114,12 +3115,14 @@ describe("cch attestation", () => {
 			ANTHROPIC_MODEL,
 			{
 				systemPrompt: ["Be helpful."],
-				messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
+				// Above the gzip floor, so the official-API request is compressed.
+				messages: [{ role: "user", content: "hello ".repeat(500), timestamp: Date.now() }],
 			},
 			{ apiKey: "sk-ant-oat-test", isOAuth: true, signal: controller.signal, fetch: fakeFetch },
 		);
 
 		const capturedBody = await bodyPromise;
+		expect(gzipped).toBe(true);
 
 		// The placeholder must have been replaced before the request was sent.
 		expect(capturedBody).toContain("cch=");

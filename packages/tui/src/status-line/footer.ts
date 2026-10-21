@@ -176,6 +176,9 @@ export class FooterComponent implements Component {
 	 */
 	describe(): NativeNode {
 		const state = this.session.state;
+		// Cumulative usage: the session manager's running rollup spans every entry
+		// in the session (so it survives compaction) and already folds in the usage
+		// completed `task` tool results carry, which is where subagent spend lands.
 		const { input, output, cacheRead, cacheWrite, cost, premiumRequests } =
 			this.session.sessionManager.getUsageStatistics();
 		const segs: NativeNode[] = [];
@@ -241,7 +244,11 @@ export class FooterComponent implements Component {
 	render(width: number): readonly string[] {
 		const state = this.session.state;
 
-		// Calculate cumulative usage across the full session, including cold history.
+		// Cumulative usage comes from the session manager's running rollup, which
+		// spans every entry in the session and folds in the usage completed `task`
+		// tool results carry (subagent spend). Context usage below is a separate
+		// question and stays window-scoped on purpose. Destructured straight off the
+		// rollup: a repaint must not allocate a second copy of these six fields.
 		const {
 			input: totalInput,
 			output: totalOutput,
@@ -250,7 +257,6 @@ export class FooterComponent implements Component {
 			cost: totalCost,
 			premiumRequests: totalPremiumRequests,
 		} = this.session.sessionManager.getUsageStatistics();
-
 		// Calculate context usage from session (handles compaction correctly).
 		// After compaction, tokens are unknown until the next LLM response.
 		const contextUsage = this.session.getContextUsage();

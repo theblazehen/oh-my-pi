@@ -925,8 +925,8 @@ describe("queued user delivery policy", () => {
 		);
 		const prepare = agent.prepareQueuedMessages;
 		if (!prepare) throw new Error("Session queue preparation was not installed");
-		agent.prepareQueuedMessages = async (messages, signal) => {
-			const preparation = await prepare(messages, signal);
+		agent.prepareQueuedMessages = async (messages, signal, queue) => {
+			const preparation = await prepare(messages, signal, queue);
 			await session.setActiveToolsByName(["new_tool"]);
 			return preparation;
 		};

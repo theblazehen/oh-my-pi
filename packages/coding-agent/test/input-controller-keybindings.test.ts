@@ -120,6 +120,7 @@ async function createContext() {
 		abort,
 		getPrewalkState,
 		retry,
+		prewarmModelConnection: vi.fn(),
 	};
 	const updatePendingMessagesDisplay = vi.fn();
 	const handleBtwBranchKey = vi.fn(async () => true);

@@ -2029,7 +2029,7 @@ export class CommandController {
 		}
 		this.ctx.rebuildChatFromMessages();
 		this.ctx.statusLine.invalidate();
-		this.ctx.ui.requestRender();
+		this.ctx.ui.requestRender(true, { clearScrollback: true });
 		this.ctx.showStatus(formatShakeSummary(result));
 	}
 

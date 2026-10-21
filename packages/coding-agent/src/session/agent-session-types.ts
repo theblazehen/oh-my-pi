@@ -43,6 +43,7 @@ import type { Skill, SkillWarning } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import type { JobWidgetView } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { ToolSession } from "../tools";
 import type { XdevState } from "../tools/xdev";
 import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
@@ -95,6 +96,8 @@ export interface AsyncJobInspection {
 	output?: string;
 	/** Artifact holding the full output when `output` is cut. */
 	artifactId?: string;
+	/** The job's live widget (frozen once it settles). */
+	widget?: JobWidgetView;
 }
 
 /** Snapshot of running, recent, and pending-delivery asynchronous jobs. */
@@ -213,6 +216,8 @@ export interface AgentSessionConfig {
 	unexpectedStopJudgeTimeoutMs?: number;
 	/** Prewalk from the starting model to a fast/cheap target after implementation begins. */
 	prewalk?: Prewalk;
+	/** Keep `prewalk.auto` away from this session until `/new` (`--no-prewalk`). */
+	suppressAutoPrewalk?: boolean;
 	/** Force read-only plan mode at start, auto-approve, then switch to the target. */
 	planYolo?: PlanYolo;
 	/** Initial per-family service tiers for the live session. */

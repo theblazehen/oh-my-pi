@@ -20,9 +20,15 @@ import {
 import {
 	type Answer,
 	type AssistantMessage,
+	type BoxEdges,
 	chatTextBackend,
+	checkBoxQuestions,
 	createNativeJudge,
+	type ImageContent,
 	isJudgmentApi,
+	nativeJudgmentAcceptsImages,
+	nativeJudgmentImageBounds,
+	nativeJudgmentSupportsBoxes,
 	nativeJudgmentSupportsImages,
 	type Judge,
 	type JudgeOptions,
@@ -30,6 +36,7 @@ import {
 	type JudgmentResult,
 	type Model,
 	type NativeJudge,
+	type Question,
 	type Questions,
 	type TextBackend,
 	type TextCompletion,
@@ -45,6 +52,7 @@ import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import { normalizeModelContextImages } from "../utils/image-loading";
+import { type FittedImage, fitImage } from "../utils/image-resize";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelStringWithRouting, resolveRoleChain, type RoleChainCandidate } from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
@@ -156,33 +164,38 @@ interface RegistryWithRejections extends ModelRegistry {
 	[kRoleChain]?: {
 		settings: Settings;
 		revision: number;
+		roleChain: RoleChainCandidate[];
 		list: RoleChainCandidate[];
-		imageList: RoleChainCandidate[];
 		expiresAt: number;
 	};
 }
 
 /**
- * {@link judgeRoleChain}, reused for {@link CANDIDATE_TTL_MS} across judges over the same settings and registry.
- * A settings change (e.g. a new judge role) resolves afresh; registry or credential changes still wait out the TTL,
- * so {@link hasNativeJudge} (uncached) can briefly see a different chain after a login or discovery change.
+ * The resolved `judge` role chain and its text {@link judgeRoleChain}, reused for {@link CANDIDATE_TTL_MS}
+ * across judges over the same settings and registry. A settings change (e.g. a new judge role) resolves
+ * afresh; registry or credential changes still wait out the TTL, so {@link hasNativeJudge} (uncached) can
+ * briefly see a different chain after a login or discovery change.
  */
 function cachedJudgeRoleChain(
 	settings: Settings,
 	registry: RegistryWithRejections,
-	requiresImages = false,
-): RoleChainCandidate[] {
+): { roleChain: RoleChainCandidate[]; list: RoleChainCandidate[] } {
 	const now = Date.now();
 	const revision = settings.revision;
 	const cached = registry[kRoleChain];
 	if (cached && cached.settings === settings && cached.revision === revision && now < cached.expiresAt) {
-		return requiresImages ? cached.imageList : cached.list;
+		return cached;
 	}
 	const roleChain = resolveRoleChain("judge", settings, roleCandidatePool("judge", settings, registry));
-	const list = textJudgeRoleChain(roleChain);
-	const imageList = imageJudgeRoleChain(roleChain);
-	registry[kRoleChain] = { settings, revision, list, imageList, expiresAt: now + CANDIDATE_TTL_MS };
-	return requiresImages ? imageList : list;
+	const entry = {
+		settings,
+		revision,
+		roleChain,
+		list: textJudgeRoleChain(roleChain),
+		expiresAt: now + CANDIDATE_TTL_MS,
+	};
+	registry[kRoleChain] = entry;
+	return entry;
 }
 
 /** Append a compatible session model when no candidate is native and the chain does not already route to it. */
@@ -242,9 +255,84 @@ function textJudgeRoleChain(chain: RoleChainCandidate[]): RoleChainCandidate[] {
 	return chain.filter((candidate, index) => index < firstNative || kindOf(candidate) === "native");
 }
 
-/** Filter image-incompatible candidates before applying the native-only tail policy. */
-function imageJudgeRoleChain(chain: RoleChainCandidate[]): RoleChainCandidate[] {
-	return textJudgeRoleChain(chain.filter(candidate => supportsImageJudgment(candidate.model)));
+/**
+ * Filter candidates that cannot take `images` before applying the native-only tail policy. A native
+ * judge gets each image fitted into its bounds ({@link fitNativeImages}), so only its image support and
+ * count cap decide; prompted chat models normalize images per model, so their image support alone decides.
+ */
+function imageJudgeRoleChain(chain: RoleChainCandidate[], images: readonly ImageContent[]): RoleChainCandidate[] {
+	return textJudgeRoleChain(
+		chain.filter(candidate =>
+			kindOf(candidate) === "native"
+				? nativeTakesImages(candidate.model, images)
+				: supportsImageJudgment(candidate.model),
+		),
+	);
+}
+
+/** Whether native `model` takes `images`: image support within its count cap. Size bounds never decide; {@link fitNativeImages} fits every image into them. */
+function nativeTakesImages(model: Model, images: readonly ImageContent[]): boolean {
+	const bounds = nativeJudgmentImageBounds(model);
+	return bounds !== undefined && images.length <= (bounds.maxCount ?? images.length);
+}
+
+/** Whether `questions` include a box question, which only natives whose wire forwards them answer. */
+function asksForBoxes(questions: Questions): boolean {
+	for (const id in questions) if (questions[id].type === "box") return true;
+	return false;
+}
+
+/** {@link FittedImage.content} of an image sent as is. */
+const WHOLE_IMAGE: BoxEdges = { top: 0, bottom: 1, left: 0, right: 1 };
+
+/**
+ * `images` sized into `model`'s native judgment bounds, which the API enforces by rejecting rather than
+ * resizing: an image already within them is sent as is, any other goes through {@link fitImage}. A
+ * request-wide byte cap is split evenly so the fitted set also fits as a whole.
+ */
+async function fitNativeImages(model: Model, images: readonly ImageContent[]): Promise<FittedImage[]> {
+	const bounds = nativeJudgmentImageBounds(model);
+	if (!bounds) return images.map(image => ({ image, content: WHOLE_IMAGE }));
+	const maxBytes = Math.min(
+		bounds.maxBytes ?? Infinity,
+		Math.floor((bounds.maxTotalBytes ?? Infinity) / images.length),
+	);
+	const fitted: FittedImage[] = [];
+	// Sequential on purpose: each fit decodes and re-encodes a whole image.
+	for (const image of images) {
+		const within = nativeJudgmentAcceptsImages(model, [image]) && Buffer.byteLength(image.data, "base64") <= maxBytes;
+		fitted.push(within ? { image, content: WHOLE_IMAGE } : await fitImage(image, { ...bounds, maxBytes }));
+	}
+	return fitted;
+}
+
+/**
+ * `result` with each box answer re-measured on the source image its question names: Jev measures the
+ * image it was sent, and padding a fit shrinks the source to {@link FittedImage.content} of it. Answers
+ * are copied, never mutated, since the answer cache may share them.
+ */
+function sourceBoxes<Q extends Questions>(
+	questions: Q,
+	result: JudgmentResult<Q>,
+	fitted: readonly FittedImage[],
+): JudgmentResult<Q> {
+	let answers: Record<string, Answer> | undefined;
+	for (const id in questions) {
+		const question: Question = questions[id];
+		const answer: Answer = result.answers[id];
+		if (question.type !== "box" || answer.type !== "box") continue;
+		answers ??= { ...result.answers };
+		answers[id] = { ...answer, box: unfitBox(answer.box, fitted[question.image].content) };
+	}
+	// Only box answers change, and they stay box answers.
+	return answers ? { ...result, answers: answers as JudgmentResult<Q>["answers"] } : result;
+}
+
+/** `box`, measured on a fitted canvas, measured on the source whose edges on it are `content`; edges in the padding clamp onto the source. */
+function unfitBox(box: BoxEdges, content: BoxEdges): BoxEdges {
+	const x = (edge: number) => Math.min(1, Math.max(0, (edge - content.left) / (content.right - content.left)));
+	const y = (edge: number) => Math.min(1, Math.max(0, (edge - content.top) / (content.bottom - content.top)));
+	return { top: y(box.top), bottom: y(box.bottom), left: x(box.left), right: x(box.right) };
 }
 
 function judgeRoleChain(settings: Settings, registry: ModelRegistry): RoleChainCandidate[] {
@@ -276,7 +364,8 @@ export class ChainJudge implements Judge {
 	readonly label = "judge role chain";
 	readonly #deps: JudgeDeps;
 	readonly #telemetry: AgentTelemetry | undefined;
-	#candidates: { chain: RoleChainCandidate[]; list: RoleChainCandidate[]; requiresImages: boolean } | undefined;
+	/** Text-judgment candidates memoized per resolved chain; image candidates depend on each request's images. */
+	#candidates: { chain: RoleChainCandidate[]; list: RoleChainCandidate[] } | undefined;
 
 	constructor(deps: JudgeDeps) {
 		this.#deps = deps;
@@ -296,19 +385,24 @@ export class ChainJudge implements Judge {
 				);
 			}
 		}
+		checkBoxQuestions(request);
 		return this.#withCandidate(
 			async (candidateJudge, kind, model) => {
-				if (kind !== "online" || requestImages.length === 0) return candidateJudge.judge(request, options);
-				const images = (await normalizeModelContextImages([...requestImages], { model })) ?? [];
+				if (kind === "local" || requestImages.length === 0) return candidateJudge.judge(request, options);
+				const fitted = kind === "native" ? await fitNativeImages(model, requestImages) : undefined;
+				const images = fitted
+					? fitted.map(fit => fit.image)
+					: ((await normalizeModelContextImages([...requestImages], { model })) ?? []);
 				const signal = options.signal;
 				if (signal?.aborted) {
 					const reason = signal.reason;
 					throw reason instanceof Error ? reason : new AIError.AbortError("judgment aborted");
 				}
-				return candidateJudge.judge({ ...request, images }, options);
+				const result = await candidateJudge.judge({ ...request, images }, options);
+				return fitted ? sourceBoxes(request.questions, result, fitted) : result;
 			},
 			options,
-			requestImages.length > 0,
+			request,
 		);
 	}
 
@@ -322,20 +416,22 @@ export class ChainJudge implements Judge {
 	}
 
 	async withCandidate<T>(run: (judge: Judge, kind: JudgeKind) => Promise<T>, options: JudgeOptions = {}): Promise<T> {
-		return this.#withCandidate((judge, kind) => run(judge, kind), options, false);
+		return this.#withCandidate((judge, kind) => run(judge, kind), options);
 	}
 
+	/** Run `run` against each candidate able to answer `request` (any candidate when omitted) until one succeeds. */
 	async #withCandidate<T>(
 		run: (judge: Judge, kind: JudgeKind, model: Model) => Promise<T>,
 		options: JudgeOptions,
-		requiresImages: boolean,
+		request?: JudgmentRequest,
 	): Promise<T> {
+		const requiresImages = (request?.images?.length ?? 0) > 0;
 		const signal = options.signal;
 		let lastFailure: string | undefined;
 		let lastUnavailable: string | undefined;
 		let compatibleCandidate = false;
 		let unsupportedCandidate = false;
-		const candidates = this.#resolveCandidates(requiresImages);
+		const candidates = this.#resolveCandidates(request);
 		const rejections = this.#rejections();
 		for (const candidate of candidates) {
 			if (signal?.aborted) {
@@ -383,6 +479,9 @@ export class ChainJudge implements Judge {
 			throw new Error("judgment: no compatible judge candidate supports images");
 		}
 		if (candidates.length === 0) {
+			if (request && asksForBoxes(request.questions)) {
+				throw new Error("judgment: no judge candidate answers box questions");
+			}
 			if (requiresImages) throw new Error("judgment: no compatible judge candidate supports images");
 			throw new Error("judgment: no judge model available");
 		}
@@ -413,14 +512,20 @@ export class ChainJudge implements Judge {
 		return (registry[kRejections] ??= new Map());
 	}
 
-	#resolveCandidates(requiresImages = false): RoleChainCandidate[] {
+	#resolveCandidates(request?: JudgmentRequest): RoleChainCandidate[] {
 		const { settings, registry, sessionModel } = this.#deps;
-		const candidates = cachedJudgeRoleChain(settings, registry, requiresImages);
-		if (candidates === this.#candidates?.chain && requiresImages === this.#candidates.requiresImages) {
-			return this.#candidates.list;
+		const { roleChain, list: chain } = cachedJudgeRoleChain(settings, registry);
+		const images = request?.images ?? [];
+		// A prompted model cannot locate anything, so no session fallback either.
+		if (request && asksForBoxes(request.questions)) {
+			return roleChain.filter(
+				candidate => nativeJudgmentSupportsBoxes(candidate.model) && nativeTakesImages(candidate.model, images),
+			);
 		}
-		const list = withSessionFallback(candidates, sessionModel, requiresImages);
-		this.#candidates = { chain: candidates, list, requiresImages };
+		if (images.length > 0) return withSessionFallback(imageJudgeRoleChain(roleChain, images), sessionModel, true);
+		if (chain === this.#candidates?.chain) return this.#candidates.list;
+		const list = withSessionFallback(chain, sessionModel);
+		this.#candidates = { chain, list };
 		return list;
 	}
 
@@ -511,7 +616,17 @@ function nativeJudge(
 			options?: JudgeOptions,
 		): Promise<JudgmentResult<Q>> {
 			const startedAt = Date.now();
-			const cached = cache?.lookup(cacheModel, request);
+			const cacheRequest =
+				request.images === undefined
+					? request
+					: {
+							...request,
+							images: request.images.map(image => ({
+								...image,
+								detail: judge.effectiveImageDetail(image.detail),
+							})),
+						};
+			const cached = cache?.lookup(cacheModel, cacheRequest);
 			const known = cached?.answers ?? {};
 			const pending: Questions = {};
 			let questions = 0;

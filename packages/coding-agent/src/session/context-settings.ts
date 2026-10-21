@@ -256,6 +256,25 @@ export const cfgCompactionRemoteStreamingV2Enabled = register({
 	},
 });
 
+export const cfgCompactionRemoteTimeoutSeconds = register({
+	id: "compaction.remoteTimeoutSeconds",
+	type: "number",
+	default: 600,
+	ui: {
+		tab: "context",
+		group: "Compaction",
+		label: "Remote Compaction Timeout",
+		description: "Maximum time allowed for each provider-native compaction request",
+		options: [
+			{ value: "180", label: "3 minutes" },
+			{ value: "300", label: "5 minutes" },
+			{ value: "600", label: "10 minutes" },
+			{ value: "900", label: "15 minutes" },
+			{ value: "1800", label: "30 minutes" },
+		],
+	},
+});
+
 export const cfgCompactionAsyncEnabled = register({
 	id: "compaction.asyncEnabled",
 	type: "boolean",
@@ -343,7 +362,8 @@ export const cfgCompactionIdleTimeoutSeconds = register({
 		tab: "context",
 		group: "Compaction",
 		label: "Idle Compaction Delay",
-		description: "Seconds to wait while idle before compacting",
+		description:
+			"Seconds to wait while idle before compacting; with a 1-hour prompt cache, compaction instead runs just before the cache expires",
 		options: [
 			{ value: "60", label: "1 minute" },
 			{ value: "120", label: "2 minutes" },
@@ -395,6 +415,7 @@ export const cfgCompaction = combine({
 	autoContinue: cfgCompactionAutoContinue,
 	remoteEndpoint: cfgCompactionRemoteEndpoint,
 	remoteStreamingV2Enabled: cfgCompactionRemoteStreamingV2Enabled,
+	remoteTimeoutSeconds: cfgCompactionRemoteTimeoutSeconds,
 	v2RetainedMessageBudget: cfgCompactionV2RetainedMessageBudget,
 	idleEnabled: cfgCompactionIdleEnabled,
 	idleThresholdTokens: cfgCompactionIdleThresholdTokens,

@@ -64,6 +64,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import { resolvePromptCacheLookback } from "@oh-my-pi/pi-catalog/compat/prompt-cache-lookback";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { isRecord, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
@@ -77,6 +78,7 @@ import type { CompactOptions, ContextUsage } from "../extensibility/extensions/t
 import type { GoalModeState } from "../goals/state";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import type { MemoryBackendOperationContext } from "../memory-backend/types";
+import { customMessageEntryMessage } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import { computeNonMessageTokens, type NonMessageTokenSource } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
 import { isCompleteReadResult } from "../tools/read-supersede";
@@ -160,15 +162,16 @@ function hasConfiguredCompactionMethod(settings: CompactionSettings): boolean {
 	return resolveCompactionMethodOrder(settings.methodOrder).length > 0;
 }
 
-/** Kept Anthropic thinking requires compaction by the same live model. */
+/** Kept Claude thinking (Anthropic Messages or Bedrock Converse) requires compaction by the same live model. */
 function canUseLiveProviderNativeCompaction(
 	candidate: Model,
 	liveModel: Model,
 	settings: EngineCompactionSettings,
 ): boolean {
+	const requiresSameModel = candidate.api === "anthropic-messages" || candidate.api === "bedrock-converse-stream";
 	return (
 		candidate.provider === liveModel.provider &&
-		(candidate.api !== "anthropic-messages" || (candidate.api === liveModel.api && candidate.id === liveModel.id)) &&
+		(!requiresSameModel || (candidate.api === liveModel.api && candidate.id === liveModel.id)) &&
 		shouldUseProviderNativeCompaction(candidate, settings)
 	);
 }
@@ -194,7 +197,7 @@ function isCompactionMethodUsable(
 	return candidate === "remote"
 		? canUseRemoteCompaction(model, resolveMethodSettings(settings, candidate))
 		: candidate === "snapcompact"
-			? !excludeMedia && model?.input.includes("image") === true
+			? !excludeMedia && model !== undefined && sendsImageInputOnWire(model)
 			: candidate === "handoff"
 				? reason !== "overflow"
 				: true;
@@ -248,6 +251,20 @@ const PAYLOAD_MEDIA_LIMIT_EVIDENCE_PATTERN =
 	/\btoo many (?:images?|frames?|pixels?)\b|\b(?:images?|frames?|pixels?)\s*(?:count|limit)\b|\blimit of \d+\s*(?:images?|frames?|pixels?)\b|\bmaximum(?: of \d+)? (?:images?|frames?|pixels?)\b|\b(?:number|count) of (?:images?|frames?|pixels?)\b|\b(?:images?|frames?|pixels?)\b.{0,20}\bexceeds?\b.{0,20}\bmaximum\b|\b(?:images?|frames?) (?:is |are )?too large\b|\b(?:images?|frames?) dimensions?\b.{0,30}\bexceeds?\b.{0,30}\b(?:pixels?|\d+)\b/i;
 function hasExplicitMediaRejectionEvidence(errorMessage: string | undefined): boolean {
 	return errorMessage !== undefined && PAYLOAD_MEDIA_LIMIT_EVIDENCE_PATTERN.test(errorMessage);
+}
+
+/**
+ * Newest usage-anchor entry strictly after `compactionIndex`, or -1 when the
+ * branch carries none. Shared by the image, thinking and tool-result shake
+ * passes so all three subtract pre-anchor savings on the same basis.
+ */
+function findUsageAnchorIndex(branchEntries: readonly SessionEntry[], compactionIndex: number): number {
+	for (let index = branchEntries.length - 1; index > compactionIndex; index--) {
+		const entry = branchEntries[index];
+		if (entry?.type !== "message" || !isTranscriptUsageAnchor(entry.message)) continue;
+		return index;
+	}
+	return -1;
 }
 
 /** A terminal payload rejection may be byte-sized history or irreducible media, not necessarily token overflow. */
@@ -478,7 +495,7 @@ export interface SessionMaintenanceHost {
 	}): ContextUsageBreakdown | undefined;
 	getContextUsage(options?: { contextWindow?: number }): ContextUsage | undefined;
 	shake(mode: ShakeMode, options?: { config?: ShakeConfig; signal?: AbortSignal }): Promise<ShakeResult>;
-	dropImages(): Promise<{ removed: number }>;
+	dropImages(): Promise<{ removed: number; tokensFreed: number }>;
 	generateHandoffDocument(
 		customInstructions?: string,
 		options?: SessionHandoffOptions,
@@ -788,46 +805,80 @@ export class SessionMaintenance {
 	 * provider sessions caching message identity (Codex Responses) are torn
 	 * down to force a clean replay on the next turn.
 	 *
-	 * No-op when the branch carries no images; returns `{ removed: 0 }` and
-	 * skips the disk rewrite.
+	 * Every stripped block is measured with the active tokenizer so callers can
+	 * report real savings, and the share of those savings that predates the
+	 * transcript usage anchor is recorded against it. Without that correction
+	 * the anchor keeps charging the provider-reported prompt for images that are
+	 * gone and the context meter reads stale-high until the next response.
+	 *
+	 * No-op when the branch carries no images; returns `{ removed: 0, tokensFreed: 0 }`
+	 * and skips the disk rewrite.
 	 */
-	async dropImages(): Promise<{ removed: number }> {
+	async dropImages(): Promise<{ removed: number; tokensFreed: number }> {
 		return this.#host.sessionManager.withFullHistory(async () => {
 			const branchEntries = this.#host.sessionManager.getBranch();
+			const countOptions = { excludeEncryptedReasoning: true } as const;
+			const latestCompaction = getLatestCompactionEntry(branchEntries);
+			const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
+			const hasRemoteReplacementHistory = getOpenAiRemoteCompactionPayload(latestCompaction) !== undefined;
+			const anchorIndex = findUsageAnchorIndex(branchEntries, compactionIndex);
 			let removed = 0;
-			for (const entry of branchEntries) {
+			let tokensFreed = 0;
+			let anchoredTokensRemoved = 0;
+			for (const [index, entry] of branchEntries.entries()) {
+				// Only entries the anchor's provider-reported prompt already carried may
+				// be subtracted from it, and a remote compaction's replacement history
+				// hides everything before its cutoff from the wire.
+				const anchored = index < anchorIndex && (!hasRemoteReplacementHistory || index > compactionIndex);
 				if (entry.type === "message") {
-					removed += stripImagesFromMessage(entry.message);
+					const before = this.#tokenizer.countMessage(entry.message, countOptions);
+					const dropped = stripImagesFromMessage(entry.message);
+					if (dropped === 0) continue;
+					const saved = Math.max(0, before - this.#tokenizer.countMessage(entry.message, countOptions));
+					removed += dropped;
+					tokensFreed += saved;
+					if (anchored) anchoredTokensRemoved += saved;
 					continue;
 				}
-				if (entry.type === "custom_message" && typeof entry.content !== "string") {
-					const kept: typeof entry.content = [];
-					let dropped = 0;
-					for (const part of entry.content) {
-						if (part.type === "image") {
-							dropped++;
-						} else {
-							kept.push(part);
-						}
-					}
-					if (dropped > 0) {
-						if (kept.length === 0) {
-							kept.push({ type: "text", text: "[image removed]" });
-						}
-						entry.content = kept;
-						removed += dropped;
+				if (entry.type !== "custom_message" || typeof entry.content === "string") continue;
+				// Count the message the prompt actually builds rather than a
+				// hand-made probe, so the estimate cannot drift from the projection.
+				const projected = customMessageEntryMessage(entry);
+				if (!projected) continue;
+				const before = this.#tokenizer.countMessage(projected, countOptions);
+				const kept: typeof entry.content = [];
+				let dropped = 0;
+				for (const part of entry.content) {
+					if (part.type === "image") {
+						dropped++;
+					} else {
+						kept.push(part);
 					}
 				}
+				if (dropped === 0) continue;
+				if (kept.length === 0) {
+					kept.push({ type: "text", text: "[image removed]" });
+				}
+				entry.content = kept;
+				// A spread keeps the second count off the projected message's memoized identity.
+				const saved = Math.max(
+					0,
+					before - this.#tokenizer.countMessage({ ...projected, content: kept }, countOptions),
+				);
+				removed += dropped;
+				tokensFreed += saved;
+				if (anchored) anchoredTokensRemoved += saved;
 			}
 			if (removed === 0) {
-				return { removed: 0 };
+				return { removed: 0, tokensFreed: 0 };
 			}
+			this.#host.recordAnchoredHistoryRewrite(anchoredTokensRemoved);
 			await this.#host.sessionManager.rewriteEntries();
 			const sessionContext = this.#host.buildDisplaySessionContext();
 			this.#host.agent.replaceMessages(sessionContext.messages);
 			this.#host.resetAdvisorRuntimes("drop-images");
 			this.#host.closeCodexProviderSessionsForHistoryRewrite();
-			return { removed };
+			return { removed, tokensFreed };
 		});
 	}
 
@@ -856,8 +907,8 @@ export class SessionMaintenance {
 		} = {},
 	): Promise<ShakeResult> {
 		if (mode === "images") {
-			const { removed } = await this.#host.dropImages();
-			return { mode, toolResultsDropped: 0, blocksDropped: 0, imagesDropped: removed, tokensFreed: 0 };
+			const { removed, tokensFreed } = await this.#host.dropImages();
+			return { mode, toolResultsDropped: 0, blocksDropped: 0, imagesDropped: removed, tokensFreed };
 		}
 
 		if (mode === "thinking") {
@@ -866,13 +917,7 @@ export class SessionMaintenance {
 				const latestCompaction = getLatestCompactionEntry(branchEntries);
 				const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
 				const hasRemoteReplacementHistory = getOpenAiRemoteCompactionPayload(latestCompaction) !== undefined;
-				let anchorIndex = -1;
-				for (let index = branchEntries.length - 1; index > compactionIndex; index--) {
-					const entry = branchEntries[index];
-					if (entry.type !== "message" || !isTranscriptUsageAnchor(entry.message)) continue;
-					anchorIndex = index;
-					break;
-				}
+				const anchorIndex = findUsageAnchorIndex(branchEntries, compactionIndex);
 				let removed = 0;
 				let tokensFreed = 0;
 				let anchoredTokensRemoved = 0;
@@ -977,13 +1022,7 @@ export class SessionMaintenance {
 		assertCurrent();
 		const hasRemoteReplacementHistory = getOpenAiRemoteCompactionPayload(latestCompaction) !== undefined;
 		const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
-		let anchorIndex = -1;
-		for (let index = branchEntries.length - 1; index > compactionIndex; index--) {
-			const entry = branchEntries[index];
-			if (entry.type !== "message" || !isTranscriptUsageAnchor(entry.message)) continue;
-			anchorIndex = index;
-			break;
-		}
+		const anchorIndex = findUsageAnchorIndex(branchEntries, compactionIndex);
 		const entryIndexes = new Map(branchEntries.map((entry, index) => [entry, index]));
 
 		let toolResultsDropped = 0;
@@ -1217,7 +1256,7 @@ export class SessionMaintenance {
 				if (method === "snapcompact") {
 					if (
 						explicitSnapcompact ||
-						(!customInstructions && !options?.internalGuidance && activeModel.input.includes("image"))
+						(!customInstructions && !options?.internalGuidance && sendsImageInputOnWire(activeModel))
 					) {
 						selectedMethod = method;
 						selectedMethodIndex = index;
@@ -1305,13 +1344,12 @@ export class SessionMaintenance {
 			const snapcompactShapeSetting = cfgSnapcompactShape.get(this.#host.settings);
 			let snapcompactShape: snapcompact.Shape | undefined;
 			const snapcompactIncludeThinking = snapcompact.readerIncludesThinking(this.#model);
-			if (wantsSnapcompact && !this.#model.input.includes("image")) {
-				this.#host.emitNotice(
-					"warning",
-					`snapcompact needs a vision-capable model (${this.#model.id} is text-only)`,
-					"compaction",
-				);
-				throw new Error(`snapcompact cannot run locally: ${this.#model.id} is text-only.`);
+			if (wantsSnapcompact && !sendsImageInputOnWire(this.#model)) {
+				const reason = this.#model.input.includes("image")
+					? `${this.#model.id}'s provider strips image input`
+					: `${this.#model.id} is text-only`;
+				this.#host.emitNotice("warning", `snapcompact needs a vision-capable model (${reason})`, "compaction");
+				throw new Error(`snapcompact cannot run locally: ${reason}.`);
 			} else if (snapcompactReady) {
 				const text = snapcompact.serializeConversation(
 					convertToLlm(preparation.messagesToSummarize.concat(preparation.turnPrefixMessages)),
@@ -3049,7 +3087,10 @@ export class SessionMaintenance {
 					});
 					return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
 				}
-				if (payloadRejection && !compactionResult.continuationScheduled) {
+				// No retry replaces the failed turn, so it stays the run's outcome for
+				// post-settle readers (print mode, task executor) instead of whatever
+				// assistant message preceded it.
+				if (!compactionResult.continuationScheduled) {
 					this.#host.retainTerminalFailure(assistantMessage);
 				}
 				return compactionResult;
@@ -3072,6 +3113,7 @@ export class SessionMaintenance {
 				});
 				return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
 			}
+			this.#host.retainTerminalFailure(assistantMessage);
 			return COMPACTION_CHECK_NONE;
 		}
 		// A context promotion can land while the failing call is already in
@@ -4314,7 +4356,7 @@ export class SessionMaintenance {
 		// Re-rendering frames needs a vision-capable model, same gate as the
 		// snapcompact method.
 		const model = this.#model;
-		if (!model?.input.includes("image")) return undefined;
+		if (!model || !sendsImageInputOnWire(model)) return undefined;
 		const staleEntry = getLatestCompactionEntry(branchEntries);
 		if (!staleEntry) return undefined;
 		// Only rescue when the archive is the actual source of the overflow.

@@ -16,6 +16,8 @@ export interface ThinkingContent {
 	thinking: string;
 	thinkingSignature?: string;
 	itemId?: string;
+	/** Prose the model addressed to the user, returned by the provider as thinking; present it as answer text. */
+	narration?: boolean;
 }
 
 export interface RedactedThinkingContent {
@@ -771,6 +773,8 @@ export type NotifyType = "info" | "warning" | "error";
 
 export interface AgentStartEvent {
 	type: "agent_start";
+	/** Calls of an unpaired assistant tail a continued run executes before its first model request. */
+	resumedToolCallIds?: string[];
 }
 
 export interface AgentEndEvent {

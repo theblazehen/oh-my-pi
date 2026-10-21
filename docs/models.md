@@ -147,19 +147,37 @@ override matching model tags. These fields do not configure the Anthropic Messag
 - `workers-ai-systemone`
 
 `typesafe`, `openrouter-decisions`, `openai-decisions`, and `workers-ai-systemone` are judgment APIs, not chat transports: a model declared with one answers judgment requests and is selected by the `judge` model role. `typesafe` posts TypeSafe's System One body to `{baseUrl}/v1/systemone` (any System One server: TypeSafe, OpenJEV, Kev, self-hosted Clef); `openrouter-decisions` posts the same body to `{baseUrl}/decisions`; `openai-decisions` translates questions and answers to OpenAI's Decisions API at `{baseUrl}/decisions` (the bundled `openai/gpt-6-luna-decisions` row sends the wire model `gpt-6-luna`); `workers-ai-systemone` posts the System One body to Cloudflare Workers AI at `{baseUrl}/{model id}`, where `<account>` in the base URL is filled from the stored credential's account id or `CLOUDFLARE_ACCOUNT_ID`. Its `headers` carry gateway routing or custom authentication headers for that traffic.
-Judgment requests can share image attachments with vision-chat requests. Native OpenAI Decisions and Workers AI judges, plus prompted vision-chat models, support images; text-only candidates are skipped for image requests. `Judge.supportsImages` identifies compatible candidates, and a judge chain with no image-capable model fails explicitly rather than dropping images. Prompted judgments normalize images for the selected candidate, including upscaling undersized rasters and converting WebP for models with STB-backed decoders; native judges continue to receive the original image bytes.
+Judgment requests can share image attachments with vision-chat requests. Native OpenAI Decisions, TypeSafe Jev, OpenRouter Jev, and Workers AI judges, plus prompted vision-chat models, support images; text-only candidates are skipped for image requests. `Judge.supportsImages` identifies compatible candidates, and a judge chain with no image-capable model fails explicitly rather than dropping images. Prompted judgments normalize images for the selected candidate, including upscaling undersized rasters and converting WebP for models with STB-backed decoders; native judges continue to receive the original image bytes. When constructing a `NativeJudge` directly for System One, set `supportsImages: true`; `createNativeJudge` derives this flag from the catalog.
 
-OpenAI Decisions forwards embedded `ImageContent.detail` when supplied. Native image-judgment cache identities include the effective detail: different fidelity settings have separate cached answers, while omitted detail and explicit `auto` share the default setting.
+Catalog-backed native judges apply the selected model's image bounds. Direct `NativeJudge` constructors can supply `imageInput` bounds explicitly; opting into images does not inherit Jev's size limits for unrelated System One models.
 
-Image inputs are validated before any candidate runs: a malformed image fails the judgment as a caller error instead of exhausting the chain. Native judges receive the original image bytes, and each dialect's documented caps are enforced before the request is sent; Workers AI Clef accepts at most 4 PNG, JPEG, or WebP images of up to 4 MiB and 16 MP each, 8 MiB in total. Valid padded and unpadded base64, and MIME case variants, share one cache identity.
+OpenAI Decisions forwards embedded `ImageContent.detail`, and different explicit fidelity settings retain separate native image-judgment cache entries. TypeSafe Jev has no image-detail equivalent: detail is ignored on the wire and in cache identity, so requests that differ only by detail can reuse an answer. Omitted detail and explicit `auto` share the default setting.
 
-After image-capability filtering, the same native-only tail policy used for text judgments applies: a failed native judge may fall through to another compatible native, never to a prompted chat model. When no compatible native remains, eligible prompted candidates and a vision-capable session-model fallback remain available.
+Image inputs are validated before any candidate runs; malformed images fail as caller errors rather than exhausting the chain. Providers may enforce additional limits. Workers AI Clef accepts at most 4 PNG, JPEG, or WebP images of up to 4 MiB and 16 MP each, 8 MiB in total. Valid padded and unpadded base64, and MIME case variants, share one cache identity.
 
-For example, configure the judge role and attach an image in JavaScript or Python:
+After image filtering, the same native-only tail policy used for text judgments applies: a failed native judge may fall through to another compatible native, never to a prompted chat model. Filtering removes natives without image support and natives whose image-count cap the request exceeds, so when no compatible native remains, eligible prompted candidates and a vision-capable session-model fallback can still answer. Size bounds never filter a native: each image is fitted into them first (see below).
+
+#### Jev images (experimental)
+
+Native image judgments for Jev are experimental. Direct TypeSafe Jev supports `jev-latest`, `jev-preview`, `jev-1.13.0`, and `jev-1.14.0` (the default `judge` role uses `typesafe/jev-1.14.0`; `jev-latest` is TypeSafe's stable alias, currently `jev-1.13.0`). OpenRouter supports `typesafe/jev-1.13`, `typesafe/jev-1.14`, and `~typesafe/jev-latest`.
+
+Images join `state` without replacing it: an object root keeps its fields and gains them under a collision-safe `__omp_judgment_images` key (with a numeric suffix if the key is taken), an array root gains them at the end, and a string root becomes `[original, ...images]`. Direct TypeSafe requests add each image as a referenced `assets` entry and put its reference in `state`, setting `TypeSafe-Danger-Zone-Images: true` only when images are attached; caller-supplied assets (auth gateway) must each be referenced in `state`, `instructions`, or `criteria`, and each split request carries only the assets it references. OpenRouter encodes each image as an `image_url` data URL part and uses neither the TypeSafe header nor a top-level `images` field.
+
+Text-only requests retain their original request shape and bytes. Image support is limited to the listed TypeSafe Jev and OpenRouter Jev models; it does not imply support for other System One-compatible servers or OpenRouter Decisions models.
+
+Both paths accept PNG and JPEG of 280–1568 pixels per side and 78,400–2,458,624 pixels in total, and reject anything else rather than resizing it. The judge chain therefore fits every image into a native judge's bounds before sending: an image already inside them keeps its original bytes; any other is scaled down past a maximum, or up toward a minimum as far as the maximums allow, without distortion, then padded with its top-left pixel when an extreme aspect ratio still leaves a side short (a 401×41 toolbar crop becomes 1568×160 centered on 1568×280), and re-encoded as PNG, or JPEG when the PNG exceeds the byte cap. TypeSafe Jev has no image-detail equivalent, so `ImageContent.detail` is ignored on direct TypeSafe requests.
+
+[Box questions](https://docs.typesafe.ai/primitives/box) (`{ type: "box", instructions, image }`) need Jev 1.14 and go only to TypeSafe and OpenRouter Decisions judges; the chain skips every other candidate for a request that has one, with no prompted or session-model fallback. `image` indexes the request's `images` and never reaches the wire, so `instructions` must still name the image to search among several. Jev answers with edges as fractions of the image it was sent; when fitting padded that image, the chain maps the edges back onto the image you passed and clamps any edge that lands in the padding.
+
+See TypeSafe's [image documentation](https://docs.typesafe.ai/images) and OpenRouter's [multimodal Decisions guide](https://openrouter.ai/docs/guides/community/multimodal-decisions) for their image constraints.
+
+OpenRouter's guide lists a 256 px minimum side, but a [report of a live Jev 1.14 request](https://github.com/can1357/oh-my-pi/pull/15887#issuecomment-6218295982) says a 270×300 PNG received HTTP 400; the 280 px minimum side is intentional and remains in effect.
+
+For example, configure TypeSafe Jev as the judge and attach an image in JavaScript or Python:
 
 ```yaml
 modelRoles:
-  judge: openai/gpt-6-luna-decisions
+  judge: typesafe/jev-1.14.0
 ```
 
 ```js
@@ -196,6 +214,7 @@ Loading models.yml checks a `modelOverrides` `kind` only against an api the file
 - `discovery.injectV1`: optional boolean, default `true`, for `openai-models-list`. Set `false` to fetch the model list from `{baseUrl}/models` without injecting `/v1` — for gateways that root their OpenAI-compatible surface at a versioned path (e.g. `https://api.opper.ai/v3/compat`) where the forced `/v1/models` returns a different, smaller model list. Query strings in `baseUrl` are ignored, matching the default mode.
 - `transport`: `pi-native` only. When set, every model under that provider is sent to an `omp auth-gateway` compatible `baseUrl` via `POST /v1/pi/stream`; `apiKey` is the gateway bearer.
 - `imageInputDecoder`: `stb` only. Set this on a custom model or `modelOverrides` entry when the serving backend uses an STB-compatible image decoder that cannot accept WebP; OMP converts attached and historical WebP images before provider dispatch.
+- `imageCountBudget`: positive integer. Set this on a custom model or `modelOverrides` entry to state how many images one request to its host may carry. It replaces the catalog budget, which is 5 for a provider no catalog rule names. A gateway in front of a vendor with a higher limit needs it: once a session holds more images than the budget, OMP drops the oldest ones, which changes the cached prompt prefix.
 - `tokenizer`: opt into a specific embedded local tokenizer when a proxy's model id is ambiguous or noncanonical. Allowed values: `claude-v3`, `claude-v47`, `claude-v5`, `claude-v5-sonnet`, `qwen3`, `deepseek-v3`, `kimi-k2`, `glm5`, and `o200k` (OpenAI GPT-5 and later). Omit it to use catalog identity policy; unknown models retain the fast local estimate.
 
 ## Validation rules (current)
@@ -242,6 +261,11 @@ Mantle's `/v1` base, the runtime FIPS host, and PrivateLink hosts of both endpoi
 use native OpenAI compaction without an opt-in, for any provider id. Set
 `enabled: false` to turn it off, or `v2StreamingEnabled: false` to keep only
 the V1 `/responses/compact` request. See [compaction](./compaction.md).
+
+Bedrock Converse Claude models compact natively through a Bedrock Runtime side request on AWS endpoints;
+a custom non-AWS `baseUrl` needs `remoteCompaction.enabled: true`, and `enabled: false` opts out. See
+[compaction](./compaction.md#summary-generation). The separate Anthropic Messages `/anthropic` route has
+its own [setup](./models.md#claude-on-bedrocks-anthropic-messages-api-anthropic).
 
 ### Model value checks
 
@@ -320,7 +344,7 @@ Provider defaults vs per-model overrides:
 - Provider `headers`, `compat`, and `remoteCompaction` are baselines.
 - Model `headers` override provider header keys.
 - `modelOverrides` can override model metadata (`name`, `api`, `kind`, `reasoning`, `thinking`, `input`,
-  `imageInputDecoder`, `tokenizer`, `supportsTools`, `cost`, `promptCache`, `premiumMultiplier`, `contextWindow`,
+  `imageInputDecoder`, `imageCountBudget`, `tokenizer`, `supportsTools`, `cost`, `promptCache`, `premiumMultiplier`, `contextWindow`,
   `maxContextWindow`, `maxTokens`, `omitMaxOutputTokens`, `preferWebsockets`, `headers`, `compat`,
   `contextPromotionTarget`, `compactionModel`, and `remoteCompaction`).
 - `compat` is deep-merged for nested routing blocks (`openRouterRouting`, `vercelGatewayRouting`,
@@ -472,8 +496,10 @@ If every metadata route is unavailable, discovery falls back to the OpenAI-compa
 are positive safe integers and the sum is safe. A valid `limits.max_output_tokens` independently sets the
 chat output cap, clamped to the resolved context; an incomplete or invalid context pair does not
 discard a valid output limit. Without it, a valid top-level `max_output_tokens`, then
-`max_completion_tokens`, sets the cap, ahead of any bundled-reference limit. Otherwise, context and
-output follow the existing native/reference/default fallback.
+`max_completion_tokens`, then `top_provider.max_completion_tokens`, then the generic `max_tokens`
+sets the cap, ahead of any bundled-reference limit. Each spelling is validated on its own, so an
+unusable value on one never suppresses a usable sibling. Otherwise, context and output follow the
+existing native/reference/default fallback.
 Silent endpoints can inherit bundled-reference limits, reasoning, and input modalities; unknown models
 use 128,000 context and 32,768 output as generic chat defaults. Output caps are bounded by the resolved context;
 Anthropic-routed models use an 8,192-token fallback output cap.

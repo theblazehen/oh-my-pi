@@ -1,4 +1,5 @@
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
+import type { AuthGatewayClient } from "./clients";
 import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
@@ -162,7 +163,7 @@ export interface AuthGatewayApiKey {
 export interface AuthGatewayServerOptions {
 	/** Listen address. Default `127.0.0.1:4000`. */
 	bind?: string;
-	/** Accept any of these unnamed bearer tokens. With no `apiKeys` either, every request is admitted. */
+	/** Accept any of these unnamed bearer tokens. With no `apiKeys` and no `clients` either, every request is admitted. */
 	bearerTokens: string[];
 	/**
 	 * Named API keys, accepted like `bearerTokens` (as `Authorization: Bearer` or
@@ -171,6 +172,12 @@ export interface AuthGatewayServerOptions {
 	 * key instead of the caller's `x-omp-*` identity headers.
 	 */
 	apiKeys?: () => readonly AuthGatewayApiKey[];
+	/**
+	 * Scoped clients, each admitted by its own bearer and limited to its models
+	 * and accounts (see `clients.ts`). Any table, even an empty one, requires a
+	 * bearer on every request. Throws at startup when invalid.
+	 */
+	clients?: readonly AuthGatewayClient[];
 	/** Honor forwarded peer headers only when the connecting proxy is trusted. Default false. */
 	trustProxyHeaders?: boolean;
 	/** Version surfaced on `/healthz`. */
@@ -182,4 +189,11 @@ export interface AuthGatewayServerHandle {
 	port: number;
 	hostname: string;
 	close(): Promise<void>;
+	/**
+	 * Replace the scoped clients. A removed or changed token is refused from
+	 * the next request on; a request already in flight keeps the models and
+	 * accounts it was admitted with, retries included, until it finishes.
+	 * Throws, changing nothing, when the table is invalid. Turns bearer auth on.
+	 */
+	setClients(clients: readonly AuthGatewayClient[]): void;
 }

@@ -60,6 +60,7 @@ import type {
 	AgentTurnEndContext,
 	AsideMessage,
 	PrepareQueuedMessages,
+	QueuedMessageQueue,
 	SpeculativeToolExecutionConfig,
 	StreamFn,
 	ToolCallContext,
@@ -386,8 +387,6 @@ interface CursorToolResultEntry {
 	 */
 	additionalContext?: string;
 }
-
-type QueuedMessageQueue = "steering" | "followUp";
 
 interface LiveSteeredEntry {
 	message: AgentMessage;
@@ -1011,7 +1010,7 @@ export class Agent {
 		this.#queuedMessageClaims[queue] = claim;
 		const preparationSignal = AbortSignal.any([signal, claim.controller.signal]);
 		try {
-			const preparation = await prepare(messages, preparationSignal);
+			const preparation = await prepare(messages, preparationSignal, queue);
 			signal.throwIfAborted();
 			if (preparationSignal.aborted || this.#queuedMessageClaims[queue] !== claim) return [];
 			const additional = preparation?.commit();

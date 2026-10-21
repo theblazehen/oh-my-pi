@@ -142,7 +142,6 @@ describe("MemoryProtocolHandler", () => {
 				getBranchAsync: manager.getBranchAsync.bind(manager),
 				getEntries: manager.getEntries.bind(manager),
 				getAllEntries: manager.getAllEntries.bind(manager),
-				forkBranch: manager.forkBranch.bind(manager),
 			};
 			const agentRegistry = new AgentRegistry();
 			agentRegistry.register({

@@ -7,6 +7,7 @@ import { formatKeyHint, formatKeyHints, KeybindingsManager } from "@oh-my-pi/pi-
 import type {
 	CompactOptions,
 	ExtensionActions,
+	ExtensionApprovalAnswer,
 	ExtensionApprovalPrompt,
 	ExtensionAskDialogQuestion,
 	ExtensionAskDialogResult,
@@ -45,11 +46,9 @@ import { disambiguateDisplayLabels, sanitizeCarriageReturns } from "@oh-my-pi/pi
 import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { launchTerminal } from "../../subprocess/terminal-launch";
+import { approvalAnswerForChoice, approvalChoiceLabels, approvalOnceLabel } from "../../tools/approval";
 
 const MAX_WIDGET_LINES = 10;
-/** Approval answers, as a collab guest's select shows them. */
-const APPROVE_OPTION = "Approve";
-const DENY_OPTION = "Deny";
 
 /**
  * Footer hint for a guest-rendered ask selector. The guest's selector handles
@@ -672,28 +671,32 @@ export class ExtensionUiController {
 	}
 
 	/**
-	 * The tool-approval prompt in the composer's place; a collab guest answers it as an Approve/Deny
-	 * select over the full prompt. Locally it shows the compact prompt (the details summarized to a
-	 * row, so the composer beneath keeps its room), and the expand key swaps in the full one,
-	 * wrapped — even when the two match, since a row the summary kept whole can still clip.
-	 * The composer stays mounted beneath it and takes the typing: a user message queued as steering
-	 * while the call waits (sent here, from Tern, or by a collab guest) denies the call, so the
-	 * message tells the agent why instead of a bare denial. The watch starts with the request, so
-	 * approvals still queued behind another dialog are denied by the same message.
+	 * The tool-approval prompt in the composer's place; a collab guest answers it as a select over
+	 * the full prompt with the same choices ({@link approvalChoiceLabels}): the prompt's grants when
+	 * it offers any, Approve, its "for this session" choice when it offers one, and Deny. Locally it
+	 * shows the compact prompt (the details summarized to a
+	 * row, so the composer beneath keeps its room) over that list, and the expand key
+	 * swaps in the full one, wrapped — even when the two match, since a row the summary kept whole
+	 * can still clip. The composer stays mounted beneath it and takes the typing: a user message
+	 * queued as steering while the call waits (sent here, from Tern, or by a collab guest) denies
+	 * the call, so the message tells the agent why instead of a bare denial. The watch starts with
+	 * the request, so approvals still queued behind another dialog are denied by the same message.
 	 */
 	async showCollabAwareApproval(
 		prompt: ExtensionApprovalPrompt,
 		dialogOptions?: ExtensionUIDialogOptions,
-	): Promise<boolean> {
+	): Promise<ExtensionApprovalAnswer> {
+		const sessionLabel = prompt.session;
+		const onceLabel = approvalOnceLabel(prompt);
 		const request: CollabUiRequestDraft = {
 			kind: "select",
 			title: prompt.full,
-			options: [APPROVE_OPTION, DENY_OPTION],
+			options: approvalChoiceLabels(prompt),
 		};
 		const session = this.ctx.session;
 		const agent = session.agent;
 		const pendingSteering = agent.peekSteeringQueue();
-		if (this.#denyingSteering?.some(message => pendingSteering.includes(message))) return false;
+		if (this.#denyingSteering?.some(message => pendingSteering.includes(message))) return "deny";
 		this.#denyingSteering = undefined;
 		const steered = new AbortController();
 		let steeringBaseline = session.getQueuedMessages().steering.length;
@@ -720,7 +723,7 @@ export class ExtensionUiController {
 					const editor = this.ctx.editor;
 					const dialog = new ApprovalDialogComponent(
 						prompt.compact,
-						{ onApprove: () => settle(APPROVE_OPTION), onDeny: () => settle(DENY_OPTION) },
+						{ onApprove: () => settle(onceLabel), onDeny: () => settle("Deny") },
 						{
 							tui: this.ctx.ui,
 							fullPrompt: prompt.full,
@@ -728,6 +731,15 @@ export class ExtensionUiController {
 							onTimeout: dialogOptions?.onTimeout,
 							onTimeoutStart: dialogOptions?.onTimeoutStart,
 							onTimeoutReset: dialogOptions?.onTimeoutReset,
+							...(sessionLabel
+								? { session: { label: sessionLabel, onApprove: () => settle(sessionLabel) } }
+								: {}),
+							...(prompt.grants?.length
+								? {
+										grants: prompt.grants,
+										onGrant: (grant, always) => settle(always ? grant.alwaysLabel : grant.label),
+									}
+								: {}),
 							draft: {
 								hasDraft: () =>
 									editor.getText().length > 0 || editor.pendingImages.length > 0 || editor.pasteInFlight,
@@ -754,7 +766,7 @@ export class ExtensionUiController {
 					};
 				}),
 			);
-			return choice === APPROVE_OPTION;
+			return approvalAnswerForChoice(prompt, choice);
 		} finally {
 			unsubscribe();
 		}

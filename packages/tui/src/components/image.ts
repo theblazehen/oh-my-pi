@@ -1,9 +1,11 @@
 import { encodeSixelAsync } from "@oh-my-pi/pi-natives";
 import { getKittyGraphics } from "../kitty-graphics";
+import { ensureSixelRasterWidth } from "../sixel";
 import {
 	encodeSixelNow,
 	getCellDimensions,
 	getImageDimensions,
+	getTerminalBackgroundColor,
 	type ImageDimensions,
 	ImageProtocol,
 	imageFallback,
@@ -39,6 +41,13 @@ export interface ImageOptions {
 	 * or the image's reserved rows stay blank until an unrelated repaint.
 	 */
 	requestRender?: () => void;
+}
+
+interface SixelEncode {
+	widthPx: number;
+	heightPx: number;
+	backgroundRgb: number;
+	sequence?: string | null;
 }
 
 /** Renders in progress whose rows are bound for native scrollback. */
@@ -655,6 +664,7 @@ export class Image implements Component {
 	#cachedImageProtocol: typeof TERMINAL.imageProtocol = null;
 	#cachedCellWidthPx = 0;
 	#cachedCellHeightPx = 0;
+	#cachedSixelBackground: number | undefined;
 	#cachedKittyUnicodePlaceholders = false;
 	#cachedLinked = false;
 	// Tallest graphic placement this image has rendered. The text fallback
@@ -663,8 +673,8 @@ export class Image implements Component {
 	#renderedGraphicRows = 0;
 	/** Described node and the link policy it was built under (an `off` switch drops its `href`). */
 	#native?: { linked: boolean; node: NativeNode };
-	/** Newest SIXEL encode: its target size and, once settled, the sequence (`null` on failure). */
-	#sixel?: { widthPx: number; heightPx: number; sequence?: string | null };
+	/** Newest SIXEL encode: target size, compositing background, and settled sequence. */
+	#sixel?: SixelEncode;
 
 	constructor(
 		base64Data: string,
@@ -704,33 +714,38 @@ export class Image implements Component {
 	}
 
 	/**
-	 * SIXEL sequence for a target size. A new size starts the encode off the JS
+	 * SIXEL sequence for a target size and background. A change starts the encode off the JS
 	 * thread and answers `undefined` until it settles; the settled encode
 	 * invalidates the cached lines and requests a repaint. A render bound for
 	 * scrollback cannot wait, so it encodes synchronously.
 	 */
-	#sixelSequence(widthPx: number, heightPx: number): string | null | undefined {
+	#sixelSequence(widthPx: number, heightPx: number, backgroundRgb: number): string | null | undefined {
 		const current = this.#sixel;
-		const sameSize = current !== undefined && current.widthPx === widthPx && current.heightPx === heightPx;
-		if (sameSize && current.sequence !== undefined) return current.sequence;
+		const sameInput =
+			current !== undefined &&
+			current.widthPx === widthPx &&
+			current.heightPx === heightPx &&
+			current.backgroundRgb === backgroundRgb;
+		if (sameInput && current.sequence !== undefined) return current.sequence;
 		if (scrollbackRenderDepth > 0) {
 			// Replacing the entry makes a still-pending async encode settle as stale.
-			const sequence = encodeSixelNow(this.#base64Data, widthPx, heightPx);
-			this.#sixel = { widthPx, heightPx, sequence };
+			const sequence = encodeSixelNow(this.#base64Data, widthPx, heightPx, backgroundRgb);
+			this.#sixel = { widthPx, heightPx, backgroundRgb, sequence };
 			return sequence;
 		}
-		if (sameSize) return undefined;
-		const request: { widthPx: number; heightPx: number; sequence?: string | null } = { widthPx, heightPx };
+		if (sameInput) return undefined;
+		const request: SixelEncode = { widthPx, heightPx, backgroundRgb };
 		this.#sixel = request;
 		const settle = (sequence: string | null): void => {
-			request.sequence = sequence;
-			if (this.#sixel !== request) return;
+			request.sequence = sequence === null ? null : ensureSixelRasterWidth(sequence);
+			if (this.#sixel !== request || getTerminalBackgroundColor() !== backgroundRgb) return;
 			this.invalidate();
 			if (this.#options.requestRender) this.#options.requestRender();
 			else this.#budget?.requestRender();
 		};
-		encodeSixelAsync(new Uint8Array(Buffer.from(this.#base64Data, "base64")), widthPx, heightPx).then(settle, () =>
-			settle(null),
+		encodeSixelAsync(new Uint8Array(Buffer.from(this.#base64Data, "base64")), widthPx, heightPx, backgroundRgb).then(
+			settle,
+			() => settle(null),
 		);
 		return undefined;
 	}
@@ -768,6 +783,7 @@ export class Image implements Component {
 		const hasProtocol = imageProtocol != null;
 		const cellDimensions = getCellDimensions();
 		const kittyUnicodePlaceholders = getKittyGraphics().unicodePlaceholders;
+		const sixelBackground = imageProtocol === ImageProtocol.Sixel ? getTerminalBackgroundColor() : undefined;
 		// observe() must run on every pass — even a cache hit — so the image keeps
 		// its display-order slot in the budget. Only graphics-capable frames count
 		// toward (and are demoted by) the budget; without a protocol every image is
@@ -789,6 +805,7 @@ export class Image implements Component {
 			this.#cachedImageProtocol === imageProtocol &&
 			this.#cachedCellWidthPx === cellDimensions.widthPx &&
 			this.#cachedCellHeightPx === cellDimensions.heightPx &&
+			this.#cachedSixelBackground === sixelBackground &&
 			this.#cachedKittyUnicodePlaceholders === kittyUnicodePlaceholders &&
 			// The text fallback embeds a link only under an enabled hyperlink policy.
 			this.#cachedLinked === linked &&
@@ -813,7 +830,7 @@ export class Image implements Component {
 				maxHeightCells: this.#options.maxHeightCells,
 				imageId: this.#imageId,
 				includeTransmit: needsTransmit,
-				sixel: (widthPx, heightPx) => this.#sixelSequence(widthPx, heightPx),
+				sixel: (widthPx, heightPx) => this.#sixelSequence(widthPx, heightPx, sixelBackground!),
 			});
 
 			if (result?.transmit && this.#imageId != null && this.#budget !== undefined) {
@@ -829,9 +846,9 @@ export class Image implements Component {
 				// height. First (rows-1) lines are empty (TUI clears them); the last
 				// saves the final-row cursor, moves up to the image origin, emits the
 				// image sequence, then restores the final-row cursor. When the block
-				// straddles the viewport top, the renderer rewrites this line to the
-				// visible slice (encodeKittyPlacementLine) from the geometry
-				// registered below.
+				// straddles the viewport top, the renderer crops the source raster
+				// for SIXEL or rewrites the Kitty placement's visible source slice
+				// from the geometry registered below.
 				if (this.#imageId != null && this.#budget !== undefined) {
 					this.#budget.registerPlacementGeometry(
 						this.#imageId,
@@ -861,6 +878,7 @@ export class Image implements Component {
 		this.#cachedImageProtocol = imageProtocol;
 		this.#cachedCellWidthPx = cellDimensions.widthPx;
 		this.#cachedCellHeightPx = cellDimensions.heightPx;
+		this.#cachedSixelBackground = sixelBackground;
 		this.#cachedKittyUnicodePlaceholders = kittyUnicodePlaceholders;
 		this.#cachedLinked = linked;
 

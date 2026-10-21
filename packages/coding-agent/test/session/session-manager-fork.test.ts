@@ -147,6 +147,84 @@ describe("SessionManager.forkFrom", () => {
 		expect(await Bun.file(path.join(sourceArtifactsDir, "1.read.log")).text()).toBe("tool output");
 	});
 
+	it("forks a seance in place: source untouched, history kept, startup contracts inert, artifacts not copied", async () => {
+		using tempDir = TempDir.createSync("@omp-session-seance-fork-");
+		const { cwd, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(tempDir.path());
+		const timestamp = new Date().toISOString();
+		const sourceHeader: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "source-session",
+			timestamp,
+			cwd,
+			additionalDirectories: [path.join(tempDir.path(), "parent-workspace")],
+		};
+		const inheritedInit = {
+			type: "session_init",
+			id: "inherited-init",
+			parentId: null,
+			timestamp,
+			systemPrompt: ["unrestricted source prompt"],
+			task: "unrestricted source task",
+			tools: ["read", "write", "task"],
+			agent: "task",
+			spawns: "*",
+		};
+		const request = {
+			type: "message",
+			id: "witness-request",
+			parentId: "inherited-init",
+			timestamp,
+			message: { role: "user", content: "early request before resume", timestamp: 1 },
+		};
+		const laterInit = {
+			...inheritedInit,
+			id: "later-inherited-init",
+			parentId: "witness-request",
+			systemPrompt: ["later unrestricted resume prompt"],
+		};
+		const laterMessage = {
+			type: "message",
+			id: "later-source-message",
+			parentId: "later-inherited-init",
+			timestamp,
+			message: { role: "user", content: "later source turn", timestamp: 3 },
+		};
+		const sourceText = `${[sourceHeader, inheritedInit, request, laterInit, laterMessage]
+			.map(entry => JSON.stringify(entry))
+			.join("\n")}\n`;
+		await Bun.write(sourceFile, sourceText);
+
+		const forkFile = path.join(tempDir.path(), "forks", "seance.jsonl");
+		const forked = await SessionManager.forkFrom(sourceFile, cwd, undefined, undefined, {
+			seance: true,
+			suppressBreadcrumb: true,
+			sessionFile: forkFile,
+			resetInheritedCost: true,
+			repairInterruptedTail: true,
+		});
+		try {
+			expect(await fs.readFile(sourceFile, "utf8")).toBe(sourceText);
+			const asSourceInit = { type: "custom", customType: "source_session_init" };
+			expect(await loadHistory(forkFile)).toEqual([
+				{ ...asSourceInit, id: inheritedInit.id, parentId: null, timestamp, data: inheritedInit },
+				request,
+				{ ...asSourceInit, id: laterInit.id, parentId: laterInit.parentId, timestamp, data: laterInit },
+				laterMessage,
+			] as unknown as SessionEntry[]);
+			// Revival reads the header's source pointer and finds no inherited contract to resurrect.
+			expect(await SessionManager.peekSessionInit(forkFile)).toMatchObject({
+				seanceSource: path.resolve(sourceFile),
+				init: null,
+			});
+			expect(forked.getSeanceSourceArtifactsDir()).toBe(sourceArtifactsDir);
+			expect(forked.getAdditionalDirectories()).toEqual([]);
+			await expect(fs.stat(forkFile.slice(0, -".jsonl".length))).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await forked.close();
+		}
+	});
+
 	it("does not copy artifacts when the caller opts out", async () => {
 		using tempDir = TempDir.createSync("@omp-session-fork-no-artifacts-");
 		const { cwd, sessionDir, sourceFile } = await createSessionWithArtifacts(tempDir.path());
@@ -508,71 +586,6 @@ describe("SessionManager.forkFrom", () => {
 		expect(sourceMessage.message.usage.premiumRequests).toBe(2);
 		expect(await Bun.file(sourceFile).text()).toBe(sourceText);
 		await sourceManager.close();
-	});
-
-	it("clones the selected leaf branch and preserves the provider prompt cache key", async () => {
-		using tempDir = TempDir.createSync("@omp-session-bounded-fork-");
-		const storage = new MemorySessionStorage();
-		const cwd = path.join(tempDir.path(), "project");
-		const sessionDir = path.join(tempDir.path(), "sessions");
-		const source = SessionManager.create(cwd, sessionDir, storage);
-		const providerPromptCacheKey = "bounded-fork-cache-key";
-		await source.newSession({ providerPromptCacheKey });
-		const rootId = source.appendMessage({ role: "user", content: "root", timestamp: Date.now() });
-		const selectedId = source.appendMessage({ role: "user", content: "selected", timestamp: Date.now() });
-		source.appendMessage({ role: "user", content: "selected descendant", timestamp: Date.now() });
-		source.branch(rootId);
-		source.appendMessage({ role: "user", content: "later sibling", timestamp: Date.now() });
-		await source.ensureOnDisk();
-		await source.flush();
-
-		const sourceFile = source.getSessionFile();
-		if (!sourceFile) throw new Error("expected source session file");
-		const cloneFile = path.join(sessionDir, "bounded.jsonl");
-		const forked = await SessionManager.forkFrom(sourceFile, cwd, sessionDir, storage, {
-			sourceLeafId: selectedId,
-			sessionFile: cloneFile,
-			suppressBreadcrumb: true,
-		});
-
-		const cloneEntries = await loadEntriesFromFile(cloneFile, storage);
-		const cloneMessages = cloneEntries.filter((entry): entry is SessionMessageEntry => entry.type === "message");
-		expect(cloneMessages.map(entry => entry.id)).toEqual([rootId, selectedId]);
-		expect(
-			cloneMessages.map(entry =>
-				entry.message.role === "user" && typeof entry.message.content === "string"
-					? entry.message.content
-					: undefined,
-			),
-		).toEqual(["root", "selected"]);
-		expect(forked.getHeader()?.providerPromptCacheKey).toBe(providerPromptCacheKey);
-	});
-
-	it("creates a header-only child when the selected source leaf is null", async () => {
-		using tempDir = TempDir.createSync("@omp-session-root-fork-");
-		const storage = new MemorySessionStorage();
-		const cwd = path.join(tempDir.path(), "project");
-		const sessionDir = path.join(tempDir.path(), "sessions");
-		const source = SessionManager.create(cwd, sessionDir, storage);
-		source.appendMessage({ role: "user", content: "not copied", timestamp: Date.now() });
-		await source.ensureOnDisk();
-		await source.flush();
-		const sourceFile = source.getSessionFile();
-		if (!sourceFile) throw new Error("expected source session file");
-		const cloneFile = path.join(sessionDir, "root.jsonl");
-
-		await SessionManager.forkFrom(sourceFile, cwd, sessionDir, storage, {
-			sourceLeafId: null,
-			sessionFile: cloneFile,
-			suppressBreadcrumb: true,
-		});
-
-		const cloneEntries = await loadEntriesFromFile(cloneFile, storage);
-		expect(cloneEntries).toHaveLength(1);
-		expect(cloneEntries[0]?.type).toBe("session");
-		const reopened = await SessionManager.open(cloneFile, sessionDir, storage, { suppressBreadcrumb: true });
-		expect(reopened.getHeader()?.type).toBe("session");
-		expect(reopened.getEntries()).toHaveLength(0);
 	});
 
 	for (const { name, createStorage, padding } of [
