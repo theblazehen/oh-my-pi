@@ -62,18 +62,23 @@ describe("indexModelsByRequestId (auth-gateway catalog)", () => {
 	test("explicit gateway config adds a generic provider using its stored credential", async () => {
 		using tempDir = TempDir.createSync("@omp-auth-gateway-custom-");
 		const modelsPath = tempDir.join("gateway-models.yml");
-		await Bun.write(modelsPath, JSON.stringify({
-			providers: {
-				"custom-host": {
-					baseUrl: "https://custom.example/v1",
-					api: "openai-completions",
-					models: [{ id: "custom-chat", contextWindow: 1048576, maxTokens: 16384 }],
+		await Bun.write(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					"custom-host": {
+						baseUrl: "https://custom.example/v1",
+						api: "openai-completions",
+						models: [{ id: "custom-chat", contextWindow: 1048576, maxTokens: 16384 }],
+					},
 				},
-			},
-		}));
+			}),
+		);
 		const storage = await createAuthStorage();
-		await storage.credentials.set("custom-host", { type: "api_key", key: "broker-key" });
 		const settings = Settings.isolated({});
+		await storage.credentials.set("unrelated-provider", { type: "api_key", key: "unrelated-key" });
+		await expect(createGatewayModelRegistry(storage, settings, modelsPath)).rejects.toThrow();
+		await storage.credentials.set("custom-host", { type: "api_key", key: "broker-key" });
 		const registry = await createGatewayModelRegistry(storage, settings, modelsPath);
 		const providers = gatewayRoutableProviders(storage, settings);
 		const index = indexModelsByRequestId(gatewayRoutableModels(registry), providers);
@@ -82,9 +87,11 @@ describe("indexModelsByRequestId (auth-gateway catalog)", () => {
 		expect(model?.api).toBe("openai-completions");
 		expect(model?.contextWindow).toBe(1048576);
 		expect(await storage.keys.get("custom-host")).toBe("broker-key");
-		expect(registry.find("anthropic", "claude-sonnet-4-5")?.baseUrl).toBe(
-			getBundledModels("anthropic").find(model => model.id === "claude-sonnet-4-5")?.baseUrl,
-		);
+		const bundled = getBundledModels("anthropic")[0]!;
+		expect(registry.find("anthropic", bundled.id)).toMatchObject({
+			baseUrl: bundled.baseUrl,
+			api: bundled.api,
+		});
 	});
 
 	test("explicit missing or invalid gateway config fails instead of serving a partial catalog", async () => {

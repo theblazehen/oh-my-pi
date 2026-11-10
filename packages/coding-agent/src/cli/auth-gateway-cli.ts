@@ -43,7 +43,7 @@ import {
 } from "@oh-my-pi/pi-ai/auth-gateway";
 import { type GeneratedProvider, getBundledModels, getEffectiveTokenCost } from "@oh-my-pi/pi-catalog/models";
 import { type ModelKind, modelKind } from "@oh-my-pi/pi-catalog/types";
-import { getConfigRootDir, logger, VERSION } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, getModelDbPath, logger, VERSION } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
 import { cfgDisabledProviders } from "../config/model-settings";
@@ -298,6 +298,8 @@ export async function createGatewayModelRegistry(
 	if (configPath !== undefined) await fs.access(configPath);
 	const registry = new ModelRegistry(storage, configPath, {
 		ignoreLocalModelConfig: configPath === undefined,
+		// Operator configs may be read-only mounts; retain the gateway's writable cache.
+		cacheDbPath: getModelDbPath(),
 		settings,
 	});
 	const error = registry.getError();

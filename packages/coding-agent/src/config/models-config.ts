@@ -45,6 +45,7 @@ export function validateProviderConfiguration(
 	providerName: string,
 	config: ProviderValidationConfig,
 	mode: ProviderValidationMode,
+	hasStoredCredential = false,
 ): void {
 	const hasProviderApi = !!config.api;
 	const models = config.models;
@@ -77,7 +78,10 @@ export function validateProviderConfiguration(
 		const requiresAuth =
 			mode === "runtime-register"
 				? !config.apiKey && !config.oauthConfigured
-				: !config.apiKey && (config.auth ?? "apiKey") !== "none" && (config.auth ?? "apiKey") !== "oauth";
+				: !hasStoredCredential &&
+					!config.apiKey &&
+					(config.auth ?? "apiKey") !== "none" &&
+					(config.auth ?? "apiKey") !== "oauth";
 		if (requiresAuth) {
 			throw new Error(
 				mode === "runtime-register"
@@ -194,31 +198,37 @@ export function getUnknownCompatKeys(config: ModelsConfig): string[] {
 	return unknownKeys;
 }
 
-export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", {
-	kind: "deferred",
-	resolve: getModelsConfigSchema,
-}).withValidation("models", config => {
-	const providers = config.providers ?? {};
-	for (const providerName in providers) {
-		const providerConfig = providers[providerName];
-		validateProviderConfiguration(
-			providerName,
-			{
-				baseUrl: providerConfig.baseUrl,
-				headers: providerConfig.headers,
-				apiKey: providerConfig.apiKey,
-				api: providerConfig.api as Api | undefined,
-				auth: (providerConfig.auth ?? "apiKey") as ProviderAuthMode,
-				discovery: providerConfig.discovery as ProviderDiscovery | undefined,
-				compat: providerConfig.compat,
-				remoteCompaction: providerConfig.remoteCompaction,
-				disableStrictTools: providerConfig.disableStrictTools,
-				guardrailIdentifier: providerConfig.guardrailIdentifier,
-				requestMetadata: providerConfig.requestMetadata,
-				modelOverrides: providerConfig.modelOverrides,
-				models: (providerConfig.models ?? []) as ProviderValidationModel[],
-			},
-			"models-config",
-		);
-	}
-});
+/** Validate file credentials against the registry's live local or broker-backed store. */
+export function createModelsConfigFile(hasStoredCredential?: (provider: string) => boolean): ConfigFile<ModelsConfig> {
+	return new ConfigFile<ModelsConfig>("models", {
+		kind: "deferred",
+		resolve: getModelsConfigSchema,
+	}).withValidation("models", config => {
+		const providers = config.providers ?? {};
+		for (const providerName in providers) {
+			const providerConfig = providers[providerName];
+			validateProviderConfiguration(
+				providerName,
+				{
+					baseUrl: providerConfig.baseUrl,
+					headers: providerConfig.headers,
+					apiKey: providerConfig.apiKey,
+					api: providerConfig.api as Api | undefined,
+					auth: (providerConfig.auth ?? "apiKey") as ProviderAuthMode,
+					discovery: providerConfig.discovery as ProviderDiscovery | undefined,
+					compat: providerConfig.compat,
+					remoteCompaction: providerConfig.remoteCompaction,
+					disableStrictTools: providerConfig.disableStrictTools,
+					guardrailIdentifier: providerConfig.guardrailIdentifier,
+					requestMetadata: providerConfig.requestMetadata,
+					modelOverrides: providerConfig.modelOverrides,
+					models: (providerConfig.models ?? []) as ProviderValidationModel[],
+				},
+				"models-config",
+				hasStoredCredential?.(providerName) ?? false,
+			);
+		}
+	});
+}
+
+export const ModelsConfigFile = createModelsConfigFile();

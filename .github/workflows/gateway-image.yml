@@ -57,4 +57,5 @@ jobs:
         run: |
           docker run --rm --entrypoint bun \
             ghcr.io/${{ github.repository_owner }}/omp@${{ steps.build.outputs.digest }} \
-            test packages/coding-agent/test/cli/auth-gateway-catalog.test.ts
+            test packages/coding-agent/test/cli/auth-gateway-catalog.test.ts \
+            packages/coding-agent/test/config/models-config-validation.test.ts

@@ -130,8 +130,8 @@ export {
 } from "./model-provider-discovery";
 
 import {
+	createModelsConfigFile,
 	getUnknownCompatKeys,
-	ModelsConfigFile,
 	type ProviderValidationModel,
 	validateProviderConfiguration,
 } from "./models-config";
@@ -539,7 +539,9 @@ export class ModelRegistry {
 			(isBunTestRuntime()
 				? () => Promise.reject(new Error("network disabled in model-registry runtime test"))
 				: wrapFetchForExtraCa(fetch));
-		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath ?? path.join(getAgentDir(), "models.yml"));
+		this.#modelsConfigFile = createModelsConfigFile(
+			provider => this.authStorage.keys.source(provider) !== undefined,
+		).relocate(modelsPath ?? path.join(getAgentDir(), "models.yml"));
 		this.#cacheDbPath =
 			options?.cacheDbPath ?? (modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined);
 		this.authStorage.keys.setResolver(resolveConfigValue);
