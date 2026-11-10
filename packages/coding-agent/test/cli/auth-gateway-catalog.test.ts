@@ -4,6 +4,7 @@ import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { modelKind } from "@oh-my-pi/pi-catalog/types";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import {
+	createGatewayModelRegistry,
 	createSerializedRebuilder,
 	gatewayRoutableModels,
 	gatewayRoutableProviders,
@@ -56,6 +57,46 @@ describe("indexModelsByRequestId (auth-gateway catalog)", () => {
 		// "Unknown model" when the index was built from getBundledModels only.
 		expect(index.get("anthropic/claude-opus-5-repro")?.id).toBe("claude-opus-5-repro");
 		expect(index.get("claude-opus-5-repro")?.id).toBe("claude-opus-5-repro");
+	});
+
+	test("explicit gateway config adds a generic provider using its stored credential", async () => {
+		using tempDir = TempDir.createSync("@omp-auth-gateway-custom-");
+		const modelsPath = tempDir.join("gateway-models.yml");
+		await Bun.write(modelsPath, JSON.stringify({
+			providers: {
+				"custom-host": {
+					baseUrl: "https://custom.example/v1",
+					api: "openai-completions",
+					models: [{ id: "custom-chat", contextWindow: 1048576, maxTokens: 16384 }],
+				},
+			},
+		}));
+		const storage = await createAuthStorage();
+		await storage.credentials.set("custom-host", { type: "api_key", key: "broker-key" });
+		const settings = Settings.isolated({});
+		const registry = await createGatewayModelRegistry(storage, settings, modelsPath);
+		const providers = gatewayRoutableProviders(storage, settings);
+		const index = indexModelsByRequestId(gatewayRoutableModels(registry), providers);
+		const model = index.get("custom-host/custom-chat");
+		expect(model?.baseUrl).toBe("https://custom.example/v1");
+		expect(model?.api).toBe("openai-completions");
+		expect(model?.contextWindow).toBe(1048576);
+		expect(await storage.keys.get("custom-host")).toBe("broker-key");
+		expect(registry.find("anthropic", "claude-sonnet-4-5")?.baseUrl).toBe(
+			getBundledModels("anthropic").find(model => model.id === "claude-sonnet-4-5")?.baseUrl,
+		);
+	});
+
+	test("explicit missing or invalid gateway config fails instead of serving a partial catalog", async () => {
+		using tempDir = TempDir.createSync("@omp-auth-gateway-custom-");
+		const modelsPath = tempDir.join("gateway-models.yml");
+		const storage = await createAuthStorage();
+		const settings = Settings.isolated({});
+		await expect(createGatewayModelRegistry(storage, settings, modelsPath)).rejects.toThrow();
+		await Bun.write(modelsPath, "providers: [");
+		await expect(createGatewayModelRegistry(storage, settings, modelsPath)).rejects.toThrow(
+			"Cannot load gateway models",
+		);
 	});
 
 	test("gateway registry ignores local models.yml credential and routing overrides", async () => {

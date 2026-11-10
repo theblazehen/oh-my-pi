@@ -71,6 +71,8 @@ export interface AuthGatewayCommandArgs {
 	flags: {
 		json?: boolean;
 		bind?: string;
+		/** `serve`: explicitly trusted models.yml; absent leaves local model overrides disabled. */
+		models?: string;
 		regenerate?: boolean;
 		/** Named API key `token` prints, creates, rotates (`regenerate`) or removes (`revoke`). */
 		name?: string;
@@ -286,6 +288,23 @@ export function createSerializedRebuilder(run: (force: boolean) => Promise<void>
 	return rebuild;
 }
 
+/** Only an explicitly supplied operator config may override gateway routing. */
+export async function createGatewayModelRegistry(
+	storage: AuthStorage,
+	settings: Settings,
+	modelsPath?: string,
+): Promise<ModelRegistry> {
+	const configPath = modelsPath === undefined ? undefined : path.resolve(modelsPath);
+	if (configPath !== undefined) await fs.access(configPath);
+	const registry = new ModelRegistry(storage, configPath, {
+		ignoreLocalModelConfig: configPath === undefined,
+		settings,
+	});
+	const error = registry.getError();
+	if (error) throw new Error(`Cannot load gateway models: ${error.message}`);
+	return registry;
+}
+
 async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	const brokerConfig = await resolveAuthBrokerConfig();
 	if (!brokerConfig) {
@@ -321,19 +340,9 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	});
 	await storage.credentials.reload();
 
-	// Build the model resolver + catalog from the ModelRegistry — the same
-	// component the TUI/CLI use — scoped to providers we hold credentials for.
-	// `getAll()` is a superset of the bundled catalog (bundled first, then
-	// cached + broker-discovered), so the discovery-only models omp itself
-	// reaches become routable through the gateway instead of freezing on the
-	// compiled snapshot. `ignoreLocalModelConfig` keeps the host's `models.yml`
-	// out of the picture: client-side provider overrides (baseUrl/apiKey/headers/
-	// transport) and custom models must never route a broker-backed gateway or
-	// shadow broker credentials. Format handlers ask `resolveModel` to translate
-	// a client-requested `model` field into a pi-ai `Model<Api>` before dispatch;
-	// `listModels` powers `/v1/models`. `settings` carries `disabledProviders`, so
-	// discovery skips disabled providers too.
-	const registry = new ModelRegistry(storage, undefined, { ignoreLocalModelConfig: true, settings });
+	// Default to bundled + broker-discovered models, never implicit local overrides.
+	// --models explicitly opts into an operator-owned provider/routing configuration.
+	const registry = await createGatewayModelRegistry(storage, settings, flags.models);
 	let modelById = new Map<string, Model<Api>>();
 	// Routable models as one stable array per rebuild: `resolveProviderModelReference` caches its
 	// index on the array identity, so variant lookups stay O(1) between rebuilds.

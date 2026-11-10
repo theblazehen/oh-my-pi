@@ -4,6 +4,7 @@
 
 ### Added
 
+- `omp auth-gateway serve --models=<file>` loads an explicitly trusted provider catalog, allowing generic OpenAI-compatible endpoints to use broker-held credentials without changing built-in providers.
 - `omp auth-gateway token --name <key> [--scope inference|full] [--regenerate|--revoke]` and `omp auth-gateway keys` provision named gateway API keys in `<config-dir>/auth-gateway.keys`; `serve` reloads the file every 10 s, so new, rotated, re-scoped, and revoked keys apply without a restart, and `omp usage clients` reports burn per key.
 
 ### Changed

@@ -40,7 +40,8 @@ jobs:
             type=sha,format=long
             type=raw,value=gateway
 
-      - uses: docker/build-push-action@v6
+      - id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
@@ -51,3 +52,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify gateway catalog in the published runtime
+        run: |
+          docker run --rm --entrypoint bun \
+            ghcr.io/${{ github.repository_owner }}/omp@${{ steps.build.outputs.digest }} \
+            test packages/coding-agent/test/cli/auth-gateway-catalog.test.ts
