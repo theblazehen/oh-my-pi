@@ -6,15 +6,16 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
+import * as zod from "@oh-my-pi/omptype/zod";
 import { getAgentDir, getProjectDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
-import * as arktype from "arktype";
-import * as zodModule from "zod/v4";
 import { getConfigDirs } from "../../config";
+
 import { execCommand } from "../../exec/exec";
-// Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
-import * as PiCodingAgent from "../../index";
-import * as typebox from "../typebox";
+import { getCodingAgentApi } from "../host-api";
+import * as typebox from "../legacy-typebox";
 import { GreenCommand } from "./bundled/ci-green";
+import { AnnotateCommand } from "./bundled/annotate";
 import { ReviewCommand } from "./bundled/review";
 import type {
 	CustomCommand,
@@ -24,6 +25,8 @@ import type {
 	CustomCommandsLoadResult,
 	LoadedCustomCommand,
 } from "./types";
+
+const arktype = Object.assign(Function.prototype.bind.call(type, undefined) as typeof type, type, { type });
 
 /**
  * Load a single command module using native Bun import.
@@ -164,6 +167,12 @@ function loadBundledCommands(sharedApi: CustomCommandAPI): LoadedCustomCommand[]
 		command: new ReviewCommand(sharedApi),
 		source: "bundled",
 	});
+	bundled.push({
+		path: "bundled:annotate",
+		resolvedPath: "bundled:annotate",
+		command: new AnnotateCommand(sharedApi),
+		source: "bundled",
+	});
 
 	return bundled;
 }
@@ -188,8 +197,10 @@ export async function loadCustomCommands(options: LoadCustomCommandsOptions = {}
 			execCommand(command, args, execOptions?.cwd ?? cwd, execOptions),
 		typebox,
 		arktype,
-		zod: zodModule,
-		pi: PiCodingAgent,
+		zod,
+		get pi() {
+			return getCodingAgentApi();
+		},
 	};
 
 	// 1. Load bundled commands first (lowest priority - can be overridden)

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as url from "node:url";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 const CLI_ENTRY = path.join(import.meta.dir, "..", "src", "cli.ts");
@@ -11,12 +12,20 @@ describe("omp read MCP resources", () => {
 	let root: string;
 	let projectDir: string;
 	let agentDir: string;
+	let probePath: string;
 
 	beforeEach(async () => {
 		root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-read-mcp-"));
 		projectDir = path.join(root, "project");
 		agentDir = path.join(root, "agent");
-		await Promise.all([fs.mkdir(projectDir), fs.mkdir(agentDir)]);
+		const localSkillDir = path.join(projectDir, ".omp", "skills", "local-skill");
+		await Promise.all([fs.mkdir(localSkillDir, { recursive: true }), fs.mkdir(agentDir)]);
+		await Bun.write(
+			path.join(localSkillDir, "SKILL.md"),
+			"---\nname: local-skill\ndescription: Local skill next to MCP skills.\n---\n\n# Local Skill\n",
+		);
+		await Bun.write(path.join(localSkillDir, "ref.md"), "local skill ref\n");
+		await Bun.write(path.join(projectDir, "notes.md"), "project notes\n");
 		await Bun.write(
 			path.join(projectDir, ".mcp.json"),
 			JSON.stringify({
@@ -29,14 +38,28 @@ describe("omp read MCP resources", () => {
 				},
 			}),
 		);
+		probePath = path.join(root, "probe.ts");
+		await Bun.write(
+			probePath,
+			[
+				`import { runCli } from ${JSON.stringify(url.pathToFileURL(CLI_ENTRY).href)};`,
+				'await runCli(["read", "test://alpha"]);',
+				'await runCli(["read", "urn:fixture:gamma"]);',
+				'await runCli(["read", "mcp://test://beta"]);',
+				'await runCli(["read", "skill://fixture/remote-skill/SKILL.md"]);',
+				// MCP starts for the entry no local skill owns, even behind a plain file and a local skill.
+				'await runCli(["read", "notes.md;skill://local-skill/ref.md;skill://fixture/remote-skill/SKILL.md"]);',
+				'await runCli(["read", "test://missing"]);',
+			].join("\n"),
+		);
 	});
 
 	afterEach(async () => {
 		await removeWithRetries(root);
 	});
 
-	async function runRead(resourceUri: string): Promise<{ exitCode: number; output: string; error: string }> {
-		const proc = Bun.spawn([process.execPath, CLI_ENTRY, "read", resourceUri], {
+	async function runReadProbe(): Promise<{ exitCode: number; output: string; error: string }> {
+		const proc = Bun.spawn([process.execPath, probePath], {
 			cwd: projectDir,
 			stdout: "pipe",
 			stderr: "pipe",
@@ -53,35 +76,17 @@ describe("omp read MCP resources", () => {
 		return { exitCode, output, error };
 	}
 
-	it("discovers MCP before reading a server-advertised native URI", async () => {
-		const { exitCode, output, error } = await runRead("test://alpha");
-
-		expect(exitCode).toBe(0);
-		expect(error).toBe("");
-		expect(output).toContain("fixture content for test://alpha");
-	}, 30_000);
-
-	it("discovers MCP before reading a server-advertised opaque URI", async () => {
-		const { exitCode, output, error } = await runRead("urn:fixture:gamma");
-
-		expect(exitCode).toBe(0);
-		expect(error).toBe("");
-		expect(output).toContain("fixture content for urn:fixture:gamma");
-	}, 30_000);
-
-	it("keeps the mcp:// wrapper working in the standalone CLI", async () => {
-		const { exitCode, output, error } = await runRead("mcp://test://beta");
-
-		expect(exitCode).toBe(0);
-		expect(error).toBe("");
-		expect(output).toContain("fixture content for test://beta");
-	}, 30_000);
-
-	it("exits after an MCP resource read error", async () => {
-		const { exitCode, output, error } = await runRead("test://missing");
+	it("reads native, opaque, wrapped, and skill MCP resources and reports missing resources through the CLI", async () => {
+		const { exitCode, output, error } = await runReadProbe();
 
 		expect(exitCode).toBe(1);
-		expect(output).toBe("");
+		expect(output).toContain("fixture content for test://alpha");
+		expect(output).toContain("fixture content for urn:fixture:gamma");
+		expect(output).toContain("fixture content for test://beta");
+		expect(output).toContain("fixture content for skill://fixture/remote-skill/SKILL.md");
+		expect(output).toContain("project notes");
+		expect(output).toContain("local skill ref");
+		expect(error).not.toContain("Unknown skill");
 		expect(error).toContain('No MCP server has resource "test://missing"');
 	}, 30_000);
 });

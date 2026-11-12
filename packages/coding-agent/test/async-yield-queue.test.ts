@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import {
+	type AgentMessage,
+	ASIDE_MESSAGE_COMMIT,
+	ASIDE_MESSAGE_DISCARD,
+	type CommittableAsideMessage,
+} from "@oh-my-pi/pi-agent-core";
+import { type AsyncJob, AsyncJobManager, type AsyncJobType } from "@oh-my-pi/pi-coding-agent/async";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { YieldQueue } from "@oh-my-pi/pi-coding-agent/session/yield-queue";
-import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { type CoordinationDetails, HubTool } from "../src/tools/hub";
 
 type AsyncEntry = {
 	jobId: string;
@@ -16,7 +19,7 @@ type AsyncEntry = {
 type AsyncDetails = {
 	jobs: Array<{
 		jobId: string;
-		type?: "bash" | "task";
+		type?: AsyncJobType;
 		label?: string;
 		durationMs?: number;
 	}>;
@@ -47,20 +50,6 @@ function asyncDetails(message: AgentMessage): AsyncDetails {
 	return (message as CustomMessage<AsyncDetails>).details ?? { jobs: [] };
 }
 
-function createToolSession(asyncJobManager?: AsyncJobManager): ToolSession {
-	return {
-		cwd: process.cwd(),
-		hasUI: false,
-		settings: {
-			get: (key: string) => (key === "async.pollWaitDuration" ? "5s" : undefined),
-		},
-		getSessionFile: () => null,
-		getSessionSpawns: () => null,
-		getAgentId: () => null,
-		asyncJobManager,
-	} as unknown as ToolSession;
-}
-
 function createHarness(initialStreaming: boolean) {
 	let streaming = initialStreaming;
 	const followUps: AgentMessage[] = [];
@@ -78,12 +67,11 @@ function createHarness(initialStreaming: boolean) {
 			scheduledFlushes.push(run);
 		},
 	});
-	let manager!: AsyncJobManager;
 	queue.register<AsyncEntry>("async-result", {
 		isStale: entry => manager.isDeliverySuppressed(entry.jobId),
 		build: buildAsyncMessage,
 	});
-	manager = new AsyncJobManager({
+	const manager = new AsyncJobManager({
 		onJobComplete: (jobId, result, job) => {
 			if (manager.isDeliverySuppressed(jobId)) return;
 			queue.enqueue<AsyncEntry>("async-result", {
@@ -107,14 +95,6 @@ function createHarness(initialStreaming: boolean) {
 	};
 }
 
-async function waitUntil(predicate: () => boolean, message: string): Promise<void> {
-	const deadline = Date.now() + 2_000;
-	while (!predicate()) {
-		if (Date.now() >= deadline) throw new Error(message);
-		await Bun.sleep(5);
-	}
-}
-
 afterEach(async () => {
 	const manager = AsyncJobManager.instance();
 	if (manager) {
@@ -124,22 +104,6 @@ afterEach(async () => {
 });
 
 describe("async result yield queue delivery", () => {
-	test("job poll acknowledgement suppresses already staged completion", async () => {
-		const harness = createHarness(true);
-		const jobId = harness.manager.register("bash", "race job", async () => "inline result");
-
-		await harness.manager.waitForAll();
-		await waitUntil(() => harness.queue.has("async-result"), "Timed out waiting for staged async result");
-
-		const tool = new HubTool(createToolSession(harness.manager));
-		const result = await tool.execute("tool-call", { op: "wait", ids: [jobId] });
-		expect((result.details as CoordinationDetails)?.jobs?.find(job => job.id === jobId)?.status).toBe("completed");
-
-		await harness.queue.flush("streaming");
-
-		expect(harness.followUps).toHaveLength(0);
-	});
-
 	test("multiple completions in one yield window become one follow-up", async () => {
 		const harness = createHarness(true);
 		const firstJobId = harness.manager.register("bash", "first", async () => "first result");
@@ -170,5 +134,59 @@ describe("async result yield queue delivery", () => {
 		expect(harness.prompts).toHaveLength(1);
 		expect(harness.prompts[0]).toHaveLength(1);
 		expect(asyncDetails(harness.prompts[0]![0]!).jobs.map(job => job.jobId)).toEqual([jobId]);
+	});
+
+	test("releases a canceled idle-flush latch for rescheduling", () => {
+		const harness = createHarness(false);
+		harness.queue.enqueue<AsyncEntry>("async-result", {
+			jobId: "idle-retry",
+			result: "retry",
+			job: undefined,
+			durationMs: undefined,
+		});
+		expect(harness.scheduledFlushes).toHaveLength(1);
+
+		harness.queue.cancelIdleFlushScheduling();
+		harness.queue.requestIdleFlush();
+
+		expect(harness.scheduledFlushes).toHaveLength(2);
+	});
+
+	test("holds a streaming receipt until the aside enters live context", async () => {
+		const harness = createHarness(true);
+		const receipt = harness.queue.enqueueWithReceipt<AsyncEntry>("async-result", {
+			jobId: "streaming-receipt",
+			result: "done",
+			job: undefined,
+			durationMs: undefined,
+		});
+		let delivered = false;
+		void receipt.then(() => {
+			delivered = true;
+		});
+		const message = harness.queue.drainLazy()[0]?.();
+		if (!message) throw new Error("Expected a lazy aside");
+
+		await Promise.resolve();
+		expect(delivered).toBe(false);
+		(message as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
+		await receipt;
+		expect(delivered).toBe(true);
+	});
+
+	test("rejects a streaming receipt when the agent discards its aside", async () => {
+		const harness = createHarness(true);
+		const receipt = harness.queue.enqueueWithReceipt<AsyncEntry>("async-result", {
+			jobId: "discarded-receipt",
+			result: "done",
+			job: undefined,
+			durationMs: undefined,
+		});
+		const message = harness.queue.drainLazy()[0]?.();
+		if (!message) throw new Error("Expected a lazy aside");
+
+		(message as CommittableAsideMessage)[ASIDE_MESSAGE_DISCARD]?.(new Error("deadline expired"));
+
+		await expect(receipt).rejects.toThrow("deadline expired");
 	});
 });

@@ -3,6 +3,8 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use crate::task;
+
 #[napi(object)]
 pub struct BlockRangeOptions {
 	/// Source code to inspect.
@@ -44,6 +46,67 @@ pub fn block_range_at(options: BlockRangeOptions) -> Result<Option<BlockRange>> 
 	})
 	.map(|range| range.map(Into::into))
 	.map_err(|error| Error::from_reason(error.to_string()))
+}
+
+#[napi(object)]
+pub struct NodeSpan {
+	/// 1-indexed inclusive first line of the node.
+	pub start_line: u32,
+	/// 1-indexed inclusive last content line of the node.
+	pub end_line:   u32,
+	/// Tree-sitter grammar node kind (e.g. `attribute_item`, `function_item`).
+	pub kind:       String,
+}
+
+impl From<pi_ast::block::NodeSpan> for NodeSpan {
+	fn from(value: pi_ast::block::NodeSpan) -> Self {
+		Self { start_line: value.start_line, end_line: value.end_line, kind: value.kind }
+	}
+}
+
+/// Named-node chain containing `options.line`, innermost-first, excluding the
+/// whole-file root.
+///
+/// Single-line nodes beginning on the line (attributes, decorators) come
+/// first, followed by every enclosing construct. ERROR/MISSING recovery nodes
+/// are skipped. Returns `null` when the language is unrecognized, the line is
+/// out of range / blank, or the source fails to parse entirely.
+#[napi]
+pub fn node_chain_at(options: BlockRangeOptions) -> Result<Option<Vec<NodeSpan>>> {
+	pi_ast::block::node_chain_at(pi_ast::block::BlockRangeOptions {
+		code: options.code,
+		lang: options.lang,
+		path: options.path,
+		line: options.line,
+	})
+	.map(|chain| chain.map(|spans| spans.into_iter().map(Into::into).collect()))
+	.map_err(|error| Error::from_reason(error.to_string()))
+}
+
+#[napi(object)]
+pub struct BlockParseOptions {
+	/// Source code to parse.
+	pub code: String,
+	/// Language alias (e.g. "rust", "typescript") used before path inference.
+	pub lang: Option<String>,
+	/// File path used to infer language by extension when `lang` is omitted.
+	pub path: Option<String>,
+}
+
+/// Parse `options.code` into the shared tree cache on the native blocking
+/// pool.
+///
+/// [`enclosing_block_boundaries`], [`block_range_at`] and [`node_chain_at`]
+/// are synchronous and parse on the JS thread when their source is not
+/// cached; awaiting this first makes that parse a cache hit. Resolves without
+/// parsing when the language is unrecognized or the source is over 2 MiB,
+/// where a typical tree would not fit the cache's memory budget.
+#[napi]
+pub fn warm_block_parse(options: BlockParseOptions) -> task::Promise<()> {
+	task::blocking("block.warm_parse", (), move |_| {
+		pi_ast::block::warm_parse(&options.code, options.lang.as_deref(), options.path.as_deref())
+			.map_err(|error| Error::from_reason(error.to_string()))
+	})
 }
 
 #[napi(object)]

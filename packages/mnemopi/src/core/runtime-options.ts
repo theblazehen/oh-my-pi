@@ -1,12 +1,18 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Api, ApiKey, Model } from "@oh-my-pi/pi-ai";
 
+export type MnemopiLlmCompletionTask = {
+	kind: "memory-extraction";
+	input: string;
+};
+
 export interface MnemopiLlmCompleteOptions {
 	maxTokens?: number;
 	temperature?: number;
 	timeout?: number;
 	provider?: string | null;
 	model?: string | null;
+	task?: MnemopiLlmCompletionTask;
 }
 
 export type MnemopiLlmCompletion = (
@@ -35,6 +41,8 @@ export interface MnemopiEmbeddingRuntimeOptions {
 	provider?: MnemopiEmbeddingProvider | ((texts: readonly string[]) => EmbeddingOutput | Promise<EmbeddingOutput>);
 	/** Override `MNEMOPI_EMBEDDING_MAX_INPUT_CHARS`. `0` disables the cap. See `config.embeddingMaxInputChars`. */
 	maxInputChars?: number;
+	/** Override `MNEMOPI_EMBEDDING_BATCH_SIZE`: max texts per embedding API request. */
+	batchSize?: number;
 }
 
 export interface MnemopiLlmRuntimeOptions {
@@ -64,6 +72,7 @@ export interface ResolvedMnemopiEmbeddingRuntimeOptions {
 	apiKey?: ApiKey;
 	provider?: MnemopiEmbeddingProvider;
 	maxInputChars?: number;
+	batchSize?: number;
 }
 
 export interface ResolvedMnemopiLlmRuntimeOptions {

@@ -3,9 +3,8 @@ export { truncate } from "@oh-my-pi/pi-utils";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
-import { type Theme, theme } from "../modes/theme/theme";
-import { formatGroupedFiles } from "../tools/grouped-file-output";
-import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
+import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
+import { formatPathRelativeToCwd, resolveToCwd, specialFileKind } from "../tools/path-utils";
 import type {
 	CodeAction,
 	Command,
@@ -19,7 +18,14 @@ import type {
 	WorkspaceEdit,
 } from "./types";
 
-export { detectLanguageId } from "../utils/lang-from-path";
+export { detectLanguageId } from "@oh-my-pi/pi-tui/lang-from-path";
+
+/** Read a file's text, refusing FIFOs, devices and sockets, whose reads can block forever or never end. */
+export async function readTextFromDisk(filePath: string): Promise<string> {
+	const kind = specialFileKind(await fs.stat(filePath));
+	if (kind) throw new Error(`Cannot open '${filePath}': it is a ${kind}, not a regular file or directory.`);
+	return Bun.file(filePath).text();
+}
 
 // =============================================================================
 // URI Handling (Cross-Platform)
@@ -78,6 +84,35 @@ function laxUriToFile(uri: string): string {
 	return filePath;
 }
 
+/** Map that treats equivalent file URI spellings as the same key. */
+export class EquivalentUriMap<Value> extends Map<string, Value> {
+	#key(uri: string): string {
+		if (!uri.startsWith("file://")) return uri;
+		const filePath = path.normalize(uriToFile(uri));
+		return process.platform === "win32" ? filePath.toLowerCase() : filePath;
+	}
+
+	override delete(uri: string): boolean {
+		const key = this.#key(uri);
+		return super.delete(key);
+	}
+
+	override get(uri: string): Value | undefined {
+		const key = this.#key(uri);
+		return super.get(key);
+	}
+
+	override has(uri: string): boolean {
+		const key = this.#key(uri);
+		return super.has(key);
+	}
+
+	override set(uri: string, value: Value): this {
+		const key = this.#key(uri);
+		return super.set(key, value);
+	}
+}
+
 // =============================================================================
 // Diagnostic Formatting
 // =============================================================================
@@ -112,6 +147,35 @@ export function sortDiagnostics(diagnostics: Diagnostic[]): Diagnostic[] {
 		if (aCol !== bCol) return aCol - bCol;
 		return a.message.localeCompare(b.message);
 	});
+}
+
+function diagnosticFingerprint(d: Diagnostic): string {
+	return `${d.range.start.line}:${d.range.start.character}:${d.range.end.line}:${d.range.end.character}:${d.source ?? ""}:${d.message}`;
+}
+
+/**
+ * Merge two diagnostic lists, preserving order and deduplicating by range, source and message.
+ */
+export function mergeDiagnosticLists(primary: Diagnostic[], secondary: Diagnostic[]): Diagnostic[] {
+	if (primary.length === 0) return secondary.slice();
+	if (secondary.length === 0) return primary.slice();
+	const seen = new Set<string>();
+	const merged: Diagnostic[] = [];
+	for (const d of primary) {
+		const key = diagnosticFingerprint(d);
+		if (!seen.has(key)) {
+			seen.add(key);
+			merged.push(d);
+		}
+	}
+	for (const d of secondary) {
+		const key = diagnosticFingerprint(d);
+		if (!seen.has(key)) {
+			seen.add(key);
+			merged.push(d);
+		}
+	}
+	return merged;
 }
 
 /**
@@ -165,57 +229,6 @@ export function formatDiagnostic(diagnostic: Diagnostic, filePath: string): stri
 	const message = stripDiagnosticNoise(diagnostic.message);
 
 	return `${filePath}:${line}:${col} [${severity}] ${source}${message}${code}`;
-}
-
-// Regex: split on the first `:digits:digits` boundary to separate path from the rest
-const DIAG_PATH_RE = /^(.+?):(\d+:\d+\s+.*)$/;
-
-/**
- * Reformat pre-formatted diagnostic messages into a multi-level, prefix-folded
- * directory/file grouping (see `formatGroupedFiles`).
- * Input:  ["path:line:col [sev] msg", ...]
- * Output: "# pkg/src/\n## file.ts\n  line:col [sev] msg"
- *
- * Messages that don't match the expected format are appended ungrouped at the end.
- */
-export function formatGroupedDiagnosticMessages(messages: string[]): string {
-	const diagnosticsByFile = new Map<string, string[]>();
-	const fileOrder: string[] = [];
-	const ungrouped: string[] = [];
-
-	for (const msg of messages) {
-		const match = DIAG_PATH_RE.exec(msg);
-		if (!match) {
-			ungrouped.push(msg);
-			continue;
-		}
-
-		const [, rawFilePath, rest] = match;
-		const filePath = rawFilePath.replace(/\\/g, "/");
-		if (!diagnosticsByFile.has(filePath)) {
-			diagnosticsByFile.set(filePath, []);
-			fileOrder.push(filePath);
-		}
-		diagnosticsByFile.get(filePath)?.push(rest);
-	}
-
-	if (diagnosticsByFile.size === 0) {
-		return ungrouped.join("\n");
-	}
-
-	const grouped = formatGroupedFiles(fileOrder, filePath => ({
-		modelLines: (diagnosticsByFile.get(filePath) ?? []).map(diagnostic => `  ${diagnostic}`),
-	}));
-	const lines: string[] = grouped.model;
-
-	if (ungrouped.length > 0) {
-		lines.push("");
-		for (const msg of ungrouped) {
-			lines.push(msg);
-		}
-	}
-
-	return lines.join("\n");
 }
 
 /**
@@ -435,7 +448,7 @@ export function symbolKindToName(kind: SymbolKind): string {
 export function formatDocumentSymbol(symbol: DocumentSymbol, indent = 0): string[] {
 	const prefix = "  ".repeat(indent);
 	const icon = symbolKindToIcon(symbol.kind);
-	const line = symbol.range.start.line + 1;
+	const line = symbol.selectionRange.start.line + 1;
 	const detail = symbol.detail ? ` ${symbol.detail}` : "";
 	const results = [`${prefix}${icon} ${symbol.name}${detail} @ line ${line}`];
 
@@ -491,6 +504,21 @@ export function formatCodeAction(action: CodeAction | Command, index: number): s
 	const preferred = "isPreferred" in action && action.isPreferred ? " (preferred)" : "";
 	const disabled = "disabled" in action && action.disabled ? ` (disabled: ${action.disabled.reason})` : "";
 	return `${index}: [${kind}] ${action.title}${preferred}${disabled}`;
+}
+
+/**
+ * Appends the `extra` code actions that do not already appear, identically, in `base`.
+ * `code_actions` merges its unfiltered and `source`-kind requests with this; servers that
+ * ignore `context.only` answer both with the same actions. Same-titled actions that differ
+ * in any field (edit, command, data) stay distinct, as do repeats within one response.
+ */
+export function mergeCodeActions(
+	base: (CodeAction | Command)[] | null,
+	extra: (CodeAction | Command)[] | null,
+): (CodeAction | Command)[] {
+	const merged = base ?? [];
+	const seen = new Set(merged.map(action => JSON.stringify(action)));
+	return [...merged, ...(extra ?? []).filter(action => !seen.has(JSON.stringify(action)))];
 }
 
 export interface CodeActionApplyDependencies {
@@ -666,7 +694,7 @@ function parseSymbolSpec(spec: string): { symbol: string; occurrence: number } {
 export async function resolveSymbolColumn(filePath: string, line: number, symbolSpec?: string): Promise<number> {
 	const lineNumber = Math.max(1, line);
 	try {
-		const fileText = await Bun.file(filePath).text();
+		const fileText = await readTextFromDisk(filePath);
 		const lines = fileText.split("\n");
 		const targetLine = lines[lineNumber - 1] ?? "";
 		if (!symbolSpec) {
@@ -697,8 +725,10 @@ export async function readLocationContext(filePath: string, line: number, contex
 	const targetLine = Math.max(1, line);
 	const surrounding = Math.max(0, contextLines);
 	try {
+		// Context is decoration: a special-file location keeps its header, like a missing file.
+		if (specialFileKind(await fs.stat(filePath))) return [];
 		const fileText = await Bun.file(filePath).text();
-		const lines = fileText.split("\n");
+		const lines = fileText.split(/\r?\n/);
 		if (lines.length === 0) return [];
 
 		const startLine = Math.max(1, targetLine - surrounding);

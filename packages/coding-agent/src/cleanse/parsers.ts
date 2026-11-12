@@ -3,26 +3,40 @@ import { isRecord, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { CleanseDiagnostic, CleanseSeverity } from "./types";
 
 /** Machine and fallback output formats understood by cleanse. */
-export type CleanseParserKind =
-	| "rust"
-	| "rust-test"
-	| "go"
-	| "go-test"
-	| "ruff"
-	| "pyright"
-	| "eslint"
-	| "biome"
-	| "rubocop"
-	| "phpstan"
-	| "psalm"
-	| "swiftlint"
-	| "dart"
-	| "credo"
-	| "shellcheck"
-	| "hlint"
-	| "terraform"
-	| "tflint"
-	| "generic";
+export const CLEANSE_PARSER_KINDS = [
+	"rust",
+	"rust-test",
+	"go",
+	"go-test",
+	"staticcheck",
+	"golangci",
+	"ruff",
+	"pyright",
+	"mypy",
+	"pylint",
+	"flake8",
+	"ty",
+	"eslint",
+	"biome",
+	"oxlint",
+	"deno-lint",
+	"stylelint",
+	"rubocop",
+	"phpstan",
+	"psalm",
+	"swiftlint",
+	"dart",
+	"credo",
+	"shellcheck",
+	"hlint",
+	"terraform",
+	"tflint",
+	"actionlint",
+	"generic",
+] as const;
+
+/** One machine or fallback output format understood by cleanse. */
+export type CleanseParserKind = (typeof CLEANSE_PARSER_KINDS)[number];
 
 /** Captured checker process output passed to a format parser. */
 export interface CleanseParserInput {
@@ -53,7 +67,180 @@ interface ParsedLocation {
 
 /** Parse one checker invocation into normalized, project-relative diagnostics. */
 export function parseCleanseDiagnostics(kind: CleanseParserKind, input: CleanseParserInput): CleanseDiagnostic[] {
-	const parsed = (() => {
+	const parsed = parsePrimary(kind, input);
+	return deduplicateDiagnostics(parsed.length > 0 || !GENERIC_FALLBACK[kind] ? parsed : parseGeneric(input));
+}
+
+/** Kinds whose own format falls back to the generic line parser when it matches nothing. */
+const GENERIC_FALLBACK: Partial<Record<CleanseParserKind, true>> = { go: true, "go-test": true };
+
+/**
+ * Where partial output on one stream may be cut so both sides parse independently:
+ * at any line end, or only at line ends outside every JSON document.
+ */
+type StreamFraming = "lines" | "json";
+
+const LINES: { stdout: StreamFraming; stderr: StreamFraming } = { stdout: "lines", stderr: "lines" };
+const JSON_BOTH: { stdout: StreamFraming; stderr: StreamFraming } = { stdout: "json", stderr: "json" };
+const JSON_STDOUT: { stdout: StreamFraming; stderr: StreamFraming } = { stdout: "json", stderr: "lines" };
+
+const STREAM_FRAMING: Record<CleanseParserKind, { stdout: StreamFraming; stderr: StreamFraming }> = {
+	rust: JSON_STDOUT,
+	"rust-test": JSON_STDOUT,
+	go: JSON_BOTH,
+	"go-test": JSON_STDOUT,
+	staticcheck: JSON_BOTH,
+	golangci: LINES,
+	ruff: JSON_BOTH,
+	pyright: JSON_BOTH,
+	mypy: LINES,
+	pylint: JSON_BOTH,
+	flake8: LINES,
+	ty: LINES,
+	eslint: JSON_BOTH,
+	biome: JSON_BOTH,
+	oxlint: LINES,
+	"deno-lint": JSON_BOTH,
+	stylelint: JSON_BOTH,
+	rubocop: JSON_BOTH,
+	phpstan: JSON_BOTH,
+	psalm: JSON_BOTH,
+	swiftlint: JSON_BOTH,
+	dart: LINES,
+	credo: JSON_BOTH,
+	shellcheck: JSON_BOTH,
+	hlint: JSON_BOTH,
+	terraform: JSON_BOTH,
+	tflint: JSON_BOTH,
+	actionlint: JSON_BOTH,
+	generic: LINES,
+};
+
+/**
+ * Incremental parser for output of a checker that is still running.
+ *
+ * Each {@link push} takes the text appended to stdout/stderr since the previous call and
+ * parses only the output completed since then, cut where the format parses independently:
+ * at line ends, and for JSON streams only between documents. The diagnostics yielded across
+ * calls match re-parsing the whole completed prefix each time; callers dedupe across calls.
+ */
+export class CleanseStreamParser {
+	readonly #kind: CleanseParserKind;
+	readonly #context: Omit<CleanseParserInput, "stdout" | "stderr">;
+	readonly #stdout: StreamCutter;
+	readonly #stderr: StreamCutter;
+	#primaryFound = false;
+
+	constructor(kind: CleanseParserKind, context: Omit<CleanseParserInput, "stdout" | "stderr">) {
+		this.#kind = kind;
+		this.#context = context;
+		const framing = STREAM_FRAMING[kind];
+		this.#stdout = new StreamCutter(framing.stdout);
+		this.#stderr = new StreamCutter(framing.stderr);
+	}
+
+	/** Feed newly produced output; returns diagnostics parsed from newly completed segments. */
+	push(stdout: string, stderr: string): CleanseDiagnostic[] {
+		const input: CleanseParserInput = {
+			...this.#context,
+			stdout: this.#stdout.push(stdout),
+			stderr: this.#stderr.push(stderr),
+		};
+		if (!input.stdout && !input.stderr) return [];
+		const parsed = parsePrimary(this.#kind, input);
+		if (parsed.length > 0) this.#primaryFound = true;
+		// The generic fallback applies only while the primary format has matched nothing
+		// in the whole prefix, exactly as a full re-parse of that prefix would decide.
+		const fallback = !this.#primaryFound && GENERIC_FALLBACK[this.#kind];
+		return deduplicateDiagnostics(fallback ? parseGeneric(input) : parsed);
+	}
+}
+
+/** Splits one growing output stream into sanitized segments that parse independently. */
+class StreamCutter {
+	readonly #json: boolean;
+	/** Raw output after the last newline seen, as received; joined once its line completes. */
+	#partial: string[] = [];
+	/** Sanitized complete lines held back while a JSON document is open; joined once it closes. */
+	#held: string[] = [];
+	// JSON scanner state at the end of #held, mirroring parseJsonValues.
+	#inDocument = false;
+	#depth = 0;
+	#inString = false;
+	#escaped = false;
+	/** Whether the current line already has non-whitespace text outside a document. */
+	#lineHasText = false;
+
+	constructor(framing: StreamFraming) {
+		this.#json = framing === "json";
+	}
+
+	push(chunk: string): string {
+		const newline = chunk.lastIndexOf("\n");
+		if (newline < 0) {
+			if (chunk.length > 0) this.#partial.push(chunk);
+			return "";
+		}
+		this.#partial.push(chunk.slice(0, newline + 1));
+		const lines = this.#partial.join("");
+		this.#partial = newline + 1 < chunk.length ? [chunk.slice(newline + 1)] : [];
+		// Sanitize whole lines only: ANSI sequences never span a newline, so this
+		// equals the corresponding slice of the full sanitized output.
+		const complete = sanitizeText(lines);
+		if (!this.#json) return complete;
+		const cut = this.#scan(complete);
+		if (cut === 0) {
+			this.#held.push(complete);
+			return "";
+		}
+		this.#held.push(complete.slice(0, cut));
+		const emitted = this.#held.join("");
+		this.#held = cut < complete.length ? [complete.slice(cut)] : [];
+		return emitted;
+	}
+
+	/**
+	 * Advance the scanner over newly completed `text`; returns the offset in it
+	 * after the last line end outside a document, or 0. A document opens only
+	 * at a line's first non-whitespace character, so a brace inside a plain
+	 * text diagnostic (`expected '{'`) does not hold the stream back.
+	 */
+	#scan(text: string): number {
+		let cut = 0;
+		for (let index = 0; index < text.length; index += 1) {
+			const char = text[index];
+			if (!this.#inDocument) {
+				if (char === "\n") {
+					cut = index + 1;
+					this.#lineHasText = false;
+				} else if (!this.#lineHasText && (char === "{" || char === "[")) {
+					this.#inDocument = true;
+					this.#depth = 1;
+					this.#inString = false;
+					this.#escaped = false;
+				} else if (char !== " " && char !== "\t" && char !== "\r") {
+					this.#lineHasText = true;
+				}
+				continue;
+			}
+			if (this.#inString) {
+				if (this.#escaped) this.#escaped = false;
+				else if (char === "\\") this.#escaped = true;
+				else if (char === '"') this.#inString = false;
+				continue;
+			}
+			if (char === '"') this.#inString = true;
+			else if (char === "{" || char === "[") this.#depth += 1;
+			else if (char === "}" || char === "]") this.#depth -= 1;
+			if (this.#depth === 0) this.#inDocument = false;
+		}
+		return cut;
+	}
+}
+
+/** The kind's own format, without the generic fallback. */
+function parsePrimary(kind: CleanseParserKind, input: CleanseParserInput): CleanseDiagnostic[] {
+	return (() => {
 		switch (kind) {
 			case "rust":
 				return parseRust(input);
@@ -63,14 +250,32 @@ export function parseCleanseDiagnostics(kind: CleanseParserKind, input: CleanseP
 				return parseGo(input);
 			case "go-test":
 				return parseGoTest(input);
+			case "staticcheck":
+				return parseStaticcheck(input);
+			case "golangci":
+				return parseGolangci(input);
 			case "ruff":
 				return parseRuff(input);
 			case "pyright":
 				return parsePyright(input);
+			case "mypy":
+				return parseGeneric(input);
+			case "pylint":
+				return parsePylint(input);
+			case "flake8":
+				return parseFlake8(input);
+			case "ty":
+				return parseTy(input);
 			case "eslint":
 				return parseEslint(input);
 			case "biome":
 				return parseBiome(input);
+			case "oxlint":
+				return parseUnixFormat(input);
+			case "deno-lint":
+				return parseDenoLint(input);
+			case "stylelint":
+				return parseStylelint(input);
 			case "rubocop":
 				return parseRubocop(input);
 			case "phpstan":
@@ -91,11 +296,12 @@ export function parseCleanseDiagnostics(kind: CleanseParserKind, input: CleanseP
 				return parseTerraform(input);
 			case "tflint":
 				return parseTflint(input);
+			case "actionlint":
+				return parseActionlint(input);
 			case "generic":
 				return parseGeneric(input);
 		}
 	})();
-	return deduplicateDiagnostics(parsed);
 }
 
 function toRecord(value: unknown): Record<string, unknown> | undefined {
@@ -292,7 +498,7 @@ function parseGo(input: CleanseParserInput): CleanseDiagnostic[] {
 		for (const key in record) visit(record[key], key);
 	};
 	for (const value of allJsonValues(input)) visit(value);
-	return diagnostics.length > 0 ? diagnostics : parseGeneric(input);
+	return diagnostics;
 }
 
 function parseGoTest(input: CleanseParserInput): CleanseDiagnostic[] {
@@ -323,7 +529,45 @@ function parseGoTest(input: CleanseParserInput): CleanseDiagnostic[] {
 			});
 		}
 	}
-	return diagnostics.length > 0 ? diagnostics : parseGeneric(input);
+	return diagnostics;
+}
+
+function parseStaticcheck(input: CleanseParserInput): CleanseDiagnostic[] {
+	const diagnostics: CleanseDiagnostic[] = [];
+	for (const value of allJsonValues(input)) {
+		const record = toRecord(value);
+		const location = nestedRecord(record, "location");
+		const end = nestedRecord(record, "end");
+		addDiagnostic(diagnostics, input, {
+			file: stringField(location, "file"),
+			line: numberField(location, "line"),
+			column: numberField(location, "column"),
+			endLine: numberField(end, "line"),
+			endColumn: numberField(end, "column"),
+			code: stringField(record, "code"),
+			severity: stringField(record, "severity") ?? "warning",
+			message: stringField(record, "message"),
+		});
+	}
+	return diagnostics;
+}
+
+function parseGolangci(input: CleanseParserInput): CleanseDiagnostic[] {
+	const diagnostics: CleanseDiagnostic[] = [];
+	const text = sanitizeText(`${input.stdout}\n${input.stderr}`);
+	for (const line of text.split("\n")) {
+		const match = /^(.+?):(\d+):(\d+):\s+(.*?)\s+\(([A-Za-z0-9_-]+)\)$/.exec(line.trim());
+		if (!match) continue;
+		addDiagnostic(diagnostics, input, {
+			file: match[1],
+			line: Number.parseInt(match[2], 10),
+			column: Number.parseInt(match[3], 10),
+			code: match[5],
+			severity: "warning",
+			message: match[4],
+		});
+	}
+	return diagnostics;
 }
 
 function parseRuff(input: CleanseParserInput): CleanseDiagnostic[] {
@@ -374,6 +618,62 @@ function parsePyright(input: CleanseParserInput): CleanseDiagnostic[] {
 	return diagnostics;
 }
 
+function parsePylint(input: CleanseParserInput): CleanseDiagnostic[] {
+	const diagnostics: CleanseDiagnostic[] = [];
+	for (const root of allJsonValues(input)) {
+		for (const value of toArray(root)) {
+			const record = toRecord(value);
+			addDiagnostic(diagnostics, input, {
+				file: stringField(record, "path"),
+				line: numberField(record, "line"),
+				column: zeroBased(numberField(record, "column")),
+				endLine: numberField(record, "endLine"),
+				endColumn: zeroBased(numberField(record, "endColumn")),
+				code: stringField(record, "symbol") ?? stringField(record, "message-id"),
+				severity: stringField(record, "type"),
+				message: stringField(record, "message"),
+			});
+		}
+	}
+	return diagnostics;
+}
+
+function parseFlake8(input: CleanseParserInput): CleanseDiagnostic[] {
+	const diagnostics: CleanseDiagnostic[] = [];
+	const text = sanitizeText(`${input.stdout}\n${input.stderr}`);
+	for (const line of text.split("\n")) {
+		const match = /^(.+?):(\d+):(\d+):\s+([A-Z]+\d+)\s+(.*)$/.exec(line.trim());
+		if (!match) continue;
+		addDiagnostic(diagnostics, input, {
+			file: match[1],
+			line: Number.parseInt(match[2], 10),
+			column: Number.parseInt(match[3], 10),
+			code: match[4],
+			severity: match[4].startsWith("F") || match[4].startsWith("E9") ? "error" : "warning",
+			message: match[5],
+		});
+	}
+	return diagnostics;
+}
+
+function parseTy(input: CleanseParserInput): CleanseDiagnostic[] {
+	const diagnostics: CleanseDiagnostic[] = [];
+	const text = sanitizeText(`${input.stdout}\n${input.stderr}`);
+	for (const line of text.split("\n")) {
+		const match = /^(.+?):(\d+):(\d+):\s+(error|warning|info)\[([^\]]+)\]\s+(.*)$/.exec(line.trim());
+		if (!match) continue;
+		addDiagnostic(diagnostics, input, {
+			file: match[1],
+			line: Number.parseInt(match[2], 10),
+			column: Number.parseInt(match[3], 10),
+			code: match[5],
+			severity: match[4],
+			message: match[6],
+		});
+	}
+	return diagnostics;
+}
+
 function zeroBased(value: number | undefined): number | undefined {
 	return value === undefined ? undefined : value + 1;
 }
@@ -419,6 +719,83 @@ function parseBiome(input: CleanseParserInput): CleanseDiagnostic[] {
 				severity: stringField(record, "severity"),
 				message,
 			});
+		}
+	}
+	return diagnostics;
+}
+
+function parseUnixFormat(input: CleanseParserInput): CleanseDiagnostic[] {
+	const diagnostics: CleanseDiagnostic[] = [];
+	const text = sanitizeText(`${input.stdout}\n${input.stderr}`);
+	for (const line of text.split("\n")) {
+		const match = /^(.+?):(\d+):(\d+):\s+(.*?)\s+\[(Error|Warning)\/([^\]]+)\]$/i.exec(line.trim());
+		if (!match) continue;
+		addDiagnostic(diagnostics, input, {
+			file: match[1],
+			line: Number.parseInt(match[2], 10),
+			column: Number.parseInt(match[3], 10),
+			code: match[6],
+			severity: match[5],
+			message: match[4],
+		});
+	}
+	return diagnostics;
+}
+
+function parseDenoLint(input: CleanseParserInput): CleanseDiagnostic[] {
+	const diagnostics: CleanseDiagnostic[] = [];
+	for (const root of allJsonValues(input)) {
+		const record = toRecord(root);
+		if (!record) continue;
+		for (const value of toArray(record.diagnostics)) {
+			const entry = toRecord(value);
+			const range = nestedRecord(entry, "range");
+			const start = nestedRecord(range, "start");
+			const end = nestedRecord(range, "end");
+			addDiagnostic(diagnostics, input, {
+				file: stringField(entry, "filename"),
+				line: numberField(start, "line"),
+				column: zeroBased(numberField(start, "col")),
+				endLine: numberField(end, "line"),
+				endColumn: zeroBased(numberField(end, "col")),
+				code: stringField(entry, "code"),
+				severity: "warning",
+				message: stringField(entry, "message"),
+				suggestion: stringField(entry, "hint"),
+			});
+		}
+		for (const value of toArray(record.errors)) {
+			const entry = toRecord(value);
+			addDiagnostic(diagnostics, input, {
+				file: stringField(entry, "file_path"),
+				severity: "error",
+				message: stringField(entry, "message"),
+			});
+		}
+	}
+	return diagnostics;
+}
+
+function parseStylelint(input: CleanseParserInput): CleanseDiagnostic[] {
+	const diagnostics: CleanseDiagnostic[] = [];
+	for (const root of allJsonValues(input)) {
+		for (const value of toArray(root)) {
+			const record = toRecord(value);
+			const source = stringField(record, "source");
+			if (!source) continue;
+			for (const warning of toArray(record?.warnings)) {
+				const entry = toRecord(warning);
+				addDiagnostic(diagnostics, input, {
+					file: source,
+					line: numberField(entry, "line"),
+					column: numberField(entry, "column"),
+					endLine: numberField(entry, "endLine"),
+					endColumn: numberField(entry, "endColumn"),
+					code: stringField(entry, "rule"),
+					severity: stringField(entry, "severity"),
+					message: stringField(entry, "text"),
+				});
+			}
 		}
 	}
 	return diagnostics;
@@ -648,6 +1025,24 @@ function parseTflint(input: CleanseParserInput): CleanseDiagnostic[] {
 			addDiagnostic(diagnostics, input, {
 				severity: "error",
 				message: stringField(error, "message"),
+			});
+		}
+	}
+	return diagnostics;
+}
+
+function parseActionlint(input: CleanseParserInput): CleanseDiagnostic[] {
+	const diagnostics: CleanseDiagnostic[] = [];
+	for (const root of allJsonValues(input)) {
+		for (const value of toArray(root)) {
+			const record = toRecord(value);
+			addDiagnostic(diagnostics, input, {
+				file: stringField(record, "filepath"),
+				line: numberField(record, "line"),
+				column: numberField(record, "column"),
+				code: stringField(record, "kind"),
+				severity: "error",
+				message: stringField(record, "message"),
 			});
 		}
 	}

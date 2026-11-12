@@ -1,15 +1,16 @@
 /**
  * Manage configuration settings.
  */
+
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
-import { type ConfigAction, type ConfigCommandArgs, runConfigCommand } from "../cli/config-cli";
-import { initTheme } from "../modes/theme/theme";
+import { configHelp as commandHelp } from "../cli/command-help";
+import { type ConfigAction, type ConfigCommandArgs, type ConfigScope, runConfigCommand } from "../cli/config-cli";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 
 const ACTIONS: ConfigAction[] = ["list", "get", "set", "reset", "path", "init-xdg"];
 
 export default class Config extends Command {
-	static description = "Manage configuration settings";
-
+	static description = commandHelp.description;
 	static args = {
 		action: Args.string({
 			description: "Config action",
@@ -29,6 +30,11 @@ export default class Config extends Command {
 
 	static flags = {
 		json: Flags.boolean({ description: "Output JSON" }),
+		scope: Flags.string({
+			description:
+				'With list: only the keys the "global" (config.yml in the agent dir) or "project" (<cwd>/.omp) layer sets, as written',
+			options: ["global", "project"],
+		}),
 	};
 
 	async run(): Promise<void> {
@@ -42,6 +48,7 @@ export default class Config extends Command {
 			value,
 			flags: {
 				json: flags.json,
+				scope: flags.scope as ConfigScope | undefined,
 			},
 		};
 

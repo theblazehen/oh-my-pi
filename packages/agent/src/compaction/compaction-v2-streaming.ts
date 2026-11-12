@@ -9,11 +9,11 @@
 
 import type { Api, CodexCompactionContext, FetchImpl, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { createOpenAICodexCompactionRequestContext } from "@oh-my-pi/pi-ai/providers/openai-codex-compaction";
 import { applyCodexResponsesLiteShape } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
-import {
-	createOpenAICodexCompactionRequestContext,
-	createOpenAICodexCompatibilityMetadata,
-	type OpenAICodexCompatibilityMetadata,
+import type {
+	OpenAICodexCompactionBody,
+	OpenAICodexCompatibilityMetadata,
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import {
 	getOpenAIPromptCacheKey,
@@ -22,13 +22,19 @@ import {
 	resolveOpenAIRequestSetup,
 } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { captureOpenAIHttpError } from "@oh-my-pi/pi-ai/utils/openai-http";
+import type { CatalogPolicyInputs } from "@oh-my-pi/pi-catalog/types";
+import { isBedrockOpenAIUrl } from "@oh-my-pi/pi-catalog/hosts";
 import {
+	applyCodexResidencyHeader,
 	CODEX_BASE_URL,
+	codexRoutingHint,
 	getCodexAccountId,
 	OPENAI_HEADER_VALUES,
 	OPENAI_HEADERS,
 } from "@oh-my-pi/pi-catalog/wire/codex";
-import { $env, logger, stringifyJson } from "@oh-my-pi/pi-utils";
+import { $env, isUnexpectedSocketCloseMessage, logger, ptree, stringifyJson, toError } from "@oh-my-pi/pi-utils";
+import { appendAzureApiVersion, resolveAzureOpenAiBaseUrl } from "./azure-openai-endpoint";
+import { prepareBedrockCompactionRequest } from "./bedrock";
 
 // ============================================================================
 // Types & Configuration
@@ -40,10 +46,9 @@ export const V2_RETAINED_MESSAGE_TOKEN_BUDGET = 64_000;
 /** Max retries for V2 streaming compaction on transient stream errors. */
 export const V2_COMPACTION_MAX_RETRIES = 2;
 
-/** Timeout for V2 streaming compaction (3 minutes, same as V1). */
-export const V2_COMPACTION_TIMEOUT_MS = 180_000;
+/** Timeout for V2 streaming compaction (5 minutes, same as V1). */
+export const V2_COMPACTION_TIMEOUT_MS = 300_000;
 
-const DEFAULT_AZURE_API_VERSION = "v1";
 const OPENAI_REMOTE_COMPACTION_PRESERVE_KEY = "openaiRemoteCompaction";
 const COMPACTION_TRIGGER_ITEM = { type: "compaction_trigger" } as const;
 // OpenAI image metering depends on detail and dimensions; charge the common
@@ -67,15 +72,13 @@ export interface CompactionV2Usage {
 	reasoningOutputTokens?: number;
 }
 
-/** Request body fields needed for Responses-stream V2 compaction. */
+/** Provider-ready Responses body and local state needed for V2 compaction. */
 export interface CompactionV2Request {
-	model: string;
+	body: OpenAICodexCompactionBody;
 	input: unknown[];
-	instructions: string;
+	/** Serialized user-written turns to keep next to the compaction item; defaults to `input`. */
+	retainedUserItems: unknown[];
 	retainedMessageBudget: number;
-	tools?: unknown[];
-	/** Responses reasoning param (effort + summary), matching a normal turn; omitted for non-reasoning models. */
-	reasoning?: { effort: string; summary: string };
 	sessionId?: string;
 	promptCacheKey?: string;
 }
@@ -96,7 +99,7 @@ export interface CompactionV2Response {
 /** Resolve the streaming Responses endpoint for a V2-capable model. */
 export function getCompactionV2Endpoint(model: Model): string | undefined {
 	if (model.remoteCompaction?.enabled === false) return undefined;
-	if (!isOpenAiV2CompatibleModel(model)) return undefined;
+	if (!isOpenAiRemoteCompactionApi(compactionV2Api(model))) return undefined;
 
 	const configuredEndpoint = model.remoteCompaction?.v2Endpoint ?? model.remoteCompaction?.streamingEndpoint;
 	if (configuredEndpoint && configuredEndpoint.length > 0) return configuredEndpoint;
@@ -115,17 +118,34 @@ export function getCompactionV2Endpoint(model: Model): string | undefined {
 export function shouldUseCompactionV2Streaming(
 	model: Model,
 ): model is Model<"openai-responses" | "azure-openai-responses" | "openai-codex-responses"> {
-	if (model.remoteCompaction?.v2StreamingEnabled !== true) return false;
+	const v2StreamingEnabled = model.remoteCompaction?.v2StreamingEnabled;
+	if (v2StreamingEnabled === false) return false;
+	// Amazon Bedrock's OpenAI routes accept `compaction_trigger` without an opt-in.
+	if (
+		v2StreamingEnabled !== true &&
+		!(compactionV2Api(model) === "openai-responses" && isBedrockOpenAIUrl(model.baseUrl))
+	) {
+		return false;
+	}
 	return getCompactionV2Endpoint(model) !== undefined;
 }
 
-function compactionV2Api(model: Model): Api | undefined {
+/** Effective compaction request adapter: the `remoteCompaction.api` override, else the model's own API. Always defined — `Model.api` is required. */
+function compactionV2Api(model: Model): Api {
 	return model.remoteCompaction?.api ?? model.api;
 }
 
-function isOpenAiV2CompatibleModel(model: Model): boolean {
-	const api = compactionV2Api(model);
+/** APIs that speak the OpenAI Responses compaction protocol (V1 `/responses/compact` and V2 streaming). */
+export function isOpenAiRemoteCompactionApi(api: Api | undefined): boolean {
 	return api === "openai-responses" || api === "azure-openai-responses" || api === "openai-codex-responses";
+}
+
+function shouldUseCodexProviderTransport(model: Model): model is Model<"openai-codex-responses"> {
+	return (
+		model.api === "openai-codex-responses" &&
+		model.remoteCompaction?.v2Endpoint === undefined &&
+		model.remoteCompaction?.streamingEndpoint === undefined
+	);
 }
 
 function resolveOpenAiResponsesEndpoint(baseUrl: string | undefined): string {
@@ -144,30 +164,28 @@ function resolveOpenAiCodexResponsesEndpoint(baseUrl: string | undefined): strin
 	return `${normalizedBase}/codex/responses`;
 }
 
-function resolveAzureOpenAiBaseUrl(model: Model): string {
-	const baseUrl = $env.AZURE_OPENAI_BASE_URL?.trim() || undefined;
-	const resourceName = $env.AZURE_OPENAI_RESOURCE_NAME;
-	const resolvedBaseUrl =
-		baseUrl ?? (resourceName ? `https://${resourceName}.openai.azure.com/openai/v1` : undefined) ?? model.baseUrl;
-	if (!resolvedBaseUrl) {
-		throw new Error(
-			"Azure OpenAI base URL is required. Set AZURE_OPENAI_BASE_URL or AZURE_OPENAI_RESOURCE_NAME, or configure model.baseUrl.",
-		);
-	}
-	return resolvedBaseUrl.replace(/\/+$/, "");
-}
-
-function appendAzureApiVersion(endpoint: string): string {
-	if (/[?&]api-version=/.test(endpoint)) return endpoint;
-	const separator = endpoint.includes("?") ? "&" : "?";
-	return `${endpoint}${separator}api-version=${encodeURIComponent($env.AZURE_OPENAI_API_VERSION || DEFAULT_AZURE_API_VERSION)}`;
-}
-
 function resolveCompactionV2Model(model: Model): string {
 	const requestModel = model.remoteCompaction?.model ?? model.requestModelId ?? model.id;
 	if (compactionV2Api(model) !== "azure-openai-responses") return requestModel;
 	const mappedDeployment = parseAzureDeploymentNameMap($env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP).get(requestModel);
 	return mappedDeployment ?? requestModel;
+}
+
+/**
+ * Catalog-policy view of a remote compaction request (V1 and V2): the
+ * effective adapter (`remoteCompaction.api`) and the wire id the body sends
+ * (`remoteCompaction.model`). Under a model override the active lane's
+ * `requestModelId` and thinking classification describe a model that never
+ * reaches the wire, so they are dropped; `reasoning` stays because the
+ * compaction body derives its reasoning config from the active model.
+ */
+export function remoteCompactionPolicyModel(model: Model): CatalogPolicyInputs {
+	const api = compactionV2Api(model);
+	const overrideId = model.remoteCompaction?.model;
+	const base = { provider: model.provider, providerType: model.providerType, api, reasoning: model.reasoning };
+	return overrideId == null
+		? { ...base, id: model.id, requestModelId: model.requestModelId, thinking: model.thinking }
+		: { ...base, id: overrideId };
 }
 
 // ============================================================================
@@ -191,15 +209,49 @@ export function buildCompactionV2Request(
 		sessionId?: string;
 		promptCacheKey?: string;
 		retainedMessageBudget?: number;
+		retainedUserItems?: unknown[];
 	},
 ): CompactionV2Request {
-	return {
+	const cacheOptions = { sessionId: options?.sessionId, promptCacheKey: options?.promptCacheKey };
+	const promptCacheKey = getOpenAIPromptCacheKey(cacheOptions);
+	const body: OpenAICodexCompactionBody = {
 		model: resolveCompactionV2Model(model),
 		input,
 		instructions,
+		stream: true,
+		store: false,
+		...(options?.reasoning || model.useResponsesLite
+			? {
+					reasoning: model.useResponsesLite ? { ...options?.reasoning, context: "all_turns" } : options?.reasoning,
+					include: ["reasoning.encrypted_content"],
+				}
+			: {}),
+		...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}),
+		...(options?.tools && options.tools.length > 0 ? { tools: options.tools, tool_choice: "auto" } : {}),
+	};
+	if (model.useResponsesLite) {
+		applyCodexResponsesLiteShape(body);
+	}
+	return buildCompactionV2RequestFromBody(model, body, options);
+}
+
+/** Wrap a body built by the normal Codex serializer for V2 compaction transport. */
+export function buildCompactionV2RequestFromBody(
+	model: Model,
+	body: OpenAICodexCompactionBody,
+	options?: {
+		sessionId?: string;
+		promptCacheKey?: string;
+		retainedMessageBudget?: number;
+		retainedUserItems?: unknown[];
+	},
+): CompactionV2Request {
+	const input = Array.isArray(body.input) ? body.input : [];
+	return {
+		body: { ...body, model: resolveCompactionV2Model(model), input },
+		input,
+		retainedUserItems: options?.retainedUserItems ?? input,
 		retainedMessageBudget: resolveCompactionV2RetainedMessageBudget(options?.retainedMessageBudget),
-		reasoning: options?.reasoning,
-		tools: options?.tools,
 		sessionId: options?.sessionId,
 		promptCacheKey: options?.promptCacheKey,
 	};
@@ -208,13 +260,6 @@ export function buildCompactionV2Request(
 // ============================================================================
 // Streaming Request Handler
 // ============================================================================
-
-/** Race the caller's signal against the V2 request timeout. */
-function withRequestTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal | undefined {
-	if (timeoutMs <= 0) return signal;
-	const timeout = AbortSignal.timeout(timeoutMs);
-	return signal ? AbortSignal.any([signal, timeout]) : timeout;
-}
 
 /** Request V2 compaction over the normal OpenAI Responses streaming endpoint. */
 export async function requestCompactionV2Streaming(
@@ -228,43 +273,54 @@ export async function requestCompactionV2Streaming(
 		retryWait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
 		providerSessionState?: Map<string, ProviderSessionState>;
 		codexCompaction?: CodexCompactionContext;
+		preferWebsockets?: boolean;
+		codexAccessPrograms?: boolean;
 	},
 ): Promise<CompactionV2Response> {
+	let fetchImpl: FetchImpl = options?.fetch ?? globalThis.fetch;
+	if (isBedrockOpenAIUrl(model.baseUrl)) {
+		({
+			model,
+			apiKey,
+			fetch: fetchImpl,
+		} = await prepareBedrockCompactionRequest(model, apiKey, options?.fetch, signal));
+	}
 	const endpoint = getCompactionV2Endpoint(model);
 	if (!endpoint) {
 		throw new Error(`Model ${model.id} does not support V2 streaming compaction`);
 	}
 
-	const fetchImpl = options?.fetch ?? globalThis.fetch;
 	const retryWait = options?.retryWait ?? ((delayMs: number) => Bun.sleep(delayMs));
 	const isCodexResponses = compactionV2Api(model) === "openai-codex-responses" || model.provider === "openai-codex";
-	const codexMetadata = isCodexResponses
-		? createOpenAICodexCompatibilityMetadata({
-				sessionId: request.sessionId,
-				providerSessionState: options?.providerSessionState,
-				requestKind: "compaction",
-				compaction: createOpenAICodexCompactionRequestContext({
-					context: options?.codexCompaction,
-					implementation: "responses_compaction_v2",
-				}),
-			})
-		: undefined;
+	let codexMetadata: OpenAICodexCompatibilityMetadata | undefined;
+	if (isCodexResponses && !shouldUseCodexProviderTransport(model)) {
+		// Metadata generation is request work; importing compaction policy must not load the Codex transport.
+		const { createOpenAICodexCompatibilityMetadata } =
+			await import("@oh-my-pi/pi-ai/providers/openai-codex-responses");
+		codexMetadata = createOpenAICodexCompatibilityMetadata({
+			sessionId: request.sessionId,
+			providerSessionState: options?.providerSessionState,
+			requestKind: "compaction",
+			compaction: createOpenAICodexCompactionRequestContext({
+				context: options?.codexCompaction,
+				implementation: "responses_compaction_v2",
+			}),
+		});
+	}
 	let lastError: Error | undefined;
 
 	for (let attempt = 0; attempt <= V2_COMPACTION_MAX_RETRIES; attempt++) {
-		const timeoutSignal = withRequestTimeout(signal, options?.timeoutMs ?? V2_COMPACTION_TIMEOUT_MS);
+		const timeoutSignal = ptree.combineSignals(signal, options?.timeoutMs ?? V2_COMPACTION_TIMEOUT_MS);
 		try {
-			return await attemptCompactionV2Streaming(
-				endpoint,
-				apiKey,
-				model,
-				request,
-				fetchImpl,
-				timeoutSignal,
+			return await attemptCompactionV2Streaming(endpoint, apiKey, model, request, fetchImpl, timeoutSignal, {
 				codexMetadata,
-			);
+				providerSessionState: options?.providerSessionState,
+				codexCompaction: options?.codexCompaction,
+				preferWebsockets: options?.preferWebsockets,
+				codexAccessPrograms: options?.codexAccessPrograms,
+			});
 		} catch (err) {
-			const error = err instanceof Error ? err : new Error(String(err));
+			const error = toError(err);
 			if (signal?.aborted) throw error;
 
 			if (isRetryableCompactionError(error) && attempt < V2_COMPACTION_MAX_RETRIES) {
@@ -292,44 +348,51 @@ async function attemptCompactionV2Streaming(
 	model: Model,
 	request: CompactionV2Request,
 	fetchImpl: FetchImpl,
-	signal?: AbortSignal,
-	codexMetadata?: OpenAICodexCompatibilityMetadata,
+	signal: AbortSignal | undefined,
+	options: {
+		codexMetadata?: OpenAICodexCompatibilityMetadata;
+		providerSessionState?: Map<string, ProviderSessionState>;
+		codexCompaction?: CodexCompactionContext;
+		preferWebsockets?: boolean;
+		codexAccessPrograms?: boolean;
+	},
 ): Promise<CompactionV2Response> {
 	// Faithful to Codex: append the compaction trigger as the final input item
-	// of an otherwise-normal Responses request, then stream the result. `store`
-	// stays false — compaction must never persist a server-side response object.
-	const cacheOptions = { sessionId: request.sessionId, promptCacheKey: request.promptCacheKey };
-	const promptCacheKey = getOpenAIPromptCacheKey(cacheOptions);
-	const body: Record<string, unknown> = {
-		model: request.model,
+	// of an otherwise-normal Responses request. `store` remains false —
+	// compaction must never persist a server-side response object.
+	const body: OpenAICodexCompactionBody = {
+		...request.body,
 		input: [...request.input, COMPACTION_TRIGGER_ITEM],
-		instructions: request.instructions,
-		stream: true,
 		store: false,
-		...(request.reasoning || model.useResponsesLite
-			? {
-					// Lite implies gpt-5.4+, where codex-rs sends `all_turns` replay.
-					reasoning: model.useResponsesLite
-						? { ...(request.reasoning ?? {}), context: "all_turns" }
-						: request.reasoning,
-					include: ["reasoning.encrypted_content"],
-				}
-			: {}),
-		...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}),
-		...(request.tools && request.tools.length > 0 ? { tools: request.tools, tool_choice: "auto" } : {}),
+		stream: true,
 	};
-	if (codexMetadata) {
-		body.client_metadata = codexMetadata.clientMetadata;
+	if (options.codexMetadata) {
+		body.client_metadata = options.codexMetadata.clientMetadata;
 	}
-	// Responses Lite models take the same rewrite on the compaction stream:
-	// instructions/tools ride as input items (codex-rs `compact_remote_v2`
-	// builds through `build_responses_request`).
-	if (model.useResponsesLite) {
-		applyCodexResponsesLiteShape(body);
+
+	if (shouldUseCodexProviderTransport(model)) {
+		// The native transport is only needed when sending a Codex compaction request.
+		const { openCodexCompactionEventStream } = await import("@oh-my-pi/pi-ai/providers/openai-codex-responses");
+		const eventStream = await openCodexCompactionEventStream(model, body, {
+			apiKey,
+			signal,
+			fetch: fetchImpl,
+			sessionId: request.sessionId,
+			providerSessionState: options.providerSessionState,
+			preferWebsockets: options.preferWebsockets,
+			codexAccessPrograms: options.codexAccessPrograms,
+			responsesLite: model.useResponsesLite,
+			codexCompaction: createOpenAICodexCompactionRequestContext({
+				context: options.codexCompaction,
+				implementation: "responses_compaction_v2",
+			}),
+		});
+		return collectCompactionV2Events(eventStream, request);
 	}
+
 	const response = await fetchImpl(endpoint, {
 		method: "POST",
-		headers: buildCompactionV2Headers(model, apiKey, request, codexMetadata),
+		headers: buildCompactionV2Headers(model, apiKey, request, options.codexMetadata),
 		body: stringifyJson(body),
 		signal,
 	});
@@ -370,13 +433,32 @@ function buildCompactionV2Headers(
 			? {
 					"content-type": "application/json",
 					"api-key": apiKey,
-					...(model.headers ?? {}),
+					...model.headers,
 				}
 			: {
 					"content-type": "application/json",
 					...resolveOpenAIRequestSetup(
-						{ provider: model.provider, id: model.id, baseUrl: model.baseUrl, headers: model.headers },
-						{ apiKey, messages: [], openAISessionId: routingSessionId, promptCacheSessionId },
+						{
+							// `on-api` scoped cache policy must see the request this
+							// compaction actually sends, not the active lane.
+							...remoteCompactionPolicyModel(model),
+							baseUrl: model.baseUrl,
+							headers: model.headers,
+							compat: {
+								sessionHeader:
+									model.compat && "sessionHeader" in model.compat ? model.compat.sessionHeader : undefined,
+							},
+						},
+						{
+							apiKey,
+							messages: [],
+							sessionId: request.sessionId ?? routingSessionId,
+							promptCacheSessionId,
+							// The family affinity key rides only an explicit
+							// prompt-cache identity; the sessionId-derived cache-id
+							// fallback never does.
+							promptCacheAffinityKey: request.promptCacheKey ? promptCacheSessionId : undefined,
+						},
 					).headers,
 				};
 	if (api === "openai-codex-responses" || model.provider === "openai-codex") {
@@ -384,13 +466,15 @@ function buildCompactionV2Headers(
 		if (accountId) {
 			headers[OPENAI_HEADERS.ACCOUNT_ID] = accountId;
 		}
+		applyCodexResidencyHeader(headers, apiKey);
 		if (routingSessionId) {
 			headers[OPENAI_HEADERS.CONVERSATION_ID] = routingSessionId;
 			headers[OPENAI_HEADERS.SESSION_ID] = routingSessionId;
 			headers["x-client-request-id"] = routingSessionId;
 		}
-		headers[OPENAI_HEADERS.BETA] = OPENAI_HEADER_VALUES.BETA_RESPONSES;
 		headers[OPENAI_HEADERS.ORIGINATOR] = OPENAI_HEADER_VALUES.ORIGINATOR_CODEX;
+		headers[OPENAI_HEADERS.CODEX_BETA_FEATURES] = OPENAI_HEADER_VALUES.REMOTE_COMPACTION_V2;
+		headers[OPENAI_HEADERS.ROUTING_HINT] = codexRoutingHint(request.body.model, undefined);
 		if (model.useResponsesLite) {
 			headers[OPENAI_HEADERS.RESPONSES_LITE] = "true";
 		}
@@ -398,6 +482,33 @@ function buildCompactionV2Headers(
 	if (codexMetadata) Object.assign(headers, codexMetadata.headers);
 
 	return headers;
+}
+
+interface CompactionV2CollectionState {
+	outputItemCount: number;
+	compactionItems: Array<Record<string, unknown>>;
+	sawCompleted: boolean;
+	usage: CompactionV2Usage | undefined;
+}
+
+function createCompactionV2CollectionState(): CompactionV2CollectionState {
+	return {
+		outputItemCount: 0,
+		compactionItems: [],
+		sawCompleted: false,
+		usage: undefined,
+	};
+}
+
+async function collectCompactionV2Events(
+	events: AsyncIterable<Record<string, unknown>>,
+	request: CompactionV2Request,
+): Promise<CompactionV2Response> {
+	const state = createCompactionV2CollectionState();
+	for await (const event of events) {
+		handleCompactionV2Event(event, undefined, state);
+	}
+	return finishCompactionV2Collection(state, request);
 }
 
 async function collectCompactionV2Output(
@@ -409,13 +520,7 @@ async function collectCompactionV2Output(
 		throw new Error("No response body for V2 compaction streaming");
 	}
 
-	const state = {
-		outputItemCount: 0,
-		compactionItems: [] as Array<Record<string, unknown>>,
-		sawCompleted: false,
-		usage: undefined as CompactionV2Usage | undefined,
-	};
-
+	const state = createCompactionV2CollectionState();
 	try {
 		const decoder = new TextDecoder();
 		let buffer = "";
@@ -462,6 +567,13 @@ async function collectCompactionV2Output(
 		reader.releaseLock();
 	}
 
+	return finishCompactionV2Collection(state, request);
+}
+
+function finishCompactionV2Collection(
+	state: CompactionV2CollectionState,
+	request: CompactionV2Request,
+): CompactionV2Response {
 	if (!state.sawCompleted) {
 		throw new Error("V2 compaction stream closed before response.completed");
 	}
@@ -473,11 +585,10 @@ async function collectCompactionV2Output(
 
 	const compactionItem = state.compactionItems[0];
 	const { replacementHistory, retainedImageCount } = buildCompactionV2ReplacementHistory(
-		request.input,
+		request.retainedUserItems,
 		compactionItem,
 		request.retainedMessageBudget,
 	);
-
 	return {
 		compactionItem,
 		replacementHistory,
@@ -490,12 +601,7 @@ async function collectCompactionV2Output(
 function handleCompactionV2SseEvent(
 	data: string,
 	eventName: string | undefined,
-	state: {
-		outputItemCount: number;
-		compactionItems: Array<Record<string, unknown>>;
-		sawCompleted: boolean;
-		usage: CompactionV2Usage | undefined;
-	},
+	state: CompactionV2CollectionState,
 ): void {
 	if (data === "[DONE]") return;
 	let event: Record<string, unknown>;
@@ -504,7 +610,14 @@ function handleCompactionV2SseEvent(
 	} catch (err) {
 		throw new Error(`V2 compaction stream parse failed: ${err instanceof Error ? err.message : String(err)}`);
 	}
+	handleCompactionV2Event(event, eventName, state);
+}
 
+function handleCompactionV2Event(
+	event: Record<string, unknown>,
+	eventName: string | undefined,
+	state: CompactionV2CollectionState,
+): void {
 	const type = typeof event.type === "string" ? event.type : eventName;
 	if (type === "response.output_item.done") {
 		state.outputItemCount++;
@@ -523,6 +636,14 @@ function handleCompactionV2SseEvent(
 
 	if (type === "response.failed" || type === "response.incomplete") {
 		throw new Error(formatCompactionV2Failure(event, type));
+	}
+
+	// A standalone `error` event terminates the stream. Keep its status so a
+	// deterministic 4xx (e.g. context_too_large) is not retried as a dropped stream.
+	if (type === "error") {
+		const message = formatCompactionV2Failure(event, type);
+		const status = numberField(event, "status");
+		throw status === undefined ? new Error(message) : new AIError.ProviderHttpError(message, status);
 	}
 }
 
@@ -556,8 +677,9 @@ function formatCompactionV2Failure(event: Record<string, unknown>, type: string)
 		: response && isRecord(response.error)
 			? response.error
 			: undefined;
-	const message = error ? stringField(error, "message") : undefined;
-	const code = error ? (stringField(error, "code") ?? stringField(error, "type")) : undefined;
+	// Responses `error` events carry code/message at the top level.
+	const message = stringField(error ?? event, "message");
+	const code = error ? (stringField(error, "code") ?? stringField(error, "type")) : stringField(event, "code");
 	return `V2 compaction stream ${type}${code ? ` (${code})` : ""}${message ? `: ${message}` : ""}`;
 }
 
@@ -578,6 +700,7 @@ function isRetryableCompactionError(error: Error): boolean {
 	}
 	const message = error.message.toLowerCase();
 	return (
+		isUnexpectedSocketCloseMessage(message) ||
 		message.includes("stream closed before response.completed") ||
 		message.includes("stream parse failed") ||
 		message.includes("server_error") ||
@@ -591,15 +714,14 @@ function isRetryableCompactionError(error: Error): boolean {
 // Replacement History
 // ============================================================================
 
-/** Build Codex-style V2 replacement history from prompt input plus compaction output. */
+/** Build Codex-style V2 replacement history from retention candidates plus compaction output. */
 export function buildCompactionV2ReplacementHistory(
 	input: unknown[],
 	compactionItem: Record<string, unknown>,
 	retainedMessageBudget = V2_RETAINED_MESSAGE_TOKEN_BUDGET,
 ): { replacementHistory: Array<Record<string, unknown>>; retainedImageCount: number } {
 	const retained = input.filter(
-		(item): item is Record<string, unknown> =>
-			isRecord(item) && isRetainedForCompactionV2(item) && shouldKeepCompactionV2HistoryItem(item),
+		(item): item is Record<string, unknown> => isRecord(item) && isRetainedUserMessageForCompactionV2(item),
 	);
 	const replacementHistory = truncateRetainedMessagesForCompactionV2(
 		retained,
@@ -610,17 +732,11 @@ export function buildCompactionV2ReplacementHistory(
 	return { replacementHistory, retainedImageCount };
 }
 
-function isRetainedForCompactionV2(item: Record<string, unknown>): boolean {
-	if (item.type !== "message") return false;
-	const role = stringField(item, "role");
-	return role === "user" || role === "developer" || role === "system";
-}
-
-function shouldKeepCompactionV2HistoryItem(item: Record<string, unknown>): boolean {
-	if (item.type !== "message") return item.type === "compaction";
-	const role = stringField(item, "role");
-	if (role !== "user") return false;
-	return !isContextualUserMessage(item);
+function isRetainedUserMessageForCompactionV2(item: Record<string, unknown>): boolean {
+	// Responses input messages may omit `type`: omp serializes turns as
+	// `{ role, content }`, which the API reads as `type: "message"`.
+	const isMessage = item.type === "message" || (item.type === undefined && typeof item.role === "string");
+	return isMessage && item.role === "user" && !isContextualUserMessage(item);
 }
 
 function isContextualUserMessage(item: Record<string, unknown>): boolean {

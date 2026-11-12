@@ -1,13 +1,20 @@
 ---
 description: Prefer Record<K, V> for small static literals; use Set/Map for anything dynamic
-condition: "\\bnew\\s+(Set|Map)\\b"
+condition:
+  # Every literal, comment, type argument and Map value is read as an unrolled loop (`a*(?:b a*)*`):
+  # each delta of a streamed line rescans the unfinished line, so a long value must cost one pass.
+  # The array must be the whole argument: the token after it is the constructor's `)`, a trailing `,`
+  # or an `as`/`satisfies` clause, never a call such as `.map(…)`. Only that token is read, not the type.
+  - "\\bnew\\s+Set\\s*(?:<[^<>;()=]*(?:(?:=>?|<[^<>;]*>|\\([^()]*\\))[^<>;()=]*)*>)?\\s*\\((?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*\\[(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*(?:\"[^\"\\\\\\n]*(?:\\\\.[^\"\\\\\\n]*)*\"|'[^'\\\\\\n]*(?:\\\\.[^'\\\\\\n]*)*'|\\x60[^\\x60$\\\\]*(?:(?:\\\\[\\s\\S]|\\$(?!\\{))[^\\x60$\\\\]*)*\\x60)(?:(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*,(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*(?:\"[^\"\\\\\\n]*(?:\\\\.[^\"\\\\\\n]*)*\"|'[^'\\\\\\n]*(?:\\\\.[^'\\\\\\n]*)*'|\\x60[^\\x60$\\\\]*(?:(?:\\\\[\\s\\S]|\\$(?!\\{))[^\\x60$\\\\]*)*\\x60))*(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*,?(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*\\](?=(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*(?:[),]|(?:as|satisfies)(?![\\w$])))"
+  # A Map whose line runs past 1000 characters is not a small table, so the condition stops there.
+  - "\\bnew\\s+Map(?![^\\n]{1000})\\s*(?:<[^<>;()=]*(?:(?:=>?|<[^<>;]*>|\\([^()]*\\))[^<>;()=]*)*>)?\\s*\\((?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*\\[(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*\\[(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*(?:\"[^\"\\\\\\n]*(?:\\\\.[^\"\\\\\\n]*)*\"|'[^'\\\\\\n]*(?:\\\\.[^'\\\\\\n]*)*'|\\x60[^\\x60$\\\\]*(?:(?:\\\\[\\s\\S]|\\$(?!\\{))[^\\x60$\\\\]*)*\\x60)(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*,[^\\[\\]\"'\\x60]*(?:(?:\"[^\"\\\\\\n]*(?:\\\\.[^\"\\\\\\n]*)*\"|'[^'\\\\\\n]*(?:\\\\.[^'\\\\\\n]*)*'|\\x60[^\\x60\\\\]*(?:\\\\[\\s\\S][^\\x60\\\\]*)*\\x60|\\[[^\\[\\]]*\\])[^\\[\\]\"'\\x60]*)*\\](?:(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*as\\s+const(?![\\w$]))?(?:(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*,(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*\\[(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*(?:\"[^\"\\\\\\n]*(?:\\\\.[^\"\\\\\\n]*)*\"|'[^'\\\\\\n]*(?:\\\\.[^'\\\\\\n]*)*'|\\x60[^\\x60$\\\\]*(?:(?:\\\\[\\s\\S]|\\$(?!\\{))[^\\x60$\\\\]*)*\\x60)(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*,[^\\[\\]\"'\\x60]*(?:(?:\"[^\"\\\\\\n]*(?:\\\\.[^\"\\\\\\n]*)*\"|'[^'\\\\\\n]*(?:\\\\.[^'\\\\\\n]*)*'|\\x60[^\\x60\\\\]*(?:\\\\[\\s\\S][^\\x60\\\\]*)*\\x60|\\[[^\\[\\]]*\\])[^\\[\\]\"'\\x60]*)*\\](?:(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*as\\s+const(?![\\w$]))?)*(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*,?(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*\\](?=(?:\\s|//.*|/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*/)*(?:[),]|(?:as|satisfies)(?![\\w$])))"
 scope: "tool:edit(**/*.{ts,tsx}), tool:write(**/*.{ts,tsx})"
 interruptMode: never
 ---
 
-Use `Record<K, V>` / `Record<K, true>` for small, static string-keyed lookup tables.
+Small, static string-keyed lookup tables: `Record<K, V>` / `Record<K, true>`.
 
-Use `Set` / `Map` when keys are dynamic, non-string, inserted or deleted at runtime, or when code needs `.size`, `.clear()`, stable insertion order, or iterator APIs.
+`Set` / `Map`: dynamic/non-string keys; runtime insertion/deletion; `.size`, `.clear()`, stable insertion order, or iterator APIs.
 
 ```typescript
 // Static literal → Record
@@ -24,5 +31,3 @@ for (const item of items) {
 	seen.add(item.id);
 }
 ```
-
-Small fixed table? `Record`. Runtime collection? `Set` / `Map`.

@@ -21,7 +21,10 @@ type CodingAgentBucket = "singleton" | "ui" | "runtime" | "native";
 interface TestCommand {
 	label: string;
 	cwd: string;
+	/** argv without `--parallel`; the runner appends it from `parallel` and the pool's CPU budget. */
 	command: string[];
+	/** `bun test --parallel` width this chunk wants when it has the machine to itself. */
+	parallel?: number;
 }
 
 type CodingAgentTestPartition = Record<CodingAgentBucket, string[]>;
@@ -82,17 +85,14 @@ const codingAgentBucketPlans: Record<CodingAgentBucket, { label: string; paralle
 // Smaller workspace packages stay separate from native/TUI/integration suites so
 // their short TS suites can run together. CI still downloads the Linux x64 native
 // addon before this bucket: shared utility barrels may load native-backed modules.
-// mnemopi is intentionally excluded — its embedding suites depend on a ~270MB
-// fastembed model absent from CI runners, so they flake/time out under the parallel
-// bucket; run `bun --cwd=packages/mnemopi test` locally instead.
 const fastWorkspacePackages = [
-	"packages/hashline",
-	"packages/wire",
+	"packages/omptype",
 	"packages/utils",
 	"packages/catalog",
 	"packages/ai",
 	"packages/snapcompact",
 	"packages/agent",
+	"packages/mnemopi",
 ];
 
 // These suites cover the native package, TUI/browser-ish behavior, local servers,
@@ -105,26 +105,16 @@ const nativeAndIntegrationPackages = [
 	"packages/typescript-edit-benchmark",
 ];
 
-// Packages the CI buckets deliberately skip but a local full run should still
-// cover. mnemopi's embedding suites need a ~270MB fastembed model absent from CI
-// runners (so it flakes/times out there); robomp-web lives under python/robomp
-// and is outside every CI TS bucket.
-const localOnlyWorkspacePackages = ["packages/mnemopi", "python/robomp/web"];
+const projectToolTestCommand: TestCommand = {
+	label: ".omp/tests (project-local TUI debug tool)",
+	cwd: ".",
+	command: ["bun", "test", ...onlyFailuresArgs, "./.omp/tests/tui.test.ts"],
+	parallel: 1,
+};
 
-// Repo-level script tests. CI's `workspace` bucket only runs the merge gates:
-// the concurrency regression (the GHA-config guard) and the .d.ts extension
-// rewrite (guards published-type resolution; hermetic temp-dir suite). A local
-// full run also exercises the release-notes and link-omp tests. (A
-// `ci-test-ts.test.ts` entry used to sit here but the file never existed — bun
-// silently ignores unmatched filters when at least one other filter matches.)
-const repoScriptTests = [
-	"scripts/ci-concurrency.test.ts",
-	"scripts/bazel-natives.test.ts",
-	"scripts/ci-release-notes.test.ts",
-	"scripts/ci-release-publish.test.ts",
-	"scripts/fix-dts-extensions.test.ts",
-	"scripts/link-omp.test.ts",
-];
+// Packages the CI buckets deliberately skip but a local full run should still
+// cover. robomp-web lives under python/robomp and is outside every CI TS bucket.
+const localOnlyWorkspacePackages = ["python/robomp/web"];
 
 const codingAgentNativePathPatterns = [
 	/(^|\/)[^/]*(bash|native|browser|cmux|mnemopi|hindsight|memory)[^/]*\.test\.ts$/i,
@@ -222,14 +212,16 @@ function workspaceTestCommand(pkg: string, parallel: number, options: { extraArg
 	return {
 		label: pkg,
 		cwd: pkg,
-		command: ["bun", "test", `--parallel=${parallel}`, ...extraArgs],
+		command: ["bun", "test", ...extraArgs],
+		parallel,
 	};
 }
 
 // The Rust suite as one pooled command, so root `bun run test` reports TS and
 // Rust under the same progress stream / failure report. Delegates to
-// run-rs-task.ts, which self-skips when no Rust-affecting files changed locally
-// (printing a one-line notice) and resolves the cargo/nextest invocation.
+// run-rs-task.ts, which self-skips when the branch changed no Rust-affecting file
+// since its merge base with main, committed or not (printing a one-line notice),
+// and resolves the cargo/nextest invocation.
 function rustTestCommand(): TestCommand {
 	return {
 		label: "rust (cargo nextest; skipped if no Rust changes)",
@@ -331,7 +323,8 @@ async function codingAgentTestCommands(bucket: CodingAgentBucket): Promise<TestC
 		commands.push({
 			label: `packages/coding-agent (${plan.label}; ${testFiles.length} files; parallel=${plan.parallel}${chunkLabel}; ${chunk.length} files)`,
 			cwd: "packages/coding-agent",
-			command: ["bun", "test", `--parallel=${plan.parallel}`, ...onlyFailuresArgs, ...chunk],
+			command: ["bun", "test", ...onlyFailuresArgs, ...chunk],
+			parallel: plan.parallel,
 		});
 	}
 	return commands;
@@ -340,25 +333,9 @@ async function codingAgentTestCommands(bucket: CodingAgentBucket): Promise<TestC
 async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 	switch (mode) {
 		case "workspace":
-			return [
-				...fastWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 8)),
-				{
-					label: "scripts",
-					cwd: ".",
-					command: [
-						"bun",
-						"test",
-						"--parallel=4",
-						...onlyFailuresArgs,
-						"scripts/ci-concurrency.test.ts",
-						"scripts/bazel-natives.test.ts",
-						"scripts/ci-release-publish.test.ts",
-						"scripts/fix-dts-extensions.test.ts",
-					],
-				},
-			];
+			return fastWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 8));
 		case "native":
-			return nativeAndIntegrationPackages.map(pkg => workspaceTestCommand(pkg, 4, { smol: true }));
+			return [...nativeAndIntegrationPackages.map(pkg => workspaceTestCommand(pkg, 4)), projectToolTestCommand];
 		case "coding-agent-singleton":
 			return await codingAgentTestCommands("singleton");
 		case "coding-agent-ui":
@@ -382,20 +359,16 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 			];
 		// `local-ts` is the full local TypeScript run that root `bun run test:ts`
 		// drives: every package the old `--workspaces` fan-out covered (the CI
-		// `all` set PLUS mnemopi and robomp-web, which CI omits) and every repo
-		// script test, routed through this one quiet runner so the whole suite
-		// shares one progress stream and one failure report.
+		// `all` set plus robomp-web, which CI omits), routed through
+		// this one quiet runner so the whole suite shares one progress stream and
+		// one failure report.
 		case "local-ts":
 			return [
 				...fastWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 8, { extraArgs: onlyFailuresArgs })),
 				...nativeAndIntegrationPackages.map(pkg => workspaceTestCommand(pkg, 4, { extraArgs: onlyFailuresArgs })),
+				projectToolTestCommand,
 				...localOnlyWorkspacePackages.map(pkg => workspaceTestCommand(pkg, 4, { extraArgs: onlyFailuresArgs })),
 				...(await commandsForMode("coding-agent-heavy")),
-				{
-					label: "scripts",
-					cwd: ".",
-					command: ["bun", "test", "--parallel=4", ...onlyFailuresArgs, ...repoScriptTests],
-				},
 			];
 		// `local` is what root `bun run test` drives: the full TS suite plus the
 		// Rust task, so a single invocation reports TS and Rust together. The Rust
@@ -405,8 +378,8 @@ async function commandsForMode(mode: Mode): Promise<TestCommand[]> {
 	}
 }
 
-// The omp-kata runner pods may inject cloud credentials (`AWS_*`) pod-wide via
-// `envFrom`, GitHub Actions injects `GITHUB_TOKEN`,
+// Self-hosted runners may carry cloud credentials (`AWS_*`) in their
+// environment, GitHub Actions injects `GITHUB_TOKEN`,
 // and a host may carry provider API keys. Any of these make env-sensitive code
 // non-deterministic in tests — e.g. leaked AWS creds make `amazon-bedrock` look
 // authenticated and win the provider startup fallback over `anthropic`. Run the
@@ -451,25 +424,37 @@ async function runTestCommand(testCommand: TestCommand): Promise<void> {
 			stdout: "inherit",
 			stderr: "inherit",
 		});
-		const killTimer = setTimeout(() => proc.kill("SIGKILL"), chunkTimeoutMs());
+		// Watchdog, mirroring the parallel path: record that *we* killed the child,
+		// otherwise the resulting 137 is indistinguishable from an OOM kill.
+		let timedOut = false;
+		const killTimer = setTimeout(async () => {
+			timedOut = true;
+			try {
+				process.stdout.write(await describeStuckProcessTree(proc.pid));
+			} finally {
+				proc.kill("SIGKILL");
+			}
+		}, chunkTimeoutMs());
 		const exitCode = await proc.exited;
 		clearTimeout(killTimer);
 		if (exitCode === 0) {
 			return;
 		}
-		if (BUN_CRASH_EXITS[exitCode] && attempt < MAX_CHUNK_ATTEMPTS) {
+		if (!timedOut && BUN_CRASH_EXITS[exitCode] && attempt < MAX_CHUNK_ATTEMPTS) {
 			console.log(
 				`==> ${testCommand.label}: bun crashed (exit ${exitCode}); retrying (attempt ${attempt + 1}/${MAX_CHUNK_ATTEMPTS})`,
 			);
 			continue;
 		}
-		throw new Error(`${testCommand.label} failed with exit code ${exitCode}: ${renderedCommand}`);
+		throw new Error(`${testCommand.label} ${describeChunkFailure(exitCode, timedOut)}: ${renderedCommand}`);
 	}
 }
 
-// Child env shared by every spawned test process: the parent env with all CI
-// credential / cloud-config variables scrubbed (see SCRUBBED_ENV_* above) and
-// GITHUB_ACTIONS cleared so suites resolve only against their own fixtures.
+// Child env shared by every spawned test process: the parent env with the
+// private test-runtime marker set, all CI credential / cloud-config variables
+// scrubbed (see SCRUBBED_ENV_* above), and GITHUB_ACTIONS cleared. Clearing it
+// would also clear run-rs-task.ts's "always run in GitHub Actions" rule for the
+// Rust child, so under GitHub Actions OMP_FORCE_RUST_TASKS carries it instead.
 //
 // GC knobs (both needed — they gate different JSC mechanisms):
 // - `BUN_JSC_useConcurrentGC=0` stops the collector from marking concurrently
@@ -493,6 +478,8 @@ function buildChildEnv(): Record<string, string | undefined> {
 	const env: Record<string, string | undefined> = {
 		...Bun.env,
 		GITHUB_ACTIONS: "",
+		...(Bun.env.GITHUB_ACTIONS === "true" ? { OMP_FORCE_RUST_TASKS: "1" } : {}),
+		PI_TEST_RUNTIME: "1",
 		BUN_JSC_useConcurrentGC: "0",
 		BUN_JSC_numberOfGCMarkers: "1",
 	};
@@ -514,6 +501,70 @@ function chunkTimeoutMs(): number {
 	const raw = Number(Bun.env.OMP_TEST_CHUNK_TIMEOUT?.trim());
 	if (Number.isFinite(raw) && raw >= 1) return raw * 1000;
 	return 600_000;
+}
+
+// What a watchdog-killed chunk was still doing, captured just before the
+// SIGKILL: every process left in the chunk's tree (the `bun test` coordinator,
+// its `--test-worker`s, anything they spawned) with state, CPU, RSS and kernel
+// wait channel, plus the sockets those processes hold (via `ss`, or the raw
+// `/proc/<pid>/fd` targets when `ss` is absent, as on the CI runner image). A
+// chunk can report every test and still never exit; this is the only evidence
+// of which process refused to and what it was blocked on. Linux-only (ps column
+// names, /proc); "" elsewhere or without `ps`. Never throws: callers kill the
+// chunk right after, and a snapshot failure must not stop that.
+async function describeStuckProcessTree(rootPid: number): Promise<string> {
+	if (process.platform !== "linux" || !Bun.which("ps")) return "";
+	try {
+		return await snapshotProcessTree(rootPid);
+	} catch (err) {
+		return `[watchdog] process tree snapshot failed: ${err instanceof Error ? err.message : String(err)}\n`;
+	}
+}
+
+async function snapshotProcessTree(rootPid: number): Promise<string> {
+	const ps = Bun.spawnSync(["ps", "-eo", "pid=,ppid=,stat=,etimes=,pcpu=,rss=,wchan:24=,args="]);
+	if (!ps.success) return "";
+	const rows = ps.stdout
+		.toString()
+		.split("\n")
+		.map(line => line.trim().split(/\s+/))
+		.filter(cols => cols.length >= 8);
+	const tree = new Set([String(rootPid)]);
+	for (let grew = true; grew;) {
+		grew = false;
+		for (const cols of rows) {
+			if (tree.has(cols[1]) && !tree.has(cols[0])) {
+				tree.add(cols[0]);
+				grew = true;
+			}
+		}
+	}
+	const lines = ["[watchdog] live process tree (pid ppid stat elapsed_s cpu% rss_kb wchan args):"];
+	for (const cols of rows) {
+		if (tree.has(cols[0])) lines.push(`  ${cols.slice(0, 7).join(" ")} ${cols.slice(7).join(" ").slice(0, 200)}`);
+	}
+	const ss = Bun.which("ss") ? Bun.spawnSync(["ss", "-tuanpH"]) : null;
+	if (ss?.success) {
+		const owned = ss.stdout
+			.toString()
+			.split("\n")
+			.filter(line => [...tree].some(pid => line.includes(`pid=${pid},`)));
+		lines.push(`[watchdog] sockets held by that tree (${owned.length}):`, ...owned.map(line => `  ${line.trim()}`));
+		return `${lines.join("\n")}\n`;
+	}
+	// No `ss`: list each process's non-tty fds (sockets, pipes, files). A
+	// process gone between `ps` and here just yields nothing.
+	lines.push("[watchdog] open fds per process (no ss on PATH):");
+	for (const pid of tree) {
+		const fdDir = `/proc/${pid}/fd`;
+		const targets = await fs.readdir(fdDir).then(
+			fds => Promise.all(fds.map(fd => fs.readlink(`${fdDir}/${fd}`).catch(() => ""))),
+			() => [],
+		);
+		const kept = targets.filter(target => target && !target.startsWith("/dev/"));
+		if (kept.length > 0) lines.push(`  ${pid}: ${kept.join(" ").slice(0, 400)}`);
+	}
+	return `${lines.join("\n")}\n`;
 }
 
 // Exit codes that mean the bun process itself died to a runtime fault
@@ -538,6 +589,21 @@ const BUN_CRASH_EXITS: Record<number, true> = {
 // deterministic crash still fails every attempt and is reported normally.
 const MAX_CHUNK_ATTEMPTS = 3;
 
+// Why a chunk failed, in words. Exit 137 is SIGKILL, which this runner reaches
+// two very different ways -- the per-chunk watchdog firing, or the kernel OOM
+// killer reaping a chunk that outgrew the runner -- and the bare exit code
+// cannot tell them apart. Which one it was is the difference between "raise
+// OMP_TEST_CHUNK_TIMEOUT" and "lower this bucket's chunkSize", so say it.
+function describeChunkFailure(exitCode: number, timedOut: boolean): string {
+	if (timedOut) {
+		return `exceeded the ${Math.round(chunkTimeoutMs() / 1000)}s chunk watchdog and was killed (exit ${exitCode}; OMP_TEST_CHUNK_TIMEOUT to change)`;
+	}
+	if (exitCode === 137) {
+		return "was SIGKILLed (exit 137) without reaching the chunk watchdog, which on a CI runner means the OOM killer; lower this bucket's chunkSize";
+	}
+	return `failed with exit code ${exitCode}`;
+}
+
 // The standard `CI` signal is authoritative. In CI each bucket is its own
 // memory-capped runner job (a single fat invocation gets OOM-killed at 137), so
 // chunks run sequentially within a job and parallelism happens across jobs.
@@ -549,21 +615,73 @@ function isCI(): boolean {
 	return normalized !== "" && normalized !== "0" && normalized !== "false";
 }
 
-// Fan-out width for the local parallel path, clamped to the command count.
-// Defaults to the machine's available parallelism; `OMP_TEST_CONCURRENCY`
-// overrides it — a positive integer to pick an exact width (dial down on a
-// memory-constrained laptop), or `all`/`max` to launch every chunk at once.
-function testConcurrency(total: number): number {
-	const raw = Bun.env.OMP_TEST_CONCURRENCY?.trim().toLowerCase();
-	if (!raw) return Math.min(Math.max(1, os.availableParallelism()), total);
-	if (raw === "all" || raw === "max") {
-		return total;
-	}
+// Fan-out width for the local parallel path, clamped to the command count and
+// to `cores`. Defaults to `cores`; `OMP_TEST_CONCURRENCY` (`spec`) dials it down
+// on a memory-constrained machine, and `all`/`max` name the cap explicitly.
+// Never wider than `cores`: every chunk is a full `bun test` process (~1 GB
+// resident on coding-agent), so launching all ~190 at once only trades a
+// CPU-bound run for an OOM kill.
+function testConcurrency(total: number, spec: string | undefined, cores: number): number {
+	const cap = Math.min(Math.max(1, cores), total);
+	const raw = spec?.trim().toLowerCase();
+	if (!raw || raw === "all" || raw === "max") return cap;
 	const override = Number(raw);
 	if (Number.isFinite(override) && override >= 1) {
-		return Math.min(Math.floor(override), total);
+		return Math.min(Math.floor(override), cap);
 	}
 	throw new Error(`Invalid OMP_TEST_CONCURRENCY=${JSON.stringify(raw)}; expected a positive integer, all, or max`);
+}
+
+// Test files interleave real IO — sqlite writes, temp dirs, spawned CLIs — with
+// CPU, so keeping every core busy needs more in-flight files than cores. This is
+// the factor by which the shared budget exceeds `availableParallelism()`.
+const FILE_OVERSUBSCRIBE = 2;
+
+// Two independent parallelism knobs stack multiplicatively: the chunk pool runs
+// `poolWidth` `bun test` processes at once, and each of those runs its own
+// `--parallel=N` test files concurrently, so up to `poolWidth * N` files are in
+// flight. Left unbudgeted that oversubscribes the runner by design — the
+// workspace bucket asked for 4 x 8 = 32 files on a 4-core box — and because
+// bun's per-test timeout is wall-clock, CPU-starved suites blow it and fail at
+// random (mnemopi's sqlite/CLI files did, a different set each run). Spend one
+// budget instead: each live chunk gets an equal share, never below 1 and never
+// above the width it asked for. A chunk that runs alone still gets everything,
+// so the sequential CI path is unchanged.
+function budgetedParallel(requested: number, poolWidth: number): number {
+	const budget = Math.max(1, os.availableParallelism()) * FILE_OVERSUBSCRIBE;
+	return Math.max(1, Math.min(requested, Math.floor(budget / poolWidth)));
+}
+
+// Bun's 5s default per-test timeout is a unit-test default, and this repo's
+// suites are not unit tests: mnemopi builds real SQLite schemas per case, the
+// coding-agent suites drive sessions and subprocesses. Those cases already run
+// 1-4s on a quiet CI runner, so any scheduling hiccup crosses 5s and reports a
+// timeout that says nothing about the code. Timing out is still worth catching,
+// so keep a ceiling — just one loose enough to only fire on a real hang. The
+// per-chunk watchdog (chunkTimeoutMs) remains the backstop for a wedged process.
+// Override with OMP_TEST_TIMEOUT (seconds); per-test `it(name, fn, ms)` still wins.
+function testTimeoutMs(): number {
+	const raw = Number(Bun.env.OMP_TEST_TIMEOUT?.trim());
+	if (Number.isFinite(raw) && raw >= 1) return raw * 1000;
+	return 30_000;
+}
+
+// Materialize each chunk's argv against the pool width it will actually run at,
+// rewriting `parallel` from the requested width to the granted one so later
+// reporting reads the truth. A `parallel` request marks the command as a `bun
+// test` invocation, so that is also where the shared per-test timeout is
+// applied; the Rust task, which has neither, passes through untouched.
+function applyChunkBudget(commands: TestCommand[], poolWidth: number): TestCommand[] {
+	const timeout = testTimeoutMs();
+	return commands.map(testCommand => {
+		if (testCommand.parallel === undefined) return testCommand;
+		const parallel = budgetedParallel(testCommand.parallel, poolWidth);
+		return {
+			...testCommand,
+			command: [...testCommand.command, `--parallel=${parallel}`, `--timeout=${timeout}`],
+			parallel,
+		};
+	});
 }
 
 // ANSI styling for interactive runs only; disabled when stdout is not a TTY or
@@ -601,7 +719,7 @@ function formatDuration(seconds: number): string {
 // captured output — `— file > test (+N more)` — so the exact break is visible
 // in the stream without waiting for the end-of-run report. Emitted in completion
 // order as each chunk finishes.
-export function formatProgressLine(outcome: ChunkOutcome): string {
+function formatProgressLine(outcome: ChunkOutcome): string {
 	const time = style.dim(`[${formatDuration(outcome.seconds)}]`);
 	const retryNote = outcome.retries > 0 ? ` ${style.dim(`(retried ×${outcome.retries} after bun crash)`)}` : "";
 	if (outcome.exitCode === 0) {
@@ -619,7 +737,7 @@ export function formatProgressLine(outcome: ChunkOutcome): string {
 // `N chunks passed` line, a `N failed` line (red when non-zero, dim when clean),
 // then the total wall time. Printed after the failure report so a run always
 // ends on an at-a-glance verdict.
-export function formatSummaryFooter(passed: number, failed: number, totalSeconds: number): string {
+function formatSummaryFooter(passed: number, failed: number, totalSeconds: number): string {
 	const failLine = failed > 0 ? style.red(`${failed} failed`) : style.dim("0 failed");
 	return [
 		"",
@@ -633,7 +751,7 @@ export function formatSummaryFooter(passed: number, failed: number, totalSeconds
 // `file > test` identifier and the verbatim failure block bun printed for it
 // (source frame, `error:` line, received/expected) — the detail a developer
 // needs to act without re-running.
-export interface FailingTest {
+interface FailingTest {
 	name: string;
 	detail: string;
 }
@@ -650,7 +768,7 @@ export interface FailingTest {
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const FILE_HEADER_RE = /^(\S.*\.test\.[cm]?[jt]sx?):$/;
 const FAIL_MARKER_RE = /^\(fail\)\s+(.*?)(?:\s+\[[\d.]+\s*m?s\])?$/;
-export function extractFailingTests(output: string): FailingTest[] {
+function extractFailingTests(output: string): FailingTest[] {
 	const failing: FailingTest[] = [];
 	let currentFile = "";
 	let buffer: string[] = [];
@@ -683,9 +801,8 @@ export function extractFailingTests(output: string): FailingTest[] {
 // the blocks are shown because the run withheld them; in verbose mode they
 // already streamed inline, so only the names are listed. When a chunk crashed
 // without per-test markers (no parseable failures) the raw log is replayed as a
-// fallback in quiet mode. The banner repeats below so it stays visible whether
-// you scroll to the top or the bottom of the failures.
-export function formatChunkFailure(failure: ChunkOutcome, replayOutput: boolean): string {
+// fallback in quiet mode.
+function formatChunkFailure(failure: ChunkOutcome, replayOutput: boolean): string {
 	const lines: string[] = [];
 	lines.push(
 		"",
@@ -710,16 +827,6 @@ export function formatChunkFailure(failure: ChunkOutcome, replayOutput: boolean)
 	return lines.join("\n");
 }
 
-export function formatFailureReport(failures: ChunkOutcome[], total: number, replayOutput: boolean): string {
-	const header = `${failures.length} of ${total} test chunk(s) FAILED`;
-	const lines: string[] = ["", style.bold(style.red(`━━━ ${header} ━━━`))];
-	for (const failure of failures) {
-		lines.push(formatChunkFailure(failure, replayOutput));
-	}
-	lines.push("", style.red(header));
-	return lines.join("\n");
-}
-
 // Run every command through a fixed-width worker pool. Each child's stdout and
 // stderr are drained concurrently (so a chatty test never deadlocks on a full
 // pipe) and buffered. Quiet mode (the default) prints one progress line per
@@ -727,14 +834,16 @@ export function formatFailureReport(failures: ChunkOutcome[], total: number, rep
 // at the end; `--full` streams every chunk's output inline as it completes. All
 // failures are collected and reported together instead of failing fast, so one
 // run surfaces every broken chunk and exits non-zero without a runner stack trace.
-export async function runTestCommandsInParallel(commands: TestCommand[], concurrency: number): Promise<void> {
+async function runTestCommandsInParallel(commands: TestCommand[], concurrency: number): Promise<void> {
 	const env = buildChildEnv();
 	const queue = [...commands];
 	const failures: ChunkOutcome[] = [];
 	let completed = 0;
+	const fileWidths = [...new Set(commands.map(c => c.parallel).filter(p => p !== undefined))].sort((a, b) => a - b);
 	console.log(
 		`Running ${commands.length} test command(s), up to ${concurrency} in parallel ` +
-			`(OMP_TEST_CONCURRENCY=<n>|all to change).`,
+			`(OMP_TEST_CONCURRENCY=<n> to lower); ${os.availableParallelism()} cores, ` +
+			`--parallel=${fileWidths.join("/") || "n/a"} per chunk.`,
 	);
 
 	// Incremental, cancellable drain into a mutable sink, so a watchdog-killed
@@ -796,9 +905,14 @@ export async function runTestCommandsInParallel(commands: TestCommand[], concurr
 		// Watchdog: a wedged child (e.g. bun's panic handler deadlocking
 		// after a GC crash) would otherwise hang this worker forever.
 		let timedOut = false;
-		const killTimer = setTimeout(() => {
+		let stuckTree = "";
+		const killTimer = setTimeout(async () => {
 			timedOut = true;
-			proc.kill("SIGKILL");
+			try {
+				stuckTree = await describeStuckProcessTree(proc.pid);
+			} finally {
+				proc.kill("SIGKILL");
+			}
 		}, chunkTimeoutMs());
 		const exitCode = await proc.exited;
 		clearTimeout(killTimer);
@@ -810,7 +924,7 @@ export async function runTestCommandsInParallel(commands: TestCommand[], concurr
 		return {
 			exitCode,
 			timedOut,
-			output: `${stdout.text}${stderr.text}${timedOut ? `\n[watchdog] chunk exceeded ${Math.round(chunkTimeoutMs() / 1000)}s; killed with SIGKILL (OMP_TEST_CHUNK_TIMEOUT to change)\n` : ""}`,
+			output: `${stdout.text}${stderr.text}${timedOut ? `\n${stuckTree}[watchdog] chunk exceeded ${Math.round(chunkTimeoutMs() / 1000)}s; killed with SIGKILL (OMP_TEST_CHUNK_TIMEOUT to change)\n` : ""}`,
 		};
 	}
 
@@ -876,25 +990,47 @@ export async function runTestCommandsInParallel(commands: TestCommand[], concurr
 	}
 }
 
-// Skipped when imported (e.g. by the runner's own unit tests), where
-// `process.argv` carries test-file paths rather than a mode/flags.
-if (import.meta.main) {
-	if (!(requestedMode in validModes)) {
-		throw new Error(
-			`Unknown mode ${shellQuote(requestedMode)}. Expected one of: ${Object.keys(validModes).join(", ")}`,
-		);
+// `OMP_TEST_SHARD=i/n` splits a mode's chunk commands across n CI jobs; job i
+// runs every chunk whose index ≡ i-1 (mod n). Round-robin rather than
+// contiguous ranges because the chunk list follows sorted file order, so slow
+// neighbouring suites spread evenly instead of piling into one shard. Every
+// chunk lands in exactly one shard; unset/empty runs everything.
+function selectShard<T>(commands: T[], spec: string | undefined): T[] {
+	const trimmed = spec?.trim();
+	if (!trimmed) return commands;
+	const match = /^(\d+)\/(\d+)$/.exec(trimmed);
+	const index = match ? Number(match[1]) : 0;
+	const count = match ? Number(match[2]) : 0;
+	if (!match || count < 1 || index < 1 || index > count) {
+		throw new Error(`Invalid OMP_TEST_SHARD=${JSON.stringify(trimmed)}; expected i/n with 1 <= i <= n`);
 	}
+	const selected = commands.filter((_, i) => i % count === index - 1);
+	if (selected.length === 0) {
+		throw new Error(`OMP_TEST_SHARD=${trimmed} selects no chunks (${commands.length} available)`);
+	}
+	return selected;
+}
 
-	const testCommands = await commandsForMode(requestedMode as Mode);
-	const explicitConcurrency = Boolean(Bun.env.OMP_TEST_CONCURRENCY?.trim());
-	// CI defaults to one process at a time, but memory-sized workflow buckets
-	// explicitly opt into bounded process concurrency. Local runs fan out by
-	// default and may use the same override.
-	if (!isDryRun && testCommands.length > 1 && (!isCI() || explicitConcurrency)) {
-		await runTestCommandsInParallel(testCommands, testConcurrency(testCommands.length));
-	} else {
-		for (const testCommand of testCommands) {
-			await runTestCommand(testCommand);
-		}
+if (!(requestedMode in validModes)) {
+	throw new Error(`Unknown mode ${shellQuote(requestedMode)}. Expected one of: ${Object.keys(validModes).join(", ")}`);
+}
+
+const requestedCommands = selectShard(await commandsForMode(requestedMode as Mode), Bun.env.OMP_TEST_SHARD);
+const explicitConcurrency = Boolean(Bun.env.OMP_TEST_CONCURRENCY?.trim());
+// CI defaults to one process at a time, but memory-sized workflow buckets
+// explicitly opt into bounded process concurrency. Local runs fan out by
+// default and may use the same override. Resolved before the dry-run check so
+// `--dry-run` prints the argv the real run would use, budget included.
+const pooled = requestedCommands.length > 1 && (!isCI() || explicitConcurrency);
+// The sequential path is a pool of one, so a lone chunk keeps the whole budget.
+const poolWidth = pooled
+	? testConcurrency(requestedCommands.length, Bun.env.OMP_TEST_CONCURRENCY, os.availableParallelism())
+	: 1;
+const testCommands = applyChunkBudget(requestedCommands, poolWidth);
+if (pooled && !isDryRun) {
+	await runTestCommandsInParallel(testCommands, poolWidth);
+} else {
+	for (const testCommand of testCommands) {
+		await runTestCommand(testCommand);
 	}
 }

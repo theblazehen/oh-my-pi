@@ -8,10 +8,13 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
 import type { AgentMessage } from "../types";
+import type { SessionEntry } from "./entries";
 import branchSummaryContextPrompt from "./prompts/branch-summary-context.md" with { type: "text" };
 import compactionSummaryContextPrompt from "./prompts/compaction-summary-context.md" with { type: "text" };
+import handoffSummaryContextPrompt from "./prompts/handoff-summary-context.md" with { type: "text" };
 
 const COMPACTION_SUMMARY_TEMPLATE = compactionSummaryContextPrompt;
+const HANDOFF_SUMMARY_TEMPLATE = handoffSummaryContextPrompt;
 const BRANCH_SUMMARY_TEMPLATE = branchSummaryContextPrompt;
 
 export interface CustomMessage<T = unknown> {
@@ -49,6 +52,10 @@ export interface CompactionSummaryMessage {
 	summary: string;
 	shortSummary?: string;
 	tokensBefore: number;
+	/** Estimated context tokens after the rewrite (display metadata). */
+	tokensAfter?: number;
+	/** Harness compaction method that produced this summary (display metadata). */
+	method?: string;
 	providerPayload?: ProviderPayload;
 	/** Runtime-only ordered archive blocks for snapcompact: old text region,
 	 *  imaged middle, then new text region. When present, `summary` is already
@@ -58,6 +65,13 @@ export interface CompactionSummaryMessage {
 	images?: ImageContent[];
 	/** Post-pass dead-end warning attached to this compaction (progress guard). */
 	warning?: string;
+	/**
+	 * Thinking-binding rewrite marker when it must differ from `timestamp`: a
+	 * natively replayed summary predates it before the retained tail so that
+	 * tail's bound thinking stays valid. `timestamp` remains the commit time,
+	 * which is what invalidates the tail's pre-compaction usage reports.
+	 */
+	historyRewriteAt?: number;
 	timestamp: number;
 }
 
@@ -79,7 +93,16 @@ function getPrunedToolResultContent(message: ToolResultMessage): (TextContent | 
 	}
 	const textBlocks = message.content.filter((content): content is TextContent => content.type === "text");
 	const text = textBlocks.map(block => block.text).join("") || "[Output truncated]";
-	return [{ type: "text", text }];
+	const firstTextIndex = message.content.findIndex(content => content.type === "text");
+	if (firstTextIndex < 0) return [{ type: "text", text }, ...message.content];
+
+	const content: (TextContent | ImageContent)[] = [];
+	for (let index = 0; index < message.content.length; index++) {
+		const block = message.content[index];
+		if (block.type !== "text") content.push(block);
+		else if (index === firstTextIndex) content.push({ type: "text", text });
+	}
+	return content;
 }
 
 export function renderBranchSummaryContext(summary: string): string {
@@ -88,6 +111,16 @@ export function renderBranchSummaryContext(summary: string): string {
 
 export function renderCompactionSummaryContext(summary: string): string {
 	return prompt.render(COMPACTION_SUMMARY_TEMPLATE, { summary });
+}
+/**
+ * Wrap a handoff document for injection into the successor context. Unlike the
+ * generic compaction wrapper, this names the mechanism and pins authorship —
+ * the document was written by a prior instance in its own voice, so without
+ * this framing the successor misreads first-person "Next Steps" as fresh user
+ * instructions (or tries to write the handoff again).
+ */
+export function renderHandoffSummaryContext(summary: string): string {
+	return prompt.render(HANDOFF_SUMMARY_TEMPLATE, { summary });
 }
 
 export function createBranchSummaryMessage(summary: string, fromId: string, timestamp: string): BranchSummaryMessage {
@@ -99,16 +132,28 @@ export function createBranchSummaryMessage(summary: string, fromId: string, time
 	};
 }
 
+/** Optional metadata for {@link createCompactionSummaryMessage}. */
+export interface CompactionSummaryMessageOptions {
+	shortSummary?: string;
+	providerPayload?: ProviderPayload;
+	images?: ImageContent[];
+	blocks?: (TextContent | ImageContent)[];
+	warning?: string;
+	/** Harness compaction method that produced this summary (e.g. "remote", "soft", "handoff"). */
+	method?: string;
+	/** Estimated context tokens after the rewrite, for display alongside `tokensBefore`. */
+	tokensAfter?: number;
+	/** See {@link CompactionSummaryMessage.historyRewriteAt}. */
+	historyRewriteAt?: number;
+}
+
 export function createCompactionSummaryMessage(
 	summary: string,
 	tokensBefore: number,
 	timestamp: string,
-	shortSummary?: string,
-	providerPayload?: ProviderPayload,
-	images?: ImageContent[],
-	blocks?: (TextContent | ImageContent)[],
-	warning?: string,
+	options: CompactionSummaryMessageOptions = {},
 ): CompactionSummaryMessage {
+	const { shortSummary, providerPayload, images, blocks, warning, method, tokensAfter, historyRewriteAt } = options;
 	const imageBlocks =
 		blocks?.filter((block): block is ImageContent => block.type === "image") ??
 		(images && images.length > 0 ? images : undefined);
@@ -117,10 +162,13 @@ export function createCompactionSummaryMessage(
 		summary,
 		shortSummary,
 		tokensBefore,
+		tokensAfter,
+		method,
 		providerPayload,
 		blocks: blocks && blocks.length > 0 ? blocks : undefined,
 		images: imageBlocks && imageBlocks.length > 0 ? imageBlocks : undefined,
 		warning,
+		historyRewriteAt,
 		timestamp: new Date(timestamp).getTime(),
 	};
 }
@@ -189,6 +237,7 @@ export function convertMessageToLlm(message: AgentMessage): Message | undefined 
 						},
 					],
 					attribution: "agent",
+					historyRewriteAt: message.timestamp,
 					timestamp: message.timestamp,
 				};
 			case "compactionSummary":
@@ -200,11 +249,15 @@ export function convertMessageToLlm(message: AgentMessage): Message | undefined 
 							: [
 									{
 										type: "text" as const,
-										text: renderCompactionSummaryContext(message.summary),
+										text:
+											message.method === "handoff"
+												? renderHandoffSummaryContext(message.summary)
+												: renderCompactionSummaryContext(message.summary),
 									},
 									...(message.images ?? []),
 								],
 					attribution: "agent",
+					historyRewriteAt: message.historyRewriteAt ?? message.timestamp,
 					providerPayload: message.providerPayload,
 					timestamp: message.timestamp,
 				};
@@ -238,4 +291,28 @@ export function convertMessageToLlm(message: AgentMessage): Message | undefined 
  */
 export function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
 	return messages.map(convertMessageToLlm).filter(message => message !== undefined);
+}
+
+/**
+ * The context message a session entry contributes, or `undefined` for entries
+ * that don't reach the LLM (compaction markers, labels, model changes, ...).
+ */
+export function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
+	if (entry.type === "message") {
+		return entry.message;
+	}
+	if (entry.type === "custom_message") {
+		return createCustomMessage(
+			entry.customType,
+			entry.content,
+			entry.display,
+			entry.details,
+			entry.timestamp,
+			entry.attribution,
+		);
+	}
+	if (entry.type === "branch_summary") {
+		return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
+	}
+	return undefined;
 }

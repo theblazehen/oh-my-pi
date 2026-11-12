@@ -88,16 +88,46 @@ describe("AIError.classify — structural provider errors", () => {
 		expect(AIError.retriable(id)).toBe(true);
 	});
 
-	it("classifies an empty provider response as transient + retryable", () => {
-		// Regression: "Cloud Code Assist API returned an empty response" matched no
-		// text pattern and empty-body carried no flag, so retry/model-fallback
-		// chains never engaged and the turn hard-failed.
-		const err = new AIError.ProviderResponseError("Cloud Code Assist API returned an empty response", {
-			provider: "google-antigravity",
+	it("keeps a terminal 4xx that wraps a stream-truncation cause terminal", () => {
+		const err = new AIError.ProviderHttpError("Bad Request", 400, { cause: new Error("unexpected EOF") });
+		const id = AIError.classify(err);
+		expect(AIError.is(id, AIError.Flag.Transient)).toBe(false);
+		expect(AIError.retriable(id)).toBe(false);
+	});
+
+	it("keeps a retryable-status wrapper over a stream-truncation cause transient", () => {
+		for (const wrapped of [
+			new AIError.ProviderHttpError("Service Unavailable", 503, { cause: new Error("unexpected EOF") }),
+			new AIError.ProviderHttpError("Too Many Requests", 429, { cause: new Error("eof while parsing") }),
+		]) {
+			const id = AIError.classify(wrapped);
+			expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
+			expect(AIError.retriable(id)).toBe(true);
+		}
+	});
+
+	it("keeps empty response bodies on the generic transient fallback path", () => {
+		const err = new AIError.ProviderResponseError("Google API returned an empty response body", {
+			provider: "google",
 			kind: "empty-body",
 		});
 		const id = AIError.classify(err);
 		expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
+		expect(AIError.is(id, AIError.Flag.EmptyResponse)).toBe(false);
+		expect(AIError.retriable(id)).toBe(true);
+	});
+
+	it("classifies thought-only output as transient + empty-response + retryable", () => {
+		const err = new AIError.ProviderResponseError(
+			"Cloud Code Assist API returned a thought-only response without final output",
+			{
+				provider: "google-antigravity",
+				kind: "empty-output",
+			},
+		);
+		const id = AIError.classify(err);
+		expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
+		expect(AIError.is(id, AIError.Flag.EmptyResponse)).toBe(true);
 		expect(AIError.retriable(id)).toBe(true);
 	});
 
@@ -129,6 +159,24 @@ describe("AIError.finalize", () => {
 		expect(AIError.is(result.id, AIError.Flag.Transient)).toBe(true);
 	});
 
+	it("applies a captured terminal 4xx before classifying a truncation error", async () => {
+		const result = await AIError.finalize(new Error("unexpected EOF"), {
+			capturedErrorResponse: { status: 400 },
+		});
+
+		expect(result.status).toBe(400);
+		expect(AIError.is(result.id, AIError.Flag.Transient)).toBe(false);
+		expect(AIError.retriable(result.id)).toBe(false);
+	});
+
+	it("preserves nested token-overflow evidence through finalization", async () => {
+		const inner = Object.assign(new Error("Error: maximum context length is 128000 tokens"), { status: 413 });
+		const result = await AIError.finalize(new Error("Provider returned error", { cause: inner }));
+
+		expect(AIError.is(result.id, AIError.Flag.ContextOverflow)).toBe(true);
+		expect(AIError.is(result.id, AIError.Flag.PayloadRejected)).toBe(false);
+	});
+
 	it("keeps an incomplete-stream provider error retryable through finalize + classifyMessage", async () => {
 		const result = await AIError.finalize(
 			new AIError.ProviderResponseError("stream ended without a finish reason", { kind: "incomplete-stream" }),
@@ -139,6 +187,25 @@ describe("AIError.finalize", () => {
 		// The transient flag survives a re-classify from the persisted message fields.
 		const reId = AIError.classifyMessage({ errorId: result.id, errorMessage: result.message });
 		expect(AIError.retriable(reId)).toBe(true);
+	});
+
+	it("treats Aliyun multimodal-gateway 400s as transient (flaky, replay succeeds)", () => {
+		const phrasings = [
+			"400 <400> InternalError.Algo.InvalidParameter: The provided URL does not appear to be valid. Ensure it is correctly formatted.\n<400> InternalError.Algo.InvalidParameter: The provided URL does not appear to be valid. Ensure it is correctly formatted. (type=invalid_request_error param=invalid_parameter_error)",
+			"400 <400> InternalError.Algo.InvalidParameter: Download multimodal file timed out\n<400> InternalError.Algo.InvalidParameter: Download multimodal file timed out (type=invalid_request_error param=invalid_parameter_error)",
+		];
+		for (const errorMessage of phrasings) {
+			const id = AIError.classifyMessage({ errorStatus: 400, errorMessage });
+			expect(AIError.is(id, AIError.Flag.Transient)).toBe(true);
+		}
+	});
+
+	it("keeps genuine 400 validation errors terminal", () => {
+		const id = AIError.classifyMessage({
+			errorStatus: 400,
+			errorMessage: "400 invalid_request_error: unknown field 'temperaturee' in request body",
+		});
+		expect(AIError.is(id, AIError.Flag.Transient)).toBe(false);
 	});
 });
 

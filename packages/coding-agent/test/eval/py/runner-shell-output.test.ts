@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { $which } from "@oh-my-pi/pi-utils";
 
 interface RunnerFrame {
 	type?: string;
@@ -8,16 +9,27 @@ interface RunnerFrame {
 	status?: string;
 }
 
-const pythonPath = Bun.env.PYTHON ?? "python3";
+const pythonPath = Bun.env.PYTHON ?? ($which("python3") ? "python3" : "python");
 const runnerPath = path.resolve(import.meta.dir, "../../../src/eval/py/runner.py");
 const repoRoot = path.resolve(import.meta.dir, "../../../../..");
 const encoder = new TextEncoder();
 
 function shellQuote(value: string): string {
+	// `!cmd` runs through cmd.exe on Windows (shell=True) and a POSIX shell
+	// elsewhere; quote for the shell that will actually parse the command.
+	if (process.platform === "win32") {
+		return `"${value.replaceAll('"', '""')}"`;
+	}
 	return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
 async function runCell(code: string): Promise<RunnerFrame[]> {
+	const [frames] = await runCells([code]);
+	return frames;
+}
+
+/** Runs each cell on one runner, sending the next request only after the previous cell's done frame. */
+async function runCells(codes: string[]): Promise<RunnerFrame[][]> {
 	const proc = Bun.spawn([pythonPath, "-u", runnerPath], {
 		cwd: repoRoot,
 		stdin: "pipe",
@@ -33,7 +45,6 @@ async function runCell(code: string): Promise<RunnerFrame[]> {
 	const reader = proc.stdout.getReader();
 	const decoder = new TextDecoder();
 	let pending = "";
-	const frames: RunnerFrame[] = [];
 
 	async function readFrame(): Promise<RunnerFrame> {
 		while (true) {
@@ -41,7 +52,10 @@ async function runCell(code: string): Promise<RunnerFrame[]> {
 			if (newline >= 0) {
 				const line = pending.slice(0, newline);
 				pending = pending.slice(newline + 1);
-				return JSON.parse(line) as RunnerFrame;
+				const frame = JSON.parse(line) as RunnerFrame;
+				// Child processes write \r\n on Windows.
+				if (typeof frame.data === "string") frame.data = frame.data.replaceAll("\r\n", "\n");
+				return frame;
 			}
 			const { value, done } = await reader.read();
 			if (done) {
@@ -52,12 +66,17 @@ async function runCell(code: string): Promise<RunnerFrame[]> {
 	}
 
 	try {
-		proc.stdin.write(encoder.encode(`${JSON.stringify({ id: "r1", code })}\n`));
-		proc.stdin.flush();
-		while (true) {
-			const frame = await readFrame();
-			frames.push(frame);
-			if (frame.type === "done") break;
+		const results: RunnerFrame[][] = [];
+		for (const [index, code] of codes.entries()) {
+			proc.stdin.write(encoder.encode(`${JSON.stringify({ id: `r${index + 1}`, code })}\n`));
+			proc.stdin.flush();
+			const frames: RunnerFrame[] = [];
+			while (true) {
+				const frame = await readFrame();
+				frames.push(frame);
+				if (frame.type === "done") break;
+			}
+			results.push(frames);
 		}
 		proc.stdin.write(encoder.encode(`${JSON.stringify({ type: "exit" })}\n`));
 		proc.stdin.end();
@@ -65,7 +84,7 @@ async function runCell(code: string): Promise<RunnerFrame[]> {
 		if (exitCode !== 0) {
 			throw new Error(`Python runner exited ${exitCode}: ${await stderr}`);
 		}
-		return frames;
+		return results;
 	} finally {
 		try {
 			reader.releaseLock();
@@ -139,6 +158,49 @@ describe("Python runner shell output streaming", () => {
 		expect(stdout).not.toContain("capturedChars=1048593");
 	});
 
+	it("isolates !cmd children from the runner's stdin control channel", async () => {
+		// The runner's stdin carries the host's NDJSON frames. A child that
+		// inherits it can steal frames or block forever waiting for input;
+		// with stdin=DEVNULL a stdin-reading child sees immediate EOF instead.
+		const child = ["import sys", "data = sys.stdin.read()", "print('read=' + repr(data))"].join(";");
+		const frames = await runCell(
+			[
+				`result = !${pythonPath} -c ${shellQuote(child)}`,
+				"print('return=' + str(result.returncode) + ' lines=' + repr(list(result)))",
+			].join("\n"),
+		);
+		const stdout = frames
+			.filter(frame => frame.type === "stdout")
+			.map(frame => frame.data)
+			.join("");
+
+		expect(stdout).toContain("read=''");
+		expect(stdout).toContain("return=0");
+	});
+
+	it("gives processes started by plain user code EOF on stdin instead of the control channel", async () => {
+		// Without an explicit stdin, a child inherits the runner's fd 0. That
+		// must not be the host's control pipe, which stays open for the
+		// kernel's whole life: a stdin-reading child (e.g. `omp -p`) would block
+		// until the timeout below, or steal frames meant for the runner.
+		const child = "import sys; print('read=' + repr(sys.stdin.read()))";
+		const [first, second] = await runCells([
+			[
+				"import subprocess, sys",
+				`proc = subprocess.run([sys.executable, "-c", ${JSON.stringify(child)}], capture_output=True, text=True, timeout=10)`,
+				"print(proc.stdout, end='')",
+			].join("\n"),
+			"print('second request served')",
+		]);
+
+		expect(first.filter(frame => frame.type === "stdout").map(frame => frame.data)).toEqual(["read=''\n"]);
+		expect(first.at(-1)?.status).toBe("ok");
+		expect(second.filter(frame => frame.type === "stdout").map(frame => frame.data)).toEqual([
+			"second request served\n",
+		]);
+		expect(second.at(-1)?.status).toBe("ok");
+	}, 30_000);
+
 	it("streams newline-free %%bash output without waiting for EOF", async () => {
 		const child = [
 			"import sys,time",
@@ -152,6 +214,16 @@ describe("Python runner shell output streaming", () => {
 		const stdout = frames.filter(frame => frame.type === "stdout").map(frame => frame.data);
 
 		expect(stdout[0]).toBe("first");
+		// The cell has no value of its own: nothing follows the command's output.
 		expect(stdout.join("")).toBe("firstsecond");
+	});
+
+	it("reports a failing %%bash cell's exit status", async () => {
+		const frames = await runCell("%%bash\nexit 3");
+
+		expect(frames.filter(frame => frame.type === "stdout")).toEqual([]);
+		expect(frames.filter(frame => frame.type === "stderr").map(frame => frame.data)).toEqual([
+			"%%bash: exit status 3\n",
+		]);
 	});
 });

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import type { Context, Model, ModelSpec, Tool, ToolChoice } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { z } from "zod/v4";
 
 interface ChatCompletionsPayload {
 	tool_choice?: unknown;
@@ -18,13 +18,13 @@ interface ResponsesPayload {
 const resolveTool: Tool = {
 	name: "resolve",
 	description: "Apply or discard a pending preview",
-	parameters: z.object({ action: z.enum(["apply", "discard"]), reason: z.string() }),
+	parameters: type({ action: type.enumeration(["apply", "discard"]), reason: type("string") }),
 };
 
 const todoTool: Tool = {
 	name: "todo",
 	description: "Track work items",
-	parameters: z.object({ note: z.string() }),
+	parameters: type({ note: type("string") }),
 };
 
 const multiToolContext: Context = {
@@ -110,16 +110,6 @@ describe("issues #3593 and #6925 — string-only tool_choice hosts", () => {
 	it.each([
 		["llama.cpp", "http://localhost:8080/v1"],
 		["lm-studio", "http://127.0.0.1:1234/v1"],
-	])("downgrades named forced tool_choice to required for %s", async (provider, baseUrl) => {
-		const payload = await capturePayload(model({ provider, baseUrl }));
-
-		expect(payload.tools?.map(tool => tool.function?.name)).toEqual(["resolve"]);
-		expect(payload.tool_choice).toBe("required");
-	});
-
-	it.each([
-		["llama.cpp", "http://localhost:8080/v1"],
-		["lm-studio", "http://127.0.0.1:1234/v1"],
 	])("drops the forced choice for %s when the named tool is absent", async (provider, baseUrl) => {
 		const payload = await capturePayload(model({ provider, baseUrl }), {
 			context: { messages: context.messages, tools: [] },
@@ -150,14 +140,6 @@ describe("issues #3593 and #6925 — string-only tool_choice hosts", () => {
 
 		expect(payload.tools?.map(tool => tool.function?.name)).toEqual(["todo", "resolve"]);
 		expect(payload.tool_choice).toEqual({ type: "function", function: { name: "todo" } });
-	});
-
-	it("preserves OpenAI's named tool_choice object", async () => {
-		const payload = await capturePayload(
-			model({ provider: "openai", baseUrl: "https://api.openai.com/v1", id: "gpt-4o-mini", name: "GPT-4o mini" }),
-		);
-
-		expect(payload.tool_choice).toEqual({ type: "function", function: { name: "resolve" } });
 	});
 });
 

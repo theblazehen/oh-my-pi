@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import { complete } from "@oh-my-pi/pi-ai/stream";
 import type { Api, Context, Model, OptionsForApi, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { type } from "arktype";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Empty schema for test tools - must be proper OBJECT type for Cloud Code Assist
@@ -504,27 +504,27 @@ describe("AI Providers Unicode Surrogate Pair Tests", () => {
 
 	describe("Google Antigravity Provider Unicode Handling", () => {
 		it.skipIf(!antigravityToken)(
-			"gemini-3-flash - should handle emoji in tool results",
+			"gemini-3.8-flash - should handle emoji in tool results",
 			async () => {
-				const llm = getBundledModel("google-antigravity", "gemini-3-flash");
+				const llm = getBundledModel("google-antigravity", "gemini-3.8-flash");
 				await testEmojiInToolResults(llm, { apiKey: antigravityToken });
 			},
 			{ retry: 3, timeout: 30000 },
 		);
 
 		it.skipIf(!antigravityToken)(
-			"gemini-3-flash - should handle real-world LinkedIn comment data with emoji",
+			"gemini-3.8-flash - should handle real-world LinkedIn comment data with emoji",
 			async () => {
-				const llm = getBundledModel("google-antigravity", "gemini-3-flash");
+				const llm = getBundledModel("google-antigravity", "gemini-3.8-flash");
 				await testRealWorldLinkedInData(llm, { apiKey: antigravityToken });
 			},
 			{ retry: 3, timeout: 30000 },
 		);
 
 		it.skipIf(!antigravityToken)(
-			"gemini-3-flash - should handle unpaired high surrogate (0xD83D) in tool results",
+			"gemini-3.8-flash - should handle unpaired high surrogate (0xD83D) in tool results",
 			async () => {
-				const llm = getBundledModel("google-antigravity", "gemini-3-flash");
+				const llm = getBundledModel("google-antigravity", "gemini-3.8-flash");
 				await testUnpairedHighSurrogate(llm, { apiKey: antigravityToken });
 			},
 			{ retry: 3, timeout: 30000 },

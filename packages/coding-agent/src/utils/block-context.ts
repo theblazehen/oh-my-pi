@@ -1,5 +1,6 @@
-import { enclosingBlockBoundaries } from "@oh-my-pi/pi-natives";
+import { enclosingBlockBoundaries, warmBlockParse } from "@oh-my-pi/pi-natives";
 import { logger } from "@oh-my-pi/pi-utils";
+import { ensureGrammar } from "./grammars";
 
 const OPEN_TO_CLOSE: Record<string, string> = {
 	"(": ")",
@@ -13,6 +14,13 @@ const CLOSE_TO_OPEN: Record<string, string> = {
 	"}": "{",
 };
 
+/**
+ * Lines containing any of these characters need char-by-char scanning when
+ * the scanner is in code mode: brackets, string quotes, or comment markers.
+ * Anything else can neither add boundaries nor change scanner state.
+ */
+const LINE_SCAN_PATTERN = /[()[\]{}'"`/#]/;
+
 export interface LineSpan {
 	startLine: number;
 	endLine: number;
@@ -22,6 +30,37 @@ export interface LineSpan {
 export interface BlockContextSource {
 	path?: string;
 	lang?: string;
+	/**
+	 * The whole source `fullLines` was split from, when the caller still holds it.
+	 * Supplying it skips re-joining every line into a fresh whole-file string on
+	 * the way to the parser. It MUST be the same content as `fullLines`; a
+	 * differing trailing newline is the only tolerated variation, since it moves
+	 * no node's line number.
+	 *
+	 * Every current supplier derives both from one buffer in the same breath, so
+	 * the two cannot drift. Do NOT set it on a source object that is reused
+	 * across two different line arrays — a before/after diff pair, say — because
+	 * the boundary lines tree-sitter reports would then be indexed into the wrong
+	 * array and surface off-by-N context rows.
+	 */
+	text?: string;
+}
+
+/**
+ * Parse `source.text` into the native tree cache off the JS thread. The
+ * block-context lookup is synchronous and, for a window that hides part of
+ * the source, would otherwise run a cold whole-file parse on the event loop;
+ * awaiting this first makes it a cache hit. A failure only means the lookup
+ * parses on demand.
+ */
+export async function warmBlockContext(source: BlockContextSource & { text: string }): Promise<void> {
+	if (!source.path && !source.lang) return;
+	try {
+		await ensureGrammar({ path: source.path, lang: source.lang });
+		await warmBlockParse({ code: source.text, path: source.path, lang: source.lang });
+	} catch (error) {
+		logger.debug("warmBlockParse failed; block context parses on demand", { error });
+	}
 }
 
 export type LineEntry = { kind: "line"; lineNumber: number; text: string; context: boolean } | { kind: "ellipsis" };
@@ -72,6 +111,11 @@ function hasEveryLineVisible(visible: ReadonlySet<number>, totalLines: number): 
 	return totalLines > 0 && visible.size >= totalLines;
 }
 
+/** Whether `spans` show all of a `totalLines`-line source, so block context has nothing to add. */
+export function spansCoverEveryLine(spans: readonly LineSpan[], totalLines: number): boolean {
+	return hasEveryLineVisible(visibleLineNumbers(normalizeLineSpans(spans, totalLines)), totalLines);
+}
+
 /** Collapse a set of visible line numbers into sorted, merged inclusive spans. */
 function visibleSetToSpans(visible: ReadonlySet<number>): LineSpan[] {
 	const sorted = [...visible].sort((left, right) => left - right);
@@ -105,7 +149,7 @@ function nativeBlockContext(
 	let boundaries: number[] | null;
 	try {
 		boundaries = enclosingBlockBoundaries({
-			code: fullLines.join("\n"),
+			code: source.text ?? fullLines.join("\n"),
 			path: source.path,
 			lang: source.lang,
 			ranges,
@@ -150,10 +194,18 @@ function lexicalBracketContext(fullLines: readonly string[], visible: ReadonlySe
 	const stack: StackEntry[] = [];
 	let mode: ScannerMode = "code";
 	let escaped = false;
-
+	// Set when the single pass below sees a bracket opener outside strings
+	// and comments. Without one, no boundary lines can exist and the trailing
+	// visible-line sweep is skipped.
+	let sawBracket = false;
 	for (let lineIndex = 0; lineIndex < fullLines.length; lineIndex++) {
-		const lineNumber = lineIndex + 1;
 		const line = fullLines[lineIndex] ?? "";
+		// In code mode a line without brackets, quotes, or comment markers can
+		// neither add boundaries nor change scanner state: skip it char-by-char
+		// cost without a separate pre-scan pass. Other modes still scan every
+		// line so multi-line strings and block comments track their end.
+		if (mode === "code" && !LINE_SCAN_PATTERN.test(line)) continue;
+		const lineNumber = lineIndex + 1;
 		const lineVisible = visible.has(lineNumber);
 		let index = 0;
 		while (index < line.length) {
@@ -219,6 +271,7 @@ function lexicalBracketContext(fullLines: readonly string[], visible: ReadonlySe
 			}
 
 			if (OPEN_TO_CLOSE[ch]) {
+				sawBracket = true;
 				stack.push({ opener: ch, lineNumber, text: line, visible: lineVisible });
 				index++;
 				continue;
@@ -244,8 +297,9 @@ function lexicalBracketContext(fullLines: readonly string[], visible: ReadonlySe
 			escaped = false;
 		}
 	}
-
-	for (const lineNumber of visible) context.delete(lineNumber);
+	// No openers outside strings/comments means no boundary lines exist;
+	// skip the visible-line sweep entirely.
+	if (sawBracket) for (const lineNumber of visible) context.delete(lineNumber);
 	return context;
 }
 

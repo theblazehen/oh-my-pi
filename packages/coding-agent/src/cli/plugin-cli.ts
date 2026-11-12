@@ -4,18 +4,22 @@
  * Handles `omp plugin <command>` subcommands for plugin lifecycle management.
  */
 
-import { APP_NAME, getProjectDir } from "@oh-my-pi/pi-utils";
-import chalk from "chalk";
+import * as path from "node:path";
+import { APP_NAME, getPluginsNodeModules, getProjectDir } from "@oh-my-pi/pi-utils";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 import { resolveOrDefaultProjectRegistryPath } from "../discovery/helpers";
 import { PluginManager, parseSettingValue, validateSetting } from "../extensibility/plugins";
+import { setInstalledPluginEnabled } from "../extensibility/plugins/toggle";
 import {
 	getInstalledPluginsRegistryPath,
 	getMarketplacesCacheDir,
 	getMarketplacesRegistryPath,
 	getPluginsCacheDir,
 	MarketplaceManager,
+	parsePluginId,
 } from "../extensibility/plugins/marketplace/index.js";
-import { theme } from "../modes/theme/theme";
+import type { InstalledPlugin } from "../extensibility/plugins/types";
+import { theme } from "@oh-my-pi/pi-tui/theme";
 
 // =============================================================================
 // Types
@@ -135,13 +139,22 @@ export function parsePluginArgs(args: string[]): PluginCommandArgs | undefined {
 	return result;
 }
 
-import { classifyInstallTarget } from "./classify-install-target";
+import { classifyInstallTarget, handleMarketplaceInstall } from "./classify-install-target";
 
 export { classifyInstallTarget } from "./classify-install-target";
 
 // =============================================================================
 // Command Handlers
 // =============================================================================
+
+/**
+ * Stop a mutating command that has no preview mode before it applies its change under `--dry-run`.
+ */
+function refuseDryRun(flags: { dryRun?: boolean }, command: string): void {
+	if (!flags.dryRun) return;
+	console.error(chalk.red(`--dry-run is not supported by '${APP_NAME} plugin ${command}'. Nothing was changed.`));
+	process.exit(1);
+}
 
 /**
  * Run a plugin command.
@@ -184,7 +197,7 @@ export async function runPluginCommand(cmd: PluginCommandArgs): Promise<void> {
 			await handleDiscover(cmd.args, cmd.flags);
 			break;
 		case "upgrade":
-			await handleUpgrade(cmd.args, cmd.flags);
+			await handleUpgrade(manager, cmd.args, cmd.flags);
 			break;
 	}
 }
@@ -203,7 +216,7 @@ async function makeMarketplaceManager(): Promise<MarketplaceManager> {
 	});
 }
 
-async function handleMarketplace(args: string[], _flags: PluginCommandArgs["flags"]): Promise<void> {
+async function handleMarketplace(args: string[], flags: PluginCommandArgs["flags"]): Promise<void> {
 	const subcommand = args[0] ?? "list";
 	const manager = await makeMarketplaceManager();
 
@@ -214,6 +227,7 @@ async function handleMarketplace(args: string[], _flags: PluginCommandArgs["flag
 				console.error(chalk.red(`Usage: ${APP_NAME} plugin marketplace add <source>`));
 				process.exit(1);
 			}
+			refuseDryRun(flags, "marketplace add");
 			try {
 				await manager.addMarketplace(source);
 				console.log(chalk.green(`${theme.status.success} Added marketplace: ${source}`));
@@ -230,6 +244,7 @@ async function handleMarketplace(args: string[], _flags: PluginCommandArgs["flag
 				console.error(chalk.red(`Usage: ${APP_NAME} plugin marketplace remove <name>`));
 				process.exit(1);
 			}
+			refuseDryRun(flags, "marketplace remove");
 			try {
 				await manager.removeMarketplace(name);
 				console.log(chalk.green(`${theme.status.success} Removed marketplace: ${name}`));
@@ -240,6 +255,7 @@ async function handleMarketplace(args: string[], _flags: PluginCommandArgs["flag
 			break;
 		}
 		case "update": {
+			refuseDryRun(flags, "marketplace update");
 			try {
 				const name = args[1];
 				if (name) {
@@ -305,27 +321,24 @@ async function handleDiscover(args: string[], _flags: PluginCommandArgs["flags"]
 	}
 }
 
-async function handleUpgrade(args: string[], flags: PluginCommandArgs["flags"]): Promise<void> {
+async function handleUpgrade(
+	pluginManager: PluginManager,
+	args: string[],
+	flags: PluginCommandArgs["flags"],
+): Promise<void> {
 	const manager = await makeMarketplaceManager();
-	const pluginId = args[0];
 	try {
-		if (pluginId) {
-			if (flags.scope) {
-				const result = await manager.upgradePlugin(pluginId, flags.scope);
-				console.log(chalk.green(`Upgraded ${pluginId} (${flags.scope}) to ${result.version}`));
-			} else {
-				const entries = await manager.upgradePluginAcrossScopes(pluginId);
-				for (const entry of entries) {
-					console.log(chalk.green(`Upgraded ${pluginId} (${entry.scope}) to ${entry.version}`));
-				}
-			}
-		} else {
+		if (args.length === 0) {
 			if (flags.scope) {
 				console.error(
 					chalk.yellow(
 						`Warning: --scope is ignored when upgrading all plugins. Use 'omp plugin upgrade <id> --scope ${flags.scope}' to target a specific plugin and scope.`,
 					),
 				);
+			}
+			if (flags.dryRun) {
+				await previewMarketplaceUpgradeAll(manager);
+				return;
 			}
 			const results = await manager.upgradeAllPlugins();
 			if (results.length === 0) {
@@ -335,10 +348,132 @@ async function handleUpgrade(args: string[], flags: PluginCommandArgs["flags"]):
 					console.log(chalk.green(`  ${r.pluginId} (${r.scope}): ${r.from} -> ${r.to}`));
 				}
 			}
+			return;
+		}
+
+		for (let pluginId of args) {
+			// Marketplace IDs are `name@marketplace`; anything else is either a bare
+			// marketplace plugin name or an npm/git-installed plugin (e.g. `ida-mcp`
+			// from `github:HexRaysSA/ida-mcp#latest`, or a scoped `@scope/pkg`).
+			if (!parsePluginId(pluginId)) {
+				const bareName = pluginId;
+				const candidates = (await manager.listInstalledPlugins())
+					.map(p => p.id)
+					.filter(id => id.slice(0, id.lastIndexOf("@")) === bareName);
+				const uniqueCandidates = [...new Set(candidates)];
+				if (uniqueCandidates.length > 1) {
+					console.error(
+						chalk.red(
+							`${bareName} is installed from ${uniqueCandidates.length} marketplaces. Qualify it: ${uniqueCandidates.join(", ")}`,
+						),
+					);
+					process.exit(1);
+				}
+				if (uniqueCandidates.length === 1) {
+					pluginId = uniqueCandidates[0];
+				} else {
+					await upgradePackagePlugin(pluginManager, bareName, flags);
+					continue;
+				}
+			}
+			if (flags.dryRun) {
+				await previewMarketplaceReinstall(manager, pluginId, flags.scope);
+			} else if (flags.scope) {
+				const result = await manager.upgradePlugin(pluginId, flags.scope);
+				console.log(chalk.green(`Upgraded ${pluginId} (${flags.scope}) to ${result.version}`));
+			} else {
+				const entries = await manager.upgradePluginAcrossScopes(pluginId);
+				for (const entry of entries) {
+					console.log(chalk.green(`Upgraded ${pluginId} (${entry.scope}) to ${entry.version}`));
+				}
+			}
 		}
 	} catch (err) {
 		console.error(chalk.red(`Failed to upgrade: ${err}`));
 		process.exit(1);
+	}
+}
+
+/**
+ * `upgrade --dry-run` with no id: the rows `upgradeAllPlugins` would reinstall, which are the
+ * outdated rows of `checkForUpdates` without the ones whose install the current state refuses.
+ */
+async function previewMarketplaceUpgradeAll(manager: MarketplaceManager): Promise<void> {
+	const updates = await manager.previewUpgradeAllPlugins();
+	if (updates.length === 0) {
+		console.log(chalk.dim("[dry-run] All marketplace plugins are up to date"));
+		return;
+	}
+	for (const u of updates) {
+		console.log(chalk.dim(`[dry-run] Would upgrade ${u.pluginId} (${u.scope}): ${u.from} -> ${u.to}`));
+	}
+}
+
+/**
+ * `upgrade <id> --dry-run`: one row per scope the real command reinstalls. `upgradePlugin` and
+ * `upgradePluginAcrossScopes` force a reinstall of the catalog's current version whatever it is,
+ * so a same or older catalog version is reported as a reinstall or downgrade, not skipped.
+ */
+async function previewMarketplaceReinstall(
+	manager: MarketplaceManager,
+	pluginId: string,
+	scope: "user" | "project" | undefined,
+): Promise<void> {
+	for (const row of await manager.previewUpgradePlugin(pluginId, scope)) {
+		const label = `${pluginId} (${row.scope})`;
+		const line = row.to
+			? `Would ${row.change} ${label}: ${row.from ?? "?"} -> ${row.to}`
+			: `Would reinstall ${label} from ${row.from ?? "?"}; the new version is known only after fetching its source`;
+		console.log(chalk.dim(`[dry-run] ${line}`));
+	}
+}
+
+/** Upgrade an npm/git-installed plugin in place from its recorded source. */
+async function upgradePackagePlugin(
+	manager: PluginManager,
+	name: string,
+	flags: PluginCommandArgs["flags"],
+): Promise<void> {
+	if (flags.dryRun) {
+		try {
+			await manager.validateUpgrade(name);
+		} catch (err) {
+			console.error(chalk.red(`Failed to upgrade ${name}: ${err instanceof Error ? err.message : err}`));
+			process.exit(1);
+		}
+		refuseDryRun(flags, `upgrade ${name}`);
+	}
+	if (flags.scope === "project") {
+		console.error(
+			chalk.yellow(
+				`Warning: --scope is only supported for marketplace plugins (name@marketplace). Ignoring for ${name}.`,
+			),
+		);
+	}
+	try {
+		const { from, plugin, changed } = await manager.upgrade(name);
+		if (flags.json) {
+			console.log(
+				JSON.stringify({ upgraded: plugin.name, from: from ?? null, to: plugin.version, changed }, null, 2),
+			);
+		} else if (!changed) {
+			console.log(chalk.green(`${plugin.name} is up to date (${plugin.version})`));
+		} else if (from === plugin.version) {
+			console.log(chalk.green(`Upgraded ${plugin.name} to a new revision (${plugin.version})`));
+		} else {
+			console.log(chalk.green(`Upgraded ${plugin.name}${from ? ` from ${from}` : ""} to ${plugin.version}`));
+		}
+	} catch (err) {
+		console.error(chalk.red(`Failed to upgrade ${name}: ${err instanceof Error ? err.message : err}`));
+		process.exit(1);
+	}
+}
+
+function printLinkPreview(pluginPath: string, json?: boolean): void {
+	if (json) {
+		console.log(JSON.stringify({ dryRun: true, action: "link", path: pluginPath }, null, 2));
+	} else {
+		console.log(chalk.dim(`[dry-run] Would link ${pluginPath}`));
 	}
 }
 
@@ -366,6 +501,24 @@ async function handleInstall(
 		const target = classifyInstallTarget(spec, knownMarketplaces);
 
 		if (target.type === "marketplace") {
+			try {
+				const handled = await handleMarketplaceInstall(
+					mktMgr,
+					target,
+					{ dryRun: flags.dryRun ?? false, force: flags.force, scope: flags.scope },
+					preview => {
+						if (flags.json) {
+							console.log(JSON.stringify(preview, null, 2));
+						} else {
+							console.log(chalk.dim(`[dry-run] Would install ${spec}`));
+						}
+					},
+				);
+				if (handled) continue;
+			} catch (err) {
+				console.error(chalk.red(`${theme.status.error} Failed to install ${spec}: ${err}`));
+				process.exit(1);
+			}
 			try {
 				const entry = await mktMgr.installPlugin(target.name, target.marketplace, {
 					force: flags.force,
@@ -402,11 +555,7 @@ async function handleInstall(
 				);
 			}
 			if (flags.dryRun) {
-				if (flags.json) {
-					console.log(JSON.stringify({ dryRun: true, action: "link", path: target.path }, null, 2));
-				} else {
-					console.log(chalk.dim(`[dry-run] Would link ${spec}`));
-				}
+				printLinkPreview(spec, flags.json);
 				continue;
 			}
 			try {
@@ -464,7 +613,7 @@ async function handleInstall(
 async function handleUninstall(
 	manager: PluginManager,
 	packages: string[],
-	flags: { json?: boolean; scope?: "user" | "project" },
+	flags: { json?: boolean; dryRun?: boolean; scope?: "user" | "project" },
 ): Promise<void> {
 	if (packages.length === 0) {
 		console.error(chalk.red(`Usage: ${APP_NAME} plugin uninstall <package> ...`));
@@ -474,10 +623,61 @@ async function handleUninstall(
 	// For uninstall, check the installed plugins registry directly.
 	// This works even if the marketplace entry was later removed from marketplaces.json.
 	const mktMgr = await makeMarketplaceManager();
-	const installedPlugins = new Set((await mktMgr.listInstalledPlugins()).map(p => p.id));
+	const installedIds = (await mktMgr.listInstalledPlugins()).map(p => p.id);
+	const installedPlugins = new Set(installedIds);
 
-	for (const name of packages) {
-		if (installedPlugins.has(name)) {
+	// Installed marketplace IDs are `name@marketplace`, so a bare name never matches one
+	// exactly. Resolve it when exactly one marketplace supplies that name: without this the
+	// bare form falls through to the npm path, where `bun uninstall` exits 0 for a package
+	// that was never a dependency and the command reports a removal that did not happen.
+	const marketplaceIdsFor = (name: string): string[] =>
+		installedIds.filter(id => id.slice(0, id.lastIndexOf("@")) === name);
+
+	for (const rawName of packages) {
+		let name = rawName;
+		if (!installedPlugins.has(name)) {
+			const candidates = marketplaceIdsFor(name);
+			if (candidates.length === 1) {
+				name = candidates[0] as string;
+			} else if (candidates.length > 1) {
+				console.error(
+					chalk.red(
+						`${theme.status.error} ${rawName} is installed from ${candidates.length} marketplaces. Qualify it: ${candidates.join(", ")}`,
+					),
+				);
+				process.exit(1);
+			}
+		}
+
+		const viaMarketplace = installedPlugins.has(name);
+
+		if (flags.dryRun) {
+			if (viaMarketplace) {
+				try {
+					await mktMgr.uninstallPlugin(name, flags.scope, { dryRun: true });
+				} catch (err) {
+					console.error(chalk.red(`${theme.status.error} Failed to uninstall ${name}: ${err}`));
+					process.exit(1);
+				}
+			}
+
+			// Marketplace dry-runs validate the requested scope before reporting.
+			if (flags.json) {
+				console.log(
+					JSON.stringify({
+						dryRun: true,
+						action: "uninstall",
+						plugin: name,
+						source: viaMarketplace ? "marketplace" : "npm",
+					}),
+				);
+			} else {
+				console.log(chalk.dim(`[dry-run] Would uninstall ${name}`));
+			}
+			continue;
+		}
+
+		if (viaMarketplace) {
 			// Exact match against installed marketplace plugin IDs (name@marketplace)
 			try {
 				await mktMgr.uninstallPlugin(name, flags.scope);
@@ -489,7 +689,14 @@ async function handleUninstall(
 			continue;
 		}
 
-		// npm path
+		// npm path. `bun uninstall` exits 0 for a package that is not a dependency, so an
+		// unknown name would otherwise print a success line having removed nothing.
+		const npmPlugins = await manager.list();
+		if (!npmPlugins.some(p => p.name === name)) {
+			console.error(chalk.red(`${theme.status.error} ${rawName} is not installed`));
+			process.exit(1);
+		}
+
 		try {
 			await manager.uninstall(name);
 			if (flags.json) {
@@ -558,10 +765,19 @@ async function handleList(manager: PluginManager, flags: { json?: boolean }): Pr
 	}
 }
 
-async function handleLink(manager: PluginManager, paths: string[], flags: { json?: boolean }): Promise<void> {
+async function handleLink(
+	manager: PluginManager,
+	paths: string[],
+	flags: { json?: boolean; dryRun?: boolean },
+): Promise<void> {
 	if (paths.length === 0) {
 		console.error(chalk.red(`Usage: ${APP_NAME} plugin link <path>`));
 		process.exit(1);
+	}
+
+	if (flags.dryRun) {
+		printLinkPreview(paths[0], flags.json);
+		return;
 	}
 
 	try {
@@ -578,7 +794,11 @@ async function handleLink(manager: PluginManager, paths: string[], flags: { json
 	}
 }
 
-async function handleDoctor(manager: PluginManager, flags: { json?: boolean; fix?: boolean }): Promise<void> {
+async function handleDoctor(
+	manager: PluginManager,
+	flags: { json?: boolean; fix?: boolean; dryRun?: boolean },
+): Promise<void> {
+	if (flags.fix) refuseDryRun(flags, "doctor --fix");
 	const checks = await manager.doctor({ fix: flags.fix });
 
 	if (flags.json) {
@@ -620,7 +840,7 @@ async function handleDoctor(manager: PluginManager, flags: { json?: boolean; fix
 async function handleFeatures(
 	manager: PluginManager,
 	args: string[],
-	flags: { json?: boolean; enable?: string; disable?: string; set?: string },
+	flags: { json?: boolean; enable?: string; disable?: string; set?: string; dryRun?: boolean },
 ): Promise<void> {
 	if (args.length === 0) {
 		console.error(
@@ -630,8 +850,7 @@ async function handleFeatures(
 	}
 
 	const pluginName = args[0];
-	const plugins = await manager.list();
-	const plugin = plugins.find(p => p.name === pluginName);
+	const plugin = await manager.getPlugin(pluginName, { path: path.join(getPluginsNodeModules(), pluginName) });
 
 	if (!plugin) {
 		console.error(chalk.red(`Plugin "${pluginName}" not found`));
@@ -669,6 +888,7 @@ async function handleFeatures(
 			}
 		}
 
+		refuseDryRun(flags, "features");
 		await manager.setEnabledFeatures(pluginName, [...currentFeatures]);
 		console.log(chalk.green(`${theme.status.success} Updated features for ${pluginName}`));
 	}
@@ -713,7 +933,7 @@ async function handleFeatures(
 async function handleConfig(
 	manager: PluginManager,
 	args: string[],
-	flags: { json?: boolean; local?: boolean },
+	flags: { json?: boolean; local?: boolean; dryRun?: boolean },
 ): Promise<void> {
 	if (args.length === 0) {
 		console.error(
@@ -735,8 +955,7 @@ async function handleConfig(
 		process.exit(1);
 	}
 
-	const plugins = await manager.list();
-	const plugin = plugins.find(p => p.name === pluginName);
+	const plugin = await manager.getPlugin(pluginName);
 
 	if (!plugin) {
 		console.error(chalk.red(`Plugin "${pluginName}" not found`));
@@ -815,6 +1034,7 @@ async function handleConfig(
 				}
 			}
 
+			refuseDryRun(flags, "config set");
 			await manager.setPluginSetting(pluginName, key, value);
 			console.log(chalk.green(`${theme.status.success} Set ${key}`));
 			break;
@@ -826,6 +1046,7 @@ async function handleConfig(
 				process.exit(1);
 			}
 
+			refuseDryRun(flags, "config delete");
 			await manager.deletePluginSetting(pluginName, key);
 			console.log(chalk.green(`${theme.status.success} Deleted ${key}`));
 			break;
@@ -838,8 +1059,32 @@ async function handleConfig(
 	}
 }
 
+/**
+ * Enumerate every installed plugin to validate — npm/link plugins from
+ * {@link PluginManager.list} plus marketplace runtime packages, which `list()`
+ * intentionally omits. Marketplace summaries are resolved through their trusted
+ * install path; deduped by resolved package name using the same active-scope
+ * precedence as runtime loading.
+ */
+async function collectPluginsForValidation(manager: PluginManager): Promise<InstalledPlugin[]> {
+	const byName = new Map<string, InstalledPlugin>();
+	for (const plugin of await manager.list()) {
+		byName.set(plugin.name, plugin);
+	}
+	const mktMgr = await makeMarketplaceManager();
+	for (const summary of await mktMgr.listInstalledPlugins()) {
+		const entry = summary.entries[0];
+		if (!entry) continue;
+		const fallbackName = parsePluginId(summary.id)?.name ?? summary.id;
+		const resolved = await manager.getPlugin(fallbackName, { path: entry.installPath });
+		if (!resolved) continue;
+		byName.set(resolved.name, (await manager.getPlugin(resolved.name)) ?? resolved);
+	}
+	return [...byName.values()];
+}
+
 async function handleConfigValidate(manager: PluginManager, flags: { json?: boolean }): Promise<void> {
-	const plugins = await manager.list();
+	const plugins = await collectPluginsForValidation(manager);
 	const results: Array<{ plugin: string; key: string; error: string }> = [];
 
 	for (const plugin of plugins) {
@@ -875,7 +1120,7 @@ async function handleConfigValidate(manager: PluginManager, flags: { json?: bool
 async function handleEnable(
 	manager: PluginManager,
 	plugins: string[],
-	flags: { json?: boolean; scope?: "user" | "project" },
+	flags: { json?: boolean; scope?: "user" | "project"; dryRun?: boolean },
 ): Promise<void> {
 	return handleSetEnabled(manager, plugins, flags, true);
 }
@@ -883,7 +1128,7 @@ async function handleEnable(
 async function handleDisable(
 	manager: PluginManager,
 	plugins: string[],
-	flags: { json?: boolean; scope?: "user" | "project" },
+	flags: { json?: boolean; scope?: "user" | "project"; dryRun?: boolean },
 ): Promise<void> {
 	return handleSetEnabled(manager, plugins, flags, false);
 }
@@ -891,7 +1136,7 @@ async function handleDisable(
 async function handleSetEnabled(
 	manager: PluginManager,
 	plugins: string[],
-	flags: { json?: boolean; scope?: "user" | "project" },
+	flags: { json?: boolean; scope?: "user" | "project"; dryRun?: boolean },
 	enabled: boolean,
 ): Promise<void> {
 	const action = enabled ? "enable" : "disable";
@@ -903,27 +1148,20 @@ async function handleSetEnabled(
 		process.exit(1);
 	}
 
+	refuseDryRun(flags, action);
+
 	const mktMgr = await makeMarketplaceManager();
 	const installedPlugins = new Set((await mktMgr.listInstalledPlugins()).map(p => p.id));
 
 	for (const name of plugins) {
-		if (installedPlugins.has(name)) {
-			try {
-				await mktMgr.setPluginEnabled(name, enabled, flags.scope);
-				if (flags.json) {
-					console.log(JSON.stringify({ [jsonKey]: name }));
-				} else {
-					console.log(chalk.green(`${theme.status.success} ${pastTense} ${name}`));
-				}
-			} catch (err) {
-				console.error(chalk.red(`${theme.status.error} Failed to ${action} ${name}: ${err}`));
-				process.exit(1);
-			}
-			continue;
-		}
-
 		try {
-			await manager.setEnabled(name, enabled);
+			await setInstalledPluginEnabled(name, {
+				enabled,
+				scope: flags.scope,
+				marketplaceIds: installedPlugins,
+				marketplace: mktMgr,
+				npm: manager,
+			});
 			if (flags.json) {
 				console.log(JSON.stringify({ [jsonKey]: name }));
 			} else {
@@ -981,7 +1219,7 @@ ${chalk.bold("Options:")}
   --fix            Attempt automatic fixes (doctor)
   --force          Overwrite without prompting (install)
   --scope <scope>  Install scope: user (default) or project (install name@marketplace)
-  --dry-run        Preview changes without applying (install)
+  --dry-run        Preview changes without applying (install, uninstall, link, upgrade of marketplace plugins)
   -l, --local      Use project-local overrides
 
 ${chalk.bold("Examples:")}

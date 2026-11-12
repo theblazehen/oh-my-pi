@@ -10,7 +10,6 @@
  * the server reads as "the tool ran and produced nothing".
  */
 
-import { create } from "@bufbuild/protobuf";
 import {
 	AfterAgentResponseRequestResponseSchema,
 	AfterAgentThoughtRequestResponseSchema,
@@ -64,7 +63,8 @@ import {
 	StopRequestResponseSchema,
 	SubagentStartRequestResponseSchema,
 	SubagentStopRequestResponseSchema,
-} from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
+} from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
+import { create } from "@oh-my-pi/pi-catalog/discovery/protobuf";
 import type { ToolResultMessage } from "../../types";
 
 /**
@@ -74,6 +74,9 @@ import type { ToolResultMessage } from "../../types";
  * and their translation are consumed together.
  */
 export {
+	cursorExecReadPath,
+	cursorRawReadPath,
+	omitUndefinedArgs,
 	piEscapeRegexLiteral,
 	piGrepSkip,
 	piJoinPath,
@@ -81,7 +84,10 @@ export {
 	piLsPath,
 	piReadDisplayPath,
 	piReadPath,
+	piReadPathHasRange,
 	piTimeout,
+	shellDeadlineSeconds,
+	shellTimeoutSeconds,
 } from "../cursor-pi-args";
 
 /** Flatten a tool result's content into the single `output` string the Pi frames carry. */

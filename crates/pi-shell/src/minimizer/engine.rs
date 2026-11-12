@@ -13,6 +13,11 @@ use crate::minimizer::{
 	pipeline::{self, CompiledPipeline, PipelineRegistry},
 	plan,
 };
+/// Captured outputs shorter than this are returned verbatim without filtering.
+pub const MIN_MINIMIZE_CHARS: usize = 1_000;
+fn is_below_minimize_threshold(captured: &str) -> bool {
+	captured.chars().take(MIN_MINIMIZE_CHARS).count() < MIN_MINIMIZE_CHARS
+}
 
 /// Minimization strategy for a shell command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,11 +45,11 @@ pub fn mode_for(command: &str, config: &MinimizerConfig) -> MinimizerMode {
 			}
 		},
 		plan::CommandPlan::Chain { segments } => {
-			// Only route a chain through the segmented runner when the minimizer is
-			// enabled, the legacy kill-switch is off, at least one segment is
-			// eligible, and no segment can permanently rewire the shell's own file
-			// descriptors (`exec >out`). Any failed guard restores the pre-PR
-			// single-exec passthrough behaviour.
+			// Only route a chain through the segmented runner when the minimizer
+			// is enabled, the legacy kill-switch is off, at least one segment
+			// is eligible, and no segment can permanently rewire the shell's
+			// own file descriptors (`exec >out`). Any failed guard restores the
+			// pre-PR single-exec passthrough behaviour.
 			if config.enabled
 				&& !config.legacy_filters_active()
 				&& chain_has_eligible_segment(&segments, config)
@@ -258,8 +263,10 @@ fn is_common_chain_utility(program: &str) -> bool {
 			| "awk"
 			| "sleep"
 			| "seq"
-			| "cp" | "mv"
-			| "rm" | "mkdir"
+			| "cp"
+			| "mv"
+			| "rm"
+			| "mkdir"
 			| "rmdir"
 			| "touch"
 			| "basename"
@@ -269,7 +276,8 @@ fn is_common_chain_utility(program: &str) -> bool {
 			| "true"
 			| "false"
 			| "yes"
-			| "tr" | "tee"
+			| "tr"
+			| "tee"
 			| "sort"
 			| "uniq"
 			| "cut"
@@ -284,7 +292,8 @@ fn is_common_chain_utility(program: &str) -> bool {
 			| "tar"
 			| "gzip"
 			| "gunzip"
-			| "cd" | "pwd"
+			| "cd"
+			| "pwd"
 			| "export"
 			| "env"
 			| "test"
@@ -305,6 +314,9 @@ fn apply_identity(
 	let subcommand = identity.subcommand.as_deref();
 
 	if filters::supports(&identity.program, subcommand) {
+		if is_below_minimize_threshold(captured) {
+			return MinimizerOutput::passthrough(captured).labeled("too-short");
+		}
 		let ctx = MinimizerCtx { program: &identity.program, subcommand, command, config };
 		let Ok(rust_output) =
 			catch_unwind(AssertUnwindSafe(|| filters::filter(&ctx, captured, exit_code)))
@@ -328,6 +340,9 @@ fn apply_identity(
 	if let Some(pipeline) = resolve_pipeline(config, &identity.program, subcommand) {
 		if pipeline.skipped_by_exit(exit_code) {
 			return MinimizerOutput::passthrough(captured).labeled("exit-skip");
+		}
+		if is_below_minimize_threshold(captured) || pipeline.skipped_by_size(captured.len()) {
+			return MinimizerOutput::passthrough(captured).labeled("too-short");
 		}
 		let text = catch_unwind(AssertUnwindSafe(|| pipeline.apply(captured).into_owned()))
 			.unwrap_or_else(|_| captured.to_string());
@@ -441,7 +456,7 @@ fn apply_pipeline_overlay(
 	let Some(pipeline) = resolve_pipeline(config, program, subcommand) else {
 		return inner.labeled(primary_label);
 	};
-	if pipeline.skipped_by_exit(exit_code) {
+	if pipeline.skipped_by_exit(exit_code) || pipeline.skipped_by_size(inner.input_bytes) {
 		return inner.labeled(primary_label);
 	}
 	let text = catch_unwind(AssertUnwindSafe(|| pipeline.apply(&inner.text).into_owned()))
@@ -474,11 +489,36 @@ fn resolve_pipeline<'a>(
 	builtin_pipelines().find(program, subcommand)
 }
 
+/// Whether the pipeline overlaid on a Rust filter's output for this command
+/// drops whole lines. A filter that would return output whole checks this
+/// first: such an overlay cuts a whole patch partway through, where it would
+/// have kept the head of a summary that starts with the stat.
+pub(crate) fn overlay_caps_lines(
+	config: &MinimizerConfig,
+	program: &str,
+	subcommand: Option<&str>,
+	exit_code: i32,
+	input_bytes: usize,
+) -> bool {
+	resolve_pipeline(config, program, subcommand)
+		.is_some_and(|pipeline| pipeline.caps_lines(exit_code, input_bytes))
+}
+
 // Atomic counter for commands that reached `apply` without a matching filter.
 static UNKNOWN_COMMAND_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// Per-thread mirror of the counter: integration tests drive `apply` from
+// parallel tokio workers, so equality assertions on the process-wide atomic
+// race. Tests assert on the calling thread's own recordings instead.
+#[cfg(test)]
+thread_local! {
+	static THREAD_UNKNOWN_COMMAND_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn record_unknown_command(_command: &str) {
 	UNKNOWN_COMMAND_COUNT.fetch_add(1, Ordering::Relaxed);
+	#[cfg(test)]
+	THREAD_UNKNOWN_COMMAND_COUNT.update(|count| count + 1);
 }
 
 /// Total number of commands that fell through `apply` without any matching
@@ -487,10 +527,11 @@ pub fn unknown_command_count() -> u64 {
 	UNKNOWN_COMMAND_COUNT.load(Ordering::Relaxed)
 }
 
-/// Reset the unknown-command counter (intended for tests).
-#[doc(hidden)]
-pub fn reset_unknown_command_count() {
-	UNKNOWN_COMMAND_COUNT.store(0, Ordering::Relaxed);
+/// Unknown-command recordings made by the current thread. Race-free
+/// alternative to [`unknown_command_count`] for test assertions.
+#[cfg(test)]
+fn thread_unknown_command_count() -> u64 {
+	THREAD_UNKNOWN_COMMAND_COUNT.with(std::cell::Cell::get)
 }
 
 const BUILTIN_FILTERS_TOML: &str = include_str!(concat!(env!("OUT_DIR"), "/builtin_filters.toml"));
@@ -515,6 +556,23 @@ pub fn verify_builtin_filters() -> Vec<pipeline::TestOutcome> {
 }
 
 #[cfg(test)]
+fn minimizable_input(input: &str) -> String {
+	let mut output = input.to_string();
+	while output.chars().count() < MIN_MINIMIZE_CHARS {
+		output.push('\n');
+	}
+	output
+}
+
+/// Pad `input` past
+/// [`WHOLE_OUTPUT_BYTES`](crate::minimizer::primitives::WHOLE_OUTPUT_BYTES)
+/// with blank lines, which no patch parser counts.
+#[cfg(test)]
+fn past_whole_budget(input: &str) -> String {
+	format!("{input}{}", "\n".repeat(crate::minimizer::primitives::WHOLE_OUTPUT_BYTES))
+}
+
+#[cfg(test)]
 mod tests {
 	use std::{
 		fmt::Write as _,
@@ -523,7 +581,6 @@ mod tests {
 	};
 
 	static CONFIG_COUNTER: AtomicUsize = AtomicUsize::new(0);
-	pub static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 	use super::*;
 	use crate::minimizer::MinimizerOptions;
@@ -539,6 +596,29 @@ mod tests {
 		});
 		let _ = fs::remove_file(path);
 		cfg
+	}
+
+	#[test]
+	fn output_below_minimum_is_not_minimized() {
+		let cfg = config_from_settings(
+			r#"
+schema_version = 1
+[filters.printf]
+match_command = "^printf$"
+replace = [{ pattern = "x", replacement = "y" }]
+"#,
+		);
+		let short = "x".repeat(MIN_MINIMIZE_CHARS - 1);
+		let exact = "x".repeat(MIN_MINIMIZE_CHARS);
+
+		let short_result = apply("printf", &short, 0, &cfg);
+		assert_eq!(short_result.text, short);
+		assert!(!short_result.changed);
+		assert_eq!(short_result.filter, "too-short");
+
+		let exact_result = apply("printf", &exact, 0, &cfg);
+		assert!(exact_result.changed);
+		assert_ne!(exact_result.text, exact);
 	}
 	#[test]
 	fn disabled_config_does_not_minimize() {
@@ -584,18 +664,193 @@ on_empty = "OVERLAY"
 only_on_exit = [0]
 "#,
 		);
-		let diff_input = "diff --git a/file.rs b/file.rs\n@@\n-old\n+new\n";
-		let diff = apply("git diff", diff_input, 0, &cfg);
+		let diff_input = minimizable_input("diff --git a/file.rs b/file.rs\n@@\n-old\n+new\n");
+		let diff = apply("git diff", &diff_input, 0, &cfg);
 		assert_eq!(diff.filter, "pipeline+builtin");
 		assert_eq!(diff.text, "OVERLAY");
 
-		let status = apply("git status", "## main\n M file.rs\n", 0, &cfg);
+		let status_input = minimizable_input("## main\n M file.rs\n");
+		let status = apply("git status", &status_input, 0, &cfg);
 		assert_ne!(status.filter, "pipeline+builtin");
 		assert!(status.text.contains("unstaged 1"));
 
-		let failed = apply("git diff", diff_input, 1, &cfg);
+		let failed = apply("git diff", &past_whole_budget(&diff_input), 1, &cfg);
 		assert_ne!(failed.filter, "pipeline+builtin");
 		assert!(failed.text.contains("file changed"));
+	}
+
+	#[test]
+	fn failing_jq_keeps_the_error_after_long_output() {
+		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
+		let mut input = String::new();
+		for i in 0..1000 {
+			let _ = writeln!(input, "{{\"id\": {i}, \"name\": \"row {i}\"}}");
+		}
+		input.push_str("Error: cannot use 1 as object key\n");
+
+		let out = apply("jq -c '.[]' rows.json", &input, 0, &cfg);
+		assert!(out.changed, "a successful run is truncated to its head");
+		let out = apply("jq -c '.[]' rows.json", &input, 5, &cfg);
+		assert!(out.text.ends_with("Error: cannot use 1 as object key\n"), "{:?}", out.text);
+	}
+
+	#[test]
+	fn ssh_keeps_long_remote_lines_whole() {
+		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
+		let mut remote = String::new();
+		for i in 0..4 {
+			let _ = writeln!(remote, "{{\"id\":{i},\"payload\":\"{}\"}}", "x".repeat(300));
+		}
+		let input = format!(
+			"Warning: Permanently added 'host' (ED25519) to the list of known \
+			 hosts.\n{remote}Connection to host closed.\n"
+		);
+
+		let out = apply("ssh host cat rows.jsonl", &input, 0, &cfg);
+		assert!(out.changed, "the banner lines are stripped");
+		assert_eq!(out.text, remote);
+	}
+
+	#[test]
+	fn ssh_keeps_blank_remote_lines() {
+		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
+		let mut remote = String::from("first record\n\nsecond record\n\n");
+		for i in 0..60 {
+			let _ = writeln!(remote, "row {i}: remote value");
+		}
+		let input = format!("{remote}Connection to host closed.\n");
+
+		let out = apply("ssh host cat records.txt", &input, 0, &cfg);
+		assert!(out.changed, "the banner line is stripped");
+		assert_eq!(out.text, remote);
+	}
+
+	#[test]
+	fn output_within_whole_budget_is_returned_whole() {
+		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
+		let mut patch = String::from(
+			"diff --git a/src/lib.rs b/src/lib.rs\nindex 1..2 100644\n--- a/src/lib.rs\n+++ \
+			 b/src/lib.rs\n@@ -1,40 +1,40 @@\n",
+		);
+		for i in 0..40 {
+			let _ = writeln!(patch, " context {i}\n-old line {i}\n+new line {i}");
+		}
+		let show = format!("commit abcdef1234567890\nAuthor: Somebody\n\n    fix: thing\n\n{patch}");
+		let mut rows = String::new();
+		for i in 0..100 {
+			let _ = writeln!(rows, "{{\"id\": {i}, \"name\": \"row {i}\"}}");
+		}
+		let mut remote = String::new();
+		for i in 0..300 {
+			let _ = writeln!(remote, "remote line {i}");
+		}
+		for (command, input, exit) in [
+			("git diff HEAD~1", &patch, 0),
+			("git show HEAD", &show, 0),
+			("diff -u a b", &patch, 1),
+			("jq -c '.[]' rows.json", &rows, 0),
+			("ssh host cat log.txt", &remote, 0),
+		] {
+			assert!(input.len() > MIN_MINIMIZE_CHARS, "{command}");
+			let out = apply(command, input, exit, &cfg);
+			assert_eq!(&out.text, input, "{command}");
+		}
+	}
+
+	#[test]
+	fn output_past_whole_budget_is_still_shortened() {
+		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
+		let mut rows = String::new();
+		let mut remote = String::new();
+		for i in 0..1000 {
+			let _ = writeln!(rows, "{{\"id\": {i}, \"name\": \"row {i}\"}}");
+			let _ = writeln!(remote, "remote line {i} of a log long enough to pass the budget");
+		}
+		let jq = apply("jq -c '.[]' rows.json", &rows, 0, &cfg);
+		assert_eq!(jq.text.lines().count(), 41, "{:?}", jq.text);
+		assert!(jq.text.ends_with("[…960ln elided…]\n"), "{:?}", jq.text);
+		let ssh = apply("ssh host cat log.txt", &remote, 0, &cfg);
+		assert!(ssh.text.contains("ln elided"), "{:?}", ssh.text);
+	}
+
+	#[test]
+	fn ssh_whole_budget_counts_the_captured_bytes() {
+		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
+		// 256 lines of 64 bytes, the last newline swapped for a character.
+		let mut at_budget = String::new();
+		for i in 0..256 {
+			let _ = writeln!(at_budget, "{i:063}");
+		}
+		at_budget.pop();
+		at_budget.push('x');
+		assert_eq!(at_budget.len(), crate::minimizer::primitives::WHOLE_OUTPUT_BYTES);
+		let out = apply("ssh host cat log.txt", &at_budget, 0, &cfg);
+		assert_eq!(out.text.lines().count(), 256, "{:?}", out.text);
+
+		let past_budget = format!("{at_budget}\n");
+		let out = apply("ssh host cat log.txt", &past_budget, 0, &cfg);
+		assert!(out.text.contains("ln elided"), "{:?}", out.text);
+	}
+
+	#[test]
+	fn jq_whole_budget_ends_at_the_shared_constant() {
+		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
+		// 256 lines of 64 bytes: exactly the budget.
+		let mut at_budget = String::new();
+		for i in 0..256 {
+			let _ = writeln!(at_budget, "{i:063}");
+		}
+		assert_eq!(at_budget.len(), crate::minimizer::primitives::WHOLE_OUTPUT_BYTES);
+		let out = apply("jq -r '.[]' rows.json", &at_budget, 0, &cfg);
+		assert_eq!(out.text, at_budget);
+
+		let past_budget = format!("{at_budget}x");
+		let out = apply("jq -r '.[]' rows.json", &past_budget, 0, &cfg);
+		assert_eq!(out.text.lines().count(), 41, "{:?}", out.text);
+		assert!(out.text.ends_with("[…217ln elided…]\n"), "{:?}", out.text);
+	}
+
+	#[test]
+	fn yadm_patch_keeps_its_summary_under_its_line_cap() {
+		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
+		let mut patch = String::from(
+			"diff --git a/.zshrc b/.zshrc\n--- a/.zshrc\n+++ b/.zshrc\n@@ -1,90 +1,90 @@\n",
+		);
+		for i in 0..90 {
+			let _ = writeln!(patch, "-old {i}\n+new {i}");
+		}
+		patch.push_str(
+			"diff --git a/.vimrc b/.vimrc\n--- a/.vimrc\n+++ b/.vimrc\n@@ -1 +1 @@\n-a\n+b\n",
+		);
+		let out = apply("yadm diff", &patch, 0, &cfg);
+		assert!(out.text.contains(".vimrc"), "{:?}", out.text);
+	}
+
+	#[test]
+	fn line_capping_user_overlay_keeps_the_patch_summary() {
+		let capped = |program: &str| {
+			config_from_settings(&format!(
+				"schema_version = 1\n[filters.cap]\nmatch_command = \"^{program}$\"\nmax_lines = 20\n"
+			))
+		};
+		let mut patch = String::from(
+			"diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,100 +1,100 @@\n",
+		);
+		for i in 0..100 {
+			let _ = writeln!(patch, "-old {i}\n+new {i}");
+		}
+		patch.push_str(
+			"diff --git a/src/b.rs b/src/b.rs\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n-a\n+b\n",
+		);
+		// `gt diff` runs the git filter, but the overlay the engine applies is
+		// the one for `gt`.
+		for (program, command) in [("git", "git diff"), ("gt", "gt diff")] {
+			let out = apply(command, &patch, 0, &capped(program));
+			assert!(out.text.contains("src/b.rs | 2"), "{command}: {:?}", out.text);
+			assert!(out.text.contains("2 files changed"), "{command}: {:?}", out.text);
+		}
+		let out = apply("gt diff", &patch, 0, &capped("git"));
+		assert_eq!(out.text, patch, "a git-only cap leaves gt output whole");
 	}
 
 	// Regression guards for the builtin npx catch-all def (defs/npx.toml). Its
@@ -610,9 +865,11 @@ only_on_exit = [0]
 		// and strip the NX banner; the bare npx def must not claim subcommand
 		// `nx`.
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
-		let input = "\n >  NX   Running target build for 3 projects\n\n> nx run app:build\nError: \
-		             build failed\n\n >  NX   Ran target build for 3 projects (2s)\n";
-		let out = apply("npx nx build", input, 0, &cfg);
+		let input = minimizable_input(
+			"\n >  NX   Running target build for 3 projects\n\n> nx run app:build\nError: build \
+			 failed\n\n >  NX   Ran target build for 3 projects (2s)\n",
+		);
+		let out = apply("npx nx build", &input, 0, &cfg);
 		assert!(
 			!out.text.contains("NX   Running target"),
 			"npx def shadowed nx-wrapped; NX banner survived: {:?}",
@@ -635,8 +892,8 @@ only_on_exit = [0]
 		let npx = apply("npx eslint src/", &input, 1, &cfg);
 		let direct = apply("eslint src/", &input, 1, &cfg);
 		// Label differs by program token (npx -> "builtin", eslint -> "eslint"),
-		// but it must NOT be the overlay label and the TEXT must be the un-mutated
-		// lint output — same lines, no max_lines truncation.
+		// but it must NOT be the overlay label and the TEXT must be the
+		// un-mutated lint output — same lines, no max_lines truncation.
 		assert_ne!(
 			npx.filter, "pipeline+builtin",
 			"npx def overlaid the routed eslint filter output"
@@ -652,9 +909,11 @@ only_on_exit = [0]
 		// for genuinely UNKNOWN tools (its whole purpose). cowsay is not routed
 		// or owned by any other def, so the npx pipeline claims it.
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
-		let input = "Need to install the following packages:\ncowsay@1.6.0\nOk to proceed? \
-		             (y)\n\nnpm warn deprecated foo@1.0.0: use bar instead\n< Hello >\n";
-		let out = apply("npx cowsay hello", input, 0, &cfg);
+		let input = minimizable_input(
+			"Need to install the following packages:\ncowsay@1.6.0\nOk to proceed? (y)\n\nnpm warn \
+			 deprecated foo@1.0.0: use bar instead\n< Hello >\n",
+		);
+		let out = apply("npx cowsay hello", &input, 0, &cfg);
 		assert!(out.changed);
 		assert!(!out.text.contains("Need to install"));
 		assert!(!out.text.contains("Ok to proceed"));
@@ -666,7 +925,8 @@ only_on_exit = [0]
 	fn enabled_known_filter_minimizes() {
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
 		assert!(should_minimize("git diff", &cfg));
-		let out = apply("git diff", "diff --git a/file.rs b/file.rs\n@@\n-old\n+new\n", 0, &cfg);
+		let input = past_whole_budget("diff --git a/file.rs b/file.rs\n@@\n-old\n+new\n");
+		let out = apply("git diff", &input, 0, &cfg);
 		assert!(out.changed);
 		assert!(out.text.contains("file changed"));
 	}
@@ -675,8 +935,8 @@ only_on_exit = [0]
 	fn enabled_config_minimizes_git_status() {
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
 		assert!(should_minimize("git status", &cfg));
-		let input = "## main\n M file.rs\n";
-		let out = apply("git status", input, 0, &cfg);
+		let input = minimizable_input("## main\n M file.rs\n");
+		let out = apply("git status", &input, 0, &cfg);
 		assert!(out.changed);
 		assert!(out.text.contains("unstaged 1"));
 		assert_eq!(out.filter, "git");
@@ -685,18 +945,26 @@ only_on_exit = [0]
 	#[test]
 	fn successful_minimization_keeps_visible_ok_when_filter_removes_all_lines() {
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
-		let out = apply(
-			"cargo build",
-			"   Compiling app v0.1.0\n    Finished `dev` profile [unoptimized + debuginfo] target(s) \
-			 in 1.23s\n",
-			0,
-			&cfg,
+		let input = format!(
+			"{}    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.23s\n",
+			"   Compiling app v0.1.0\n".repeat(200),
 		);
+		let out = apply("cargo build", &input, 0, &cfg);
 
 		assert!(out.changed);
 		assert_eq!(out.text, "OK\n");
 		assert_eq!(out.output_bytes, out.text.len());
 		assert!(out.original_text.is_some());
+	}
+
+	#[test]
+	fn rustc_query_output_is_not_collapsed_to_ok() {
+		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
+		let input = "/opt/rust/lib/rustlib\n";
+		let out = apply("rustc --print sysroot", input, 0, &cfg);
+
+		assert_eq!(out.text, input);
+		assert!(!out.changed);
 	}
 
 	#[test]
@@ -710,20 +978,21 @@ strip_lines_matching = [".*"]
 "#,
 		);
 
-		assert!(should_minimize("printf done", &cfg));
-		let out = apply("printf done", "drop me\n", 0, &cfg);
+		let input = minimizable_input("drop me\n");
+		let out = apply("printf done", &input, 0, &cfg);
 
 		assert!(out.changed);
 		assert_eq!(out.text, "OK\n");
 		assert_eq!(out.filter, "pipeline");
 		assert_eq!(out.output_bytes, out.text.len());
-		assert_eq!(out.original_text.as_deref(), Some("drop me\n"));
+		assert_eq!(out.original_text.as_deref(), Some(input.as_str()));
 	}
 
 	#[test]
 	fn failed_minimization_does_not_invent_ok_for_empty_output() {
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
-		let out = apply("cargo build", "   Compiling app v0.1.0\n", 1, &cfg);
+		let input = "   Compiling app v0.1.0\n".repeat(200);
+		let out = apply("cargo build", &input, 1, &cfg);
 
 		assert!(out.changed);
 		assert_eq!(out.text, "");
@@ -759,15 +1028,15 @@ strip_lines_matching = [".*"]
 
 	#[test]
 	fn segmented_chain_supported_command_does_not_record_unknown() {
-		let _guard = TEST_LOCK.lock();
 		// Phase 7 (Mode α resolution): supported chains route through
 		// filters::dispatch via the chain decomposer instead of falling
 		// back to passthrough. The unknown-command counter must remain
-		// stable — the chain entry point is structurally known.
-		reset_unknown_command_count();
+		// stable — the chain entry point is structurally known. Asserted on
+		// this thread's recordings: parallel integration tests legitimately
+		// bump the process-wide counter.
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
 		let input = "diff --git a/file.rs b/file.rs\n@@\n-old\n+new\n";
-		let before = unknown_command_count();
+		let before = thread_unknown_command_count();
 
 		assert_eq!(mode_for("git diff ; printf done", &cfg), MinimizerMode::SegmentedChain);
 		let out = apply("git diff ; printf done", input, 0, &cfg);
@@ -778,7 +1047,7 @@ strip_lines_matching = [".*"]
 		// recorded (per-segment minimization is the segmented runner's job).
 		assert!(!out.changed, "mixed chain must stay passthrough in whole-buffer minimization");
 		assert_eq!(out.filter, "compound");
-		assert_eq!(unknown_command_count(), before);
+		assert_eq!(thread_unknown_command_count(), before);
 	}
 
 	#[test]
@@ -787,25 +1056,21 @@ strip_lines_matching = [".*"]
 		assert!(should_minimize("ctest --output-on-failure", &cfg));
 		assert!(should_minimize("./build/foo_test --gtest_filter=Foo.*", &cfg));
 
-		let ctest = apply(
-			"ctest --output-on-failure",
+		let ctest_input = minimizable_input(
 			"Test project /tmp/build\n1/2 Test #1: ok ........   Passed    0.01 sec\n2/2 Test #2: \
 			 bad .......***Failed    0.02 sec\nThe following tests FAILED:\n",
-			8,
-			&cfg,
 		);
+		let ctest = apply("ctest --output-on-failure", &ctest_input, 8, &cfg);
 		assert!(ctest.changed);
 		assert_eq!(ctest.filter, "ctest");
 		assert!(!ctest.text.contains("Test #1"));
 		assert!(ctest.text.contains("Test #2: bad"));
 
-		let gtest = apply(
-			"./build/foo_test",
+		let gtest_input = minimizable_input(
 			"[ RUN      ] Foo.Pass\n[       OK ] Foo.Pass (0 ms)\nfoo_test.cc:42: Failure\nExpected: \
 			 1\n[  FAILED  ] Foo.Fails\n",
-			1,
-			&cfg,
 		);
+		let gtest = apply("./build/foo_test", &gtest_input, 1, &cfg);
 		assert!(gtest.changed);
 		assert_eq!(gtest.filter, "gtest");
 		assert!(!gtest.text.contains("Foo.Pass"));
@@ -856,11 +1121,12 @@ strip_lines_matching = [".*"]
 
 	#[test]
 	fn git_diff_chain_differing_formats_stays_opaque() {
-		// `git diff --name-only && git diff --stat` share the `diff` subcommand but
-		// select incompatible renderers. Routing the combined buffer through one
-		// (the whole-chain command carries BOTH `--name-only` and `--stat`, so the
-		// diff filter would treat it as a stat buffer) corrupts the listing
-		// segment's output. Diverging diff formats must stay opaque.
+		// `git diff --name-only && git diff --stat` share the `diff` subcommand
+		// but select incompatible renderers. Routing the combined buffer
+		// through one (the whole-chain command carries BOTH `--name-only` and
+		// `--stat`, so the diff filter would treat it as a stat buffer)
+		// corrupts the listing segment's output. Diverging diff formats must
+		// stay opaque.
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
 		let input =
 			"src/a.rs\nsrc/b.rs\n src/a.rs | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n";
@@ -937,10 +1203,11 @@ strip_lines_matching = [".*"]
 	}
 	#[test]
 	fn mixed_chain_stays_opaque_in_whole_buffer_minimization() {
-		// A mixed chain (`git status` + unrelated `echo`) must NOT route the whole
-		// interleaved capture through the first segment's filter: `condense_status`
-		// rebuilds from its own parse and would drop the `echo` segment's output.
-		// Stay opaque and preserve the captured bytes verbatim.
+		// A mixed chain (`git status` + unrelated `echo`) must NOT route the
+		// whole interleaved capture through the first segment's filter:
+		// `condense_status` rebuilds from its own parse and would drop the
+		// `echo` segment's output. Stay opaque and preserve the captured bytes
+		// verbatim.
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
 		let input = "## main\n M file.rs\nIMPORTANT side-effect line\n";
 		let out = apply("git status && echo IMPORTANT side-effect line", input, 0, &cfg);
@@ -1027,10 +1294,12 @@ strip_lines_matching = [".*"]
 	#[test]
 	fn rails_db_migrate_routes_to_standalone_def() {
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
-		let input = "== 20240115 CreateUsers: migrating\n-- create_table(:users)\n   -> 0.0234s\n== \
-		             20240115 CreateUsers: migrated\n\n== 20240116 AddIndexToOrders: migrating\n-- \
-		             add_index(:orders)\n   -> 0.0123s\n== 20240116 AddIndexToOrders: migrated\n";
-		let out = apply("rails db:migrate", input, 0, &cfg);
+		let input = minimizable_input(
+			"== 20240115 CreateUsers: migrating\n-- create_table(:users)\n   -> 0.0234s\n== 20240115 \
+			 CreateUsers: migrated\n\n== 20240116 AddIndexToOrders: migrating\n-- \
+			 add_index(:orders)\n   -> 0.0123s\n== 20240116 AddIndexToOrders: migrated\n",
+		);
+		let out = apply("rails db:migrate", &input, 0, &cfg);
 		assert!(out.changed);
 		assert!(out.text.contains("✓ CreateUsers"));
 		assert!(out.text.contains("✓ AddIndexToOrders"));
@@ -1043,8 +1312,10 @@ strip_lines_matching = [".*"]
 	#[test]
 	fn rails_routes_routes_to_standalone_def() {
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
-		let input = "                                  Prefix Verb   URI Pattern                                                                                       Controller#Action\n                                    root GET    /                                                                                                 home#index\n";
-		let out = apply("rails routes", input, 0, &cfg);
+		let input = minimizable_input(
+			"                                  Prefix Verb   URI Pattern                                                                                       Controller#Action\n                                    root GET    /                                                                                                 home#index\n",
+		);
+		let out = apply("rails routes", &input, 0, &cfg);
 		assert!(out.changed);
 		assert!(!out.text.contains("Prefix"));
 		assert!(out.text.contains("root GET"));
@@ -1054,8 +1325,10 @@ strip_lines_matching = [".*"]
 	#[test]
 	fn rake_routes_regression_unminimized() {
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
-		let input = "                                  Prefix Verb   URI Pattern                                                                                       Controller#Action\n                                    root GET    /                                                                                                 home#index\n";
-		let out = apply("rake routes", input, 0, &cfg);
+		let input = minimizable_input(
+			"                                  Prefix Verb   URI Pattern                                                                                       Controller#Action\n                                    root GET    /                                                                                                 home#index\n",
+		);
+		let out = apply("rake routes", &input, 0, &cfg);
 		assert!(out.changed, "rake routes should be minimized by the rails-routes def");
 		assert!(!out.text.contains("Prefix"));
 		assert!(out.text.contains("root GET"));
@@ -1064,9 +1337,11 @@ strip_lines_matching = [".*"]
 	#[test]
 	fn bundle_exec_rails_db_migrate_reaches_def() {
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
-		let input = "== 20240115 CreateUsers: migrating\n-- create_table(:users)\n   -> 0.0234s\n== \
-		             20240115 CreateUsers: migrated\n";
-		let out = apply("bundle exec rails db:migrate", input, 0, &cfg);
+		let input = minimizable_input(
+			"== 20240115 CreateUsers: migrating\n-- create_table(:users)\n   -> 0.0234s\n== 20240115 \
+			 CreateUsers: migrated\n",
+		);
+		let out = apply("bundle exec rails db:migrate", &input, 0, &cfg);
 		assert!(out.changed);
 		assert!(out.text.contains("CreateUsers"));
 		assert!(!out.text.contains("-- create_table"));
@@ -1075,8 +1350,10 @@ strip_lines_matching = [".*"]
 	#[test]
 	fn bundle_exec_rails_routes_reaches_def() {
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
-		let input = "                                  Prefix Verb   URI Pattern                                                                                       Controller#Action\n                                    root GET    /                                                                                                 home#index\n";
-		let out = apply("bundle exec rails routes", input, 0, &cfg);
+		let input = minimizable_input(
+			"                                  Prefix Verb   URI Pattern                                                                                       Controller#Action\n                                    root GET    /                                                                                                 home#index\n",
+		);
+		let out = apply("bundle exec rails routes", &input, 0, &cfg);
 		assert!(out.changed);
 		assert!(!out.text.contains("Prefix"));
 		assert!(out.text.contains("root GET"));
@@ -1095,9 +1372,10 @@ strip_lines_matching = [".*"]
 		}
 		let out = apply("rails db:migrate", &input, 0, &cfg);
 		assert!(out.changed);
-		// Only the def's max_lines=40 cap should fire; filter_rake's head_tail must
-		// NOT also condense. Both now emit `[…Nln elided…]`, so a single marker
-		// proves no double truncation (two would mean both stages fired).
+		// Only the def's max_lines=40 cap should fire; filter_rake's head_tail
+		// must NOT also condense. Both now emit `[…Nln elided…]`, so a single
+		// marker proves no double truncation (two would mean both stages
+		// fired).
 		assert_eq!(
 			out.text.matches("ln elided…]").count(),
 			1,
@@ -1109,11 +1387,13 @@ strip_lines_matching = [".*"]
 	#[test]
 	fn rails_db_migrate_keyword_in_name_not_dropped() {
 		let cfg = MinimizerConfig { enabled: true, ..Default::default() };
-		let input = "== 20240115 CreateTestResults: migrating\n-- create_table(:test_results)\n   \
-		             -> 0.0234s\n== 20240115 CreateTestResults: migrated\n\n== 20240116 \
-		             AddIndexToOrders: migrating\n-- add_index(:orders)\n   -> 0.0123s\n== 20240116 \
-		             AddIndexToOrders: migrated\n";
-		let out = apply("rails db:migrate", input, 0, &cfg);
+		let input = minimizable_input(
+			"== 20240115 CreateTestResults: migrating\n-- create_table(:test_results)\n   -> \
+			 0.0234s\n== 20240115 CreateTestResults: migrated\n\n== 20240116 AddIndexToOrders: \
+			 migrating\n-- add_index(:orders)\n   -> 0.0123s\n== 20240116 AddIndexToOrders: \
+			 migrated\n",
+		);
+		let out = apply("rails db:migrate", &input, 0, &cfg);
 		assert!(out.changed);
 		// Both migrations must survive; the old overlay-on-rake would keep only
 		// lines containing "test" and silently drop AddIndexToOrders.
@@ -1134,7 +1414,8 @@ strip_lines_matching = [".*"]
 		             assertions, 1 failures, 0 errors, 0 skips\n";
 		let rails = apply("rails test", input, 1, &cfg);
 		let rake = apply("rake test", input, 1, &cfg);
-		// Must NOT be an overlay label; minitest filter gets its own program label.
+		// Must NOT be an overlay label; minitest filter gets its own program
+		// label.
 		assert_ne!(
 			rails.filter, "pipeline+builtin",
 			"rails-migrate def overlaid the routed minitest filter output"
@@ -1199,12 +1480,10 @@ mod pipeline_integration_tests {
 			enabled: Some(true),
 			..Default::default()
 		});
-		let out = apply(
-			"gradle build",
+		let input = minimizable_input(
 			"> Task :app:compileJava UP-TO-DATE\n> Task :app:test\nBUILD SUCCESSFUL in 8s\n",
-			0,
-			&cfg,
 		);
+		let out = apply("gradle build", &input, 0, &cfg);
 		// gradle.toml is deleted; gradle now dispatches to the Rust jvm Build
 		// filter, which strips `> Task :…UP-TO-DATE` task-progress noise (the
 		// carried-over defs/gradle.toml behaviour, now as a Rust filter — NOT a
@@ -1230,15 +1509,19 @@ mod pipeline_integration_tests {
 
 	#[test]
 	fn unknown_command_counter_increments() {
-		let _guard = super::tests::TEST_LOCK.lock();
-		reset_unknown_command_count();
 		let cfg = MinimizerConfig::from_options(&MinimizerOptions {
 			enabled: Some(true),
 			..Default::default()
 		});
-		let before = unknown_command_count();
+		let global_before = unknown_command_count();
+		let thread_before = thread_unknown_command_count();
 		let _ = apply("zzzobscurecmd foo", "hi\n", 0, &cfg);
-		let after = unknown_command_count();
-		assert!(after > before, "counter should advance for unknown commands");
+		// Exact accounting on this thread; monotonic advance on the public
+		// process-wide counter (other threads may add, never subtract).
+		assert_eq!(thread_unknown_command_count(), thread_before + 1);
+		assert!(
+			unknown_command_count() > global_before,
+			"counter should advance for unknown commands"
+		);
 	}
 }

@@ -1,14 +1,37 @@
-import { Database, type Statement } from "bun:sqlite";
+import { Database, type SQLQueryBindings, type Statement } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { AsyncDrain, getHistoryDbPath, logger } from "@oh-my-pi/pi-utils";
+import {
+	checkpointWal,
+	getHistoryDbPath,
+	logger,
+	openSqliteDatabaseSync,
+	postmortem,
+	readSalvageableRows,
+} from "@oh-my-pi/pi-utils";
+import { closeSessionIndex, salvageSessionIndex } from "./session-index";
 
+/** A unique prompt with provenance from its most recent submission. */
 export interface HistoryEntry {
+	/** Stable row identifier used by the full-text index. */
 	id: number;
+	/** Trimmed prompt text, unique across the history database. */
 	prompt: string;
+	/** Unix timestamp of the most recent submission. */
 	created_at: number;
+	/** Project working directory of the most recent submission. */
 	cwd?: string;
-	/** ID of the session the prompt was submitted from, if known. */
+	/** Session ID of the most recent submission, if known. */
+	sessionId?: string;
+	/** Number of times this prompt has been submitted, including the first. */
+	useCount: number;
+}
+
+/** Narrows history reads; omitted fields match every prompt. */
+export interface HistoryFilter {
+	/** Exact project working directory of the prompt's latest submission. */
+	cwd?: string;
+	/** Exact session id of the prompt's latest submission. */
 	sessionId?: string;
 }
 
@@ -18,9 +41,29 @@ type HistoryRow = {
 	created_at: number;
 	cwd: string | null;
 	session_id: string | null;
+	use_count: number;
 };
 
 const SQLITE_NOW_EPOCH = "CAST(strftime('%s','now') AS INTEGER)";
+
+/**
+ * SQL predicate for a {@link HistoryFilter}, bound as numbered parameters
+ * `?first` (cwd) and `?first+1` (session id); binding NULL disables that half.
+ * `table` qualifies the columns (`"h."`) when the statement joins.
+ */
+function historyFilterClause(table: string, first: number): string {
+	const session = first + 1;
+	return `(?${first} IS NULL OR ${table}cwd = ?${first}) AND (?${session} IS NULL OR ${table}session_id = ?${session})`;
+}
+
+/**
+ * Rows a reader may hand to callers. A damaged page cross-linked into
+ * `history` decodes foreign bytes as rows (BLOB prompts and counters), which
+ * would reach the editor as `Uint8Array`s.
+ */
+function readableRowClause(table: string): string {
+	return `typeof(${table}prompt) = 'text' AND typeof(${table}created_at) = 'integer' AND typeof(${table}use_count) = 'integer'`;
+}
 
 // Escape LIKE wildcards so user input is treated as literal text.
 // Matches the `ESCAPE '\\'` clause used by substring-search statements.
@@ -28,110 +71,169 @@ function escapeLikePattern(text: string): string {
 	return text.replace(/[\\%_]/g, "\\$&");
 }
 
+/**
+ * Canonical stored form of a prompt: CRLF/CR folded to LF, trailing whitespace
+ * stripped from every line, outer whitespace trimmed. Terminal copies pad each
+ * line with spaces to the screen width, so without this a resubmitted copy of
+ * an existing prompt lands as a byte-distinct duplicate row.
+ */
+function normalizePrompt(prompt: string): string {
+	return prompt
+		.replace(/\r\n?/g, "\n")
+		.replace(/[^\S\n]+\n/g, "\n")
+		.trim();
+}
+/**
+ * Bumped only when stored rows need the one-time dump-and-rebuild pass on open;
+ * see `#rebuildHistory`. Purely additive columns go through `#ensureColumn`
+ * instead so existing stores are never rewritten for them.
+ */
+const HISTORY_DATA_VERSION = 1;
+
+/** Canonical `history` schema; `#rebuildHistory` recreates the table from this exact DDL. */
+const HISTORY_TABLE_DDL = `
+CREATE TABLE IF NOT EXISTS history (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	prompt TEXT NOT NULL UNIQUE,
+	created_at INTEGER NOT NULL DEFAULT (${SQLITE_NOW_EPOCH}),
+	cwd TEXT,
+	session_id TEXT,
+	use_count INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at DESC);
+`;
+
+/** Rows {@link HistoryStorage.getRecent} reads first; checked on open for decoded foreign rows. */
+const RECENT_WINDOW = 100;
+
+let cancelExitCleanup: (() => void) | undefined;
+
+/** Stores searchable prompts with only their latest project and session metadata. */
 export class HistoryStorage {
 	#db: Database;
 	static #instance?: HistoryStorage;
-	#drain = new AsyncDrain<Pick<HistoryEntry, "prompt" | "cwd" | "sessionId">>(100);
 	#sessionResolver?: () => string | undefined;
+	#addListener?: () => void;
+	#errorListener?: (error: unknown) => void;
+	#writeFailureReported = false;
 
 	// Prepared statements
-	#insertRowStmt: Statement;
+	#upsertRowStmt: Statement;
 	#recentStmt: Statement;
 	#searchStmt: Statement;
-	#lastPromptStmt: Statement;
 	// Cache substring-fallback prepared statements keyed by token count.
 	#substringStmts = new Map<number, Statement>();
 
-	// In-memory cache of last prompt to avoid sync DB reads on add
-	#lastPromptCache: string | null = null;
+	private constructor(db: Database) {
+		this.#db = db;
 
-	private constructor(dbPath: string) {
-		this.#ensureDir(dbPath);
-
-		this.#db = new Database(dbPath);
-
-		// Install the busy handler BEFORE any lock-taking statement. See #2421.
-		this.#db.run("PRAGMA busy_timeout = 5000");
-
-		const hasFts = this.#db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_fts'").get();
+		// One-shot statements go through the query cache, which close() finalizes; a
+		// stray prepare() would turn close() into a zombie that keeps the files open.
+		const hadFts = this.#db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_fts'").get();
 		this.#db.run(`
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
+${HISTORY_TABLE_DDL}
+		`);
 
-CREATE TABLE IF NOT EXISTS history (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	prompt TEXT NOT NULL,
-	created_at INTEGER NOT NULL DEFAULT (${SQLITE_NOW_EPOCH}),
-	cwd TEXT,
-	session_id TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at DESC);
+		// Additive column on stores created before the counter existed; runs before
+		// the rebuild so the dump below always sees it.
+		this.#ensureColumn("use_count", "INTEGER NOT NULL DEFAULT 1");
+		const rebuilt = this.#rebuildHistory();
 
+		this.#db.run(`
 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(prompt, content='history', content_rowid='id');
 
 CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 	INSERT INTO history_fts(rowid, prompt) VALUES (new.id, new.prompt);
-	END;
-	`);
+END;
+		`);
 
-		if (this.#historySchemaUsesUnixEpoch()) {
-			this.#migrateHistorySchema();
-		}
-
-		if (!this.#historySchemaHasColumn("session_id")) {
-			this.#db.run("ALTER TABLE history ADD COLUMN session_id TEXT");
-		}
-
-		if (!hasFts) {
+		if (rebuilt || !hadFts) {
 			try {
 				this.#db.run("INSERT INTO history_fts(history_fts) VALUES('rebuild')");
 			} catch (error) {
 				logger.warn("HistoryStorage FTS rebuild failed", { error: String(error) });
 			}
 		}
-
+		this.#assertRecentWindowReadable();
 		this.#recentStmt = this.#db.prepare(
-			"SELECT id, prompt, created_at, cwd, session_id FROM history ORDER BY created_at DESC, id DESC LIMIT ?",
+			`SELECT id, prompt, created_at, cwd, session_id, use_count FROM history WHERE ${readableRowClause("")} AND ${historyFilterClause("", 1)} ORDER BY created_at DESC, id DESC LIMIT ?3`,
 		);
 		this.#searchStmt = this.#db.prepare(
-			"SELECT h.id, h.prompt, h.created_at, h.cwd, h.session_id FROM history_fts f JOIN history h ON h.id = f.rowid WHERE history_fts MATCH ? ORDER BY h.created_at DESC, h.id DESC LIMIT ?",
+			`SELECT h.id, h.prompt, h.created_at, h.cwd, h.session_id, h.use_count FROM history_fts f JOIN history h ON h.id = f.rowid WHERE history_fts MATCH ?1 AND ${readableRowClause("h.")} AND ${historyFilterClause("h.", 2)} ORDER BY h.created_at DESC, h.id DESC LIMIT ?4`,
 		);
-		this.#lastPromptStmt = this.#db.prepare("SELECT prompt FROM history ORDER BY id DESC LIMIT 1");
-
-		this.#insertRowStmt = this.#db.prepare("INSERT INTO history (prompt, cwd, session_id) VALUES (?, ?, ?)");
-
-		const last = this.#lastPromptStmt.get() as { prompt?: string } | undefined;
-		this.#lastPromptCache = last?.prompt ?? null;
+		this.#upsertRowStmt = this.#db.prepare(`
+INSERT INTO history (prompt, created_at, cwd, session_id)
+VALUES (?, ${SQLITE_NOW_EPOCH}, ?, ?)
+ON CONFLICT(prompt) DO UPDATE SET
+	created_at = excluded.created_at,
+	cwd = excluded.cwd,
+	session_id = excluded.session_id,
+	use_count = history.use_count + 1
+		`);
 	}
 
+	/**
+	 * Opens the process-wide prompt history database. A corrupt store is
+	 * quarantined once and the rows it can still decode are copied into the
+	 * replacement.
+	 */
 	static open(dbPath: string = getHistoryDbPath()): HistoryStorage {
-		if (!HistoryStorage.#instance) {
-			HistoryStorage.#instance = new HistoryStorage(dbPath);
-		}
-		return HistoryStorage.#instance;
+		const existing = HistoryStorage.#instance;
+		if (existing) return existing;
+
+		fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+		// Windows cannot move history.db aside while the session index holds it open.
+		closeSessionIndex();
+		let backupPath = undefined as string | undefined;
+		const instance = openSqliteDatabaseSync(
+			dbPath,
+			db => {
+				const instance = new HistoryStorage(db);
+				// Exit-only: a keep-alive cleanup leaves the handle valid so the editor can
+				// keep submitting prompts; the real exit closes. Register before publishing
+				// so a real-exit-in-progress late registration cannot close this instance.
+				cancelExitCleanup = postmortem.register("history-storage", () => HistoryStorage.close(), {
+					exitOnly: true,
+				});
+				HistoryStorage.#instance = instance;
+				return instance;
+			},
+			{
+				recoverCorruption: true,
+				onCorruptionPreserved: preserved => {
+					backupPath = preserved;
+				},
+			},
+		);
+		if (backupPath) instance.#salvage(backupPath);
+		return instance;
 	}
 
-	/** @internal Reset the singleton and close its database — test-only. */
-	static resetInstance(): void {
+	/** Checkpoints and closes the process-wide database, and permits reopening it. */
+	static close(): void {
 		const instance = HistoryStorage.#instance;
 		HistoryStorage.#instance = undefined;
+		cancelExitCleanup?.();
+		cancelExitCleanup = undefined;
 		if (instance) instance.#close();
 	}
 
 	#close(): void {
+		checkpointWal(this.#db);
 		for (const stmt of this.#substringStmts.values()) stmt.finalize();
 		this.#substringStmts.clear();
-		this.#insertRowStmt.finalize();
+		this.#upsertRowStmt.finalize();
 		this.#recentStmt.finalize();
 		this.#searchStmt.finalize();
-		this.#lastPromptStmt.finalize();
 		this.#db.close();
 	}
 
 	#insertBatch(rows: Array<Pick<HistoryEntry, "prompt" | "cwd" | "sessionId">>): void {
 		this.#db.transaction((rows: Array<Pick<HistoryEntry, "prompt" | "cwd" | "sessionId">>) => {
 			for (const row of rows) {
-				this.#insertRowStmt.run(row.prompt, row.cwd ?? null, row.sessionId ?? null);
+				this.#upsertRowStmt.run(row.prompt, row.cwd ?? null, row.sessionId ?? null);
 			}
 		})(rows);
 	}
@@ -139,29 +241,56 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 	/**
 	 * Register a resolver that supplies the current session ID for prompts added
 	 * without an explicit `sessionId`. Evaluated synchronously at `add()` time so
-	 * batched writes capture the session active when the prompt was submitted.
+	 * each write captures the session active when the prompt was submitted.
 	 */
 	setSessionResolver(resolver: () => string | undefined): void {
 		this.#sessionResolver = resolver;
 	}
 
-	add(prompt: string, cwd?: string, sessionId?: string): Promise<void> {
-		const trimmed = prompt.trim();
-		if (!trimmed) return Promise.resolve();
-		if (this.#lastPromptCache === trimmed) return Promise.resolve();
-		this.#lastPromptCache = trimmed;
-		const session = sessionId ?? this.#sessionResolver?.();
-		return this.#drain.push({ prompt: trimmed, cwd: cwd ?? undefined, sessionId: session || undefined }, rows => {
-			this.#insertBatch(rows);
-		});
+	/** Register a callback run after each successful {@link add}, once the row is durable. */
+	setAddListener(listener: () => void): void {
+		this.#addListener = listener;
 	}
 
-	getRecent(limit: number): HistoryEntry[] {
+	/** Register a callback for the first failed write in each outage, reset by a successful write. */
+	setErrorListener(listener: (error: unknown) => void): void {
+		this.#errorListener = listener;
+	}
+
+	/**
+	 * Stores a prompt, replaces its provenance with the latest submission, and
+	 * bumps its use count on resubmission.
+	 * The write is synchronous: prompt submission is human-paced, not a hot
+	 * path. On success the row is durable the moment `add()` returns and cannot
+	 * be lost to an exit racing a deferred flush. Failures are logged, not thrown;
+	 * the error listener is notified once per outage until a write succeeds.
+	 */
+	add(prompt: string, cwd?: string, sessionId?: string): Promise<void> {
+		const trimmed = normalizePrompt(prompt);
+		if (!trimmed) return Promise.resolve();
+		const session = sessionId ?? this.#sessionResolver?.();
+		try {
+			this.#insertBatch([{ prompt: trimmed, cwd: cwd ?? undefined, sessionId: session || undefined }]);
+		} catch (error) {
+			logger.error("HistoryStorage add failed", { error: String(error) });
+			if (!this.#writeFailureReported) {
+				this.#writeFailureReported = true;
+				this.#errorListener?.(error);
+			}
+			return Promise.resolve();
+		}
+		this.#writeFailureReported = false;
+		this.#addListener?.();
+		return Promise.resolve();
+	}
+
+	/** Returns unique prompts ordered by their most recent submission. */
+	getRecent(limit: number, filter: HistoryFilter = {}): HistoryEntry[] {
 		const safeLimit = this.#normalizeLimit(limit);
 		if (safeLimit === 0) return [];
 
 		try {
-			const rows = this.#recentStmt.all(safeLimit) as HistoryRow[];
+			const rows = this.#recentStmt.all(filter.cwd ?? null, filter.sessionId ?? null, safeLimit) as HistoryRow[];
 			return rows.map(row => this.#toEntry(row));
 		} catch (error) {
 			logger.error("HistoryStorage getRecent failed", { error: String(error) });
@@ -169,7 +298,8 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 		}
 	}
 
-	search(query: string, limit: number): HistoryEntry[] {
+	/** Finds unique prompts matching every query token, newest first. */
+	search(query: string, limit: number, filter: HistoryFilter = {}): HistoryEntry[] {
 		const safeLimit = this.#normalizeLimit(limit);
 		if (safeLimit === 0) return [];
 
@@ -182,7 +312,12 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 		const ftsQuery = tokens.map(tok => `"${tok.replace(/"/g, '""')}"*`).join(" ");
 		let ftsRows: HistoryRow[] = [];
 		try {
-			ftsRows = this.#searchStmt.all(ftsQuery, safeLimit) as HistoryRow[];
+			ftsRows = this.#searchStmt.all(
+				ftsQuery,
+				filter.cwd ?? null,
+				filter.sessionId ?? null,
+				safeLimit,
+			) as HistoryRow[];
 		} catch (error) {
 			// Malformed FTS expression - fall through to substring path.
 			logger.debug("HistoryStorage FTS query failed, using substring only", { error: String(error) });
@@ -193,7 +328,7 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 		//    by safeLimit, ordered by recency - no full-table load into JS.
 		let subRows: HistoryRow[] = [];
 		try {
-			subRows = this.#searchSubstring(tokens, safeLimit);
+			subRows = this.#searchSubstring(tokens, safeLimit, filter);
 		} catch (error) {
 			logger.error("HistoryStorage substring search failed", { error: String(error) });
 		}
@@ -233,50 +368,165 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 		return ids;
 	}
 
-	#ensureDir(dbPath: string): void {
-		const dir = path.dirname(dbPath);
-		fs.mkdirSync(dir, { recursive: true });
-	}
-
-	#historySchemaUsesUnixEpoch(): boolean {
-		const row = this.#db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'history'").get() as
-			| { sql?: string | null }
-			| undefined;
-		return row?.sql?.includes("unixepoch(") ?? false;
-	}
-
 	#historySchemaHasColumn(column: string): boolean {
-		const columns = this.#db.prepare("PRAGMA table_info(history)").all() as Array<{ name: string }>;
+		const columns = this.#db.query("PRAGMA table_info(history)").all() as Array<{ name: string }>;
 		return columns.some(col => col.name === column);
 	}
 
-	#migrateHistorySchema(): void {
-		const migrate = this.#db.transaction(() => {
-			this.#db.run("ALTER TABLE history RENAME TO history_legacy");
+	/** Adds `column` to `history` when absent; `definition` must carry a default so existing rows stay valid. */
+	#ensureColumn(column: string, definition: string): void {
+		if (this.#historySchemaHasColumn(column)) return;
+		this.#db.run(`ALTER TABLE history ADD COLUMN ${column} ${definition}`);
+	}
+
+	/**
+	 * One-time dump-and-rebuild pass, gated by `PRAGMA user_version` (owned by
+	 * this pass — nothing else versions history.db). Dumps every row, folds each
+	 * prompt through {@link normalizePrompt} in JS, keeps the most recent
+	 * submission per normalized prompt (the upsert's "latest wins" rule) with
+	 * the use counts of every collapsed row summed, and recreates the table from
+	 * {@link HISTORY_TABLE_DDL}. Subsumes every legacy shape at once — unixepoch
+	 * defaults, missing session_id, non-unique prompt, per-line trailing
+	 * padding — without per-shape SQL migrations. Returns whether it ran so the
+	 * caller can rebuild the FTS index.
+	 */
+	#rebuildHistory(): boolean {
+		const versionRow = this.#db.query("PRAGMA user_version").get() as { user_version: number };
+		if (versionRow.user_version >= HISTORY_DATA_VERSION) return false;
+		let rows: HistoryRow[];
+		try {
+			const sessionIdSelection = this.#historySchemaHasColumn("session_id") ? "session_id" : "NULL AS session_id";
+			rows = this.#db
+				.query(
+					`SELECT id, prompt, created_at, cwd, ${sessionIdSelection}, use_count FROM history WHERE typeof(prompt) = 'text'`,
+				)
+				.all() as HistoryRow[];
+		} catch (error) {
+			logger.error("HistoryStorage rebuild dump failed", { error: String(error) });
+			return false;
+		}
+		const winners = new Map<string, HistoryRow>();
+		for (const row of rows) {
+			const prompt = normalizePrompt(row.prompt);
+			if (!prompt) continue;
+			const incumbent = winners.get(prompt);
+			if (!incumbent) {
+				winners.set(prompt, { ...row, prompt });
+				continue;
+			}
+			// Most recent submission wins, matching the upsert's "latest provenance" rule;
+			// every collapsed row still counts as a submission.
+			const useCount = incumbent.use_count + row.use_count;
+			const rowWins =
+				row.created_at > incumbent.created_at || (row.created_at === incumbent.created_at && row.id > incumbent.id);
+			winners.set(prompt, rowWins ? { ...row, prompt, use_count: useCount } : { ...incumbent, use_count: useCount });
+		}
+		this.#db.transaction(() => {
 			this.#db.run("DROP INDEX IF EXISTS idx_history_created_at");
 			this.#db.run("DROP TRIGGER IF EXISTS history_ai");
 			this.#db.run("DROP TABLE IF EXISTS history_fts");
-			this.#db.run(`
-CREATE TABLE history (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	prompt TEXT NOT NULL,
-	created_at INTEGER NOT NULL DEFAULT (${SQLITE_NOW_EPOCH}),
-	cwd TEXT,
-	session_id TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at DESC);
-INSERT INTO history (id, prompt, created_at, cwd)
-SELECT id, prompt, created_at, cwd
-FROM history_legacy;
-DROP TABLE history_legacy;
-CREATE VIRTUAL TABLE history_fts USING fts5(prompt, content='history', content_rowid='id');
-CREATE TRIGGER history_ai AFTER INSERT ON history BEGIN
-	INSERT INTO history_fts(rowid, prompt) VALUES (new.id, new.prompt);
-END;
-			`);
-			this.#db.run("INSERT INTO history_fts(history_fts) VALUES('rebuild')");
+			this.#db.run("DROP TABLE history");
+			this.#db.run(HISTORY_TABLE_DDL);
+			const insert = this.#db.query(
+				"INSERT INTO history (id, prompt, created_at, cwd, session_id, use_count) VALUES (?, ?, ?, ?, ?, ?)",
+			);
+			for (const row of winners.values()) {
+				insert.run(row.id, row.prompt, row.created_at, row.cwd, row.session_id, row.use_count);
+			}
+			this.#db.run(`PRAGMA user_version = ${HISTORY_DATA_VERSION}`);
+		})();
+		if (winners.size < rows.length) {
+			logger.debug("HistoryStorage collapsed rows during rebuild", { before: rows.length, after: winners.size });
+		}
+		return true;
+	}
+
+	/**
+	 * Recall reads the newest window first, so foreign rows there are what crash
+	 * the editor. When the window holds any and `quick_check` confirms damage,
+	 * failing with SQLITE_CORRUPT hands the store to quarantine and salvage.
+	 * A clean check means only odd but intact values, which reads filter.
+	 */
+	#assertRecentWindowReadable(): void {
+		const window = this.#db
+			.query(
+				`SELECT count(*) AS foreign_rows FROM (SELECT prompt, created_at, use_count FROM history ORDER BY created_at DESC, id DESC LIMIT ${RECENT_WINDOW}) WHERE NOT (${readableRowClause("")})`,
+			)
+			.get() as { foreign_rows: number };
+		if (window.foreign_rows === 0) return;
+		const check = this.#db.query("PRAGMA quick_check(1)").get() as { quick_check: string };
+		if (check.quick_check === "ok") return;
+		throw Object.assign(new Error(`database disk image is malformed (${check.quick_check})`), {
+			code: "SQLITE_CORRUPT",
 		});
-		migrate();
+	}
+
+	/**
+	 * Copies every prompt, session title, and recap the quarantined store at
+	 * `backupPath` can still decode into this replacement. Runs once per
+	 * quarantine; a peer that wrote to the replacement first keeps its rows, and
+	 * a prompt both hold merges like a resubmission. Best-effort: the backup
+	 * stays on disk whatever happens here.
+	 */
+	#salvage(backupPath: string): void {
+		let source: Database | undefined;
+		try {
+			source = new Database(backupPath, { readonly: true });
+			const prompts = readSalvageableRows<Record<keyof HistoryRow, unknown>>(
+				source,
+				"history",
+				"id, prompt, created_at, cwd, session_id, use_count",
+			).filter(
+				row =>
+					Number.isSafeInteger(row.id) &&
+					typeof row.prompt === "string" &&
+					row.prompt.trim() !== "" &&
+					Number.isSafeInteger(row.created_at) &&
+					Number.isSafeInteger(row.use_count),
+			);
+			let sequence: number | undefined;
+			try {
+				sequence = source
+					.query<{ seq: number }, []>("SELECT seq FROM sqlite_sequence WHERE name = 'history'")
+					.get()?.seq;
+			} catch {}
+			const target = this.#db;
+			const counts = target.transaction(() => {
+				using insert = target.prepare(`
+INSERT INTO history (id, prompt, created_at, cwd, session_id, use_count)
+VALUES (CASE WHEN EXISTS (SELECT 1 FROM history WHERE id = ?1) THEN NULL ELSE ?1 END, ?2, ?3, ?4, ?5, ?6)
+ON CONFLICT(prompt) DO UPDATE SET
+	use_count = history.use_count + excluded.use_count,
+	created_at = max(history.created_at, excluded.created_at),
+	cwd = iif(excluded.created_at > history.created_at, excluded.cwd, history.cwd),
+	session_id = iif(excluded.created_at > history.created_at, excluded.session_id, history.session_id)
+				`);
+				for (const row of prompts) {
+					insert.run(
+						row.id as number,
+						row.prompt as string,
+						row.created_at as number,
+						typeof row.cwd === "string" ? row.cwd : null,
+						typeof row.session_id === "string" ? row.session_id : null,
+						row.use_count as number,
+					);
+				}
+				// Keep ids above every id the damaged store handed out: the prediction
+				// daemon's cursor reads `id > cursor` and would skip lower new ids.
+				if (Number.isSafeInteger(sequence)) {
+					target.run("UPDATE sqlite_sequence SET seq = max(seq, ?) WHERE name = 'history'", [sequence as number]);
+				}
+				return { prompts: prompts.length, ...salvageSessionIndex(source as Database, target) };
+			})();
+			logger.warn("Salvaged readable rows from a damaged history database", { backupPath, ...counts });
+		} catch (error) {
+			logger.error("HistoryStorage salvage failed; the damaged store is preserved", {
+				backupPath,
+				error: String(error),
+			});
+		} finally {
+			source?.close();
+		}
 	}
 
 	#normalizeLimit(limit: number): number {
@@ -297,19 +547,23 @@ END;
 			.filter(tok => tok.length > 0);
 	}
 
-	#searchSubstring(tokens: string[], limit: number): HistoryRow[] {
+	#searchSubstring(tokens: string[], limit: number, filter: HistoryFilter): HistoryRow[] {
 		const stmt = this.#getSubstringStmt(tokens.length);
-		const params: unknown[] = tokens.map(tok => `%${escapeLikePattern(tok)}%`);
-		params.push(limit);
-		return stmt.all(...(params as [string, ...unknown[]])) as HistoryRow[];
+		const params: SQLQueryBindings[] = tokens.map(tok => `%${escapeLikePattern(tok)}%`);
+		params.push(filter.cwd ?? null, filter.sessionId ?? null, limit);
+		return stmt.all(...params) as HistoryRow[];
 	}
 
 	#getSubstringStmt(tokenCount: number): Statement {
 		let stmt = this.#substringStmts.get(tokenCount);
 		if (stmt) return stmt;
-		const whereClause = Array(tokenCount).fill("prompt LIKE ? ESCAPE '\\' COLLATE NOCASE").join(" AND ");
+		const tokenClauses = Array.from(
+			{ length: tokenCount },
+			(_, index) => `prompt LIKE ?${index + 1} ESCAPE '\\' COLLATE NOCASE`,
+		);
+		const whereClause = [...tokenClauses, historyFilterClause("", tokenCount + 1)].join(" AND ");
 		stmt = this.#db.prepare(
-			`SELECT id, prompt, created_at, cwd, session_id FROM history WHERE ${whereClause} ORDER BY created_at DESC, id DESC LIMIT ?`,
+			`SELECT id, prompt, created_at, cwd, session_id, use_count FROM history WHERE ${readableRowClause("")} AND ${whereClause} ORDER BY created_at DESC, id DESC LIMIT ?${tokenCount + 3}`,
 		);
 		this.#substringStmts.set(tokenCount, stmt);
 		return stmt;
@@ -322,6 +576,7 @@ END;
 			created_at: row.created_at,
 			cwd: row.cwd ?? undefined,
 			sessionId: row.session_id ?? undefined,
+			useCount: row.use_count,
 		};
 	}
 }

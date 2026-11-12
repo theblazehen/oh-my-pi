@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { z } from "zod/v4";
+import { type } from "@oh-my-pi/omptype";
+import { seedModels } from "../compat/providers";
 import type { FetchImpl, ModelSpec } from "../types";
 import { discoveryFetch, isRecord } from "../utils";
 
@@ -8,8 +9,6 @@ const GITLAB_DEFAULT_BASE_URL = "https://gitlab.com";
 const GRAPHQL_PATH = "/api/graphql";
 const PROJECTS_PATH = "/api/v4/projects";
 const GROUPS_PATH = "/api/v4/groups";
-const FALLBACK_MODEL_ID = "claude_sonnet_4_6_vertex";
-const FALLBACK_MODEL_NAME = "Claude Sonnet 4.6 - Vertex";
 // Bound the top-level group pagination so a misbehaving server cannot loop forever.
 // 50 pages × 100/page covers 5000 top-level groups, far beyond any realistic account.
 const GITLAB_DUO_WORKFLOW_MAX_GROUP_PAGES = 50;
@@ -54,20 +53,32 @@ const ProjectRootNamespaceQuery = `query omp_gitlabDuoWorkflowProjectRootNamespa
   }
 }`;
 
-const modelRefSchema = z
-	.object({
-		name: z.string().optional().catch(undefined),
-		ref: z.string().optional().catch(undefined),
-	})
-	.loose();
+// Hoisted: per-element schema construction on a discovery hot path.
+const stringSchema = type("string");
+const unknownArraySchema = type("unknown[]");
 
-const aiChatAvailableModelsSchema = z
-	.object({
-		defaultModel: z.unknown().nullable().optional(),
-		selectableModels: z.array(z.unknown()).nullable().optional().catch([]),
-		pinnedModel: z.unknown().nullable().optional(),
-	})
-	.loose();
+const resilientString = type("unknown").pipe(value => {
+	if (value === undefined) return undefined;
+	const parsed = stringSchema(value);
+	return parsed instanceof type.errors ? undefined : parsed;
+});
+
+const resilientUnknownArray = type("unknown").pipe(value => {
+	if (value === undefined || value === null) return value;
+	const parsed = unknownArraySchema(value);
+	return parsed instanceof type.errors ? [] : parsed;
+});
+
+const modelRefSchema = type({
+	"name?": resilientString,
+	"ref?": resilientString,
+});
+
+const aiChatAvailableModelsSchema = type({
+	"defaultModel?": "unknown",
+	"selectableModels?": resilientUnknownArray,
+	"pinnedModel?": "unknown",
+});
 
 type GitLabDuoWorkflowCandidateSource = "override" | "project" | "remote" | "group";
 
@@ -186,12 +197,11 @@ export function buildGitLabDuoWorkflowModelSpec(
 	};
 }
 
-export function buildGitLabDuoWorkflowFallbackModel(
-	id = FALLBACK_MODEL_ID,
-	name = FALLBACK_MODEL_NAME,
-	baseUrl = GITLAB_DEFAULT_BASE_URL,
-): ModelSpec<"gitlab-duo-agent"> {
-	return buildGitLabDuoWorkflowModelSpec({ name, ref: id }, baseUrl);
+export function buildGitLabDuoWorkflowFallbackModel(baseUrl = GITLAB_DEFAULT_BASE_URL): ModelSpec<"gitlab-duo-agent"> {
+	return {
+		...seedModels<"gitlab-duo-agent">("gitlab-duo-agent")[0]!,
+		baseUrl: normalizeGitLabBaseUrl(baseUrl),
+	};
 }
 
 async function selectGitLabDuoWorkflowNamespace(
@@ -540,17 +550,15 @@ async function postGraphQL(
 }
 
 function parseAvailability(value: unknown): GitLabDuoWorkflowAvailability | null {
-	const parsed = aiChatAvailableModelsSchema.safeParse(value);
-	if (!parsed.success) {
-		return null;
-	}
+	const parsed = aiChatAvailableModelsSchema(value);
+	if (parsed instanceof type.errors) return null;
 	return {
-		defaultModel: parseModelRef(parsed.data.defaultModel),
-		selectableModels: (parsed.data.selectableModels ?? []).flatMap(model => {
+		defaultModel: parseModelRef(parsed.defaultModel),
+		selectableModels: (parsed.selectableModels ?? []).flatMap(model => {
 			const parsedModel = parseModelRef(model);
 			return parsedModel ? [parsedModel] : [];
 		}),
-		pinnedModel: parseModelRef(parsed.data.pinnedModel),
+		pinnedModel: parseModelRef(parsed.pinnedModel),
 	};
 }
 
@@ -558,15 +566,13 @@ function parseModelRef(value: unknown): GitLabDuoWorkflowModelRef | null {
 	if (value === null || value === undefined) {
 		return null;
 	}
-	const parsed = modelRefSchema.safeParse(value);
-	if (!parsed.success) {
-		return null;
-	}
-	const ref = normalizeIdentifier(parsed.data.ref);
+	const parsed = modelRefSchema(value);
+	if (parsed instanceof type.errors) return null;
+	const ref = normalizeIdentifier(parsed.ref);
 	if (!ref) {
 		return null;
 	}
-	const name = normalizeIdentifier(parsed.data.name) ?? ref;
+	const name = normalizeIdentifier(parsed.name) ?? ref;
 	return { name, ref };
 }
 

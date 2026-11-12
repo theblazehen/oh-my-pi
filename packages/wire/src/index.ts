@@ -261,8 +261,12 @@ export interface AgentProgress {
 	lastIntent?: string;
 	currentTool?: string;
 	currentToolArgs?: string;
+	/** Argument key selected for the display preview, when known. */
+	currentToolArgsKey?: string;
+	/** Intent the model attached to the current call; undefined when that call carried none. */
+	currentToolIntent?: string;
 	currentToolStartMs?: number;
-	recentTools: { tool: string; args: string; endMs: number }[];
+	recentTools: { tool: string; args: string; argsKey?: string; intent?: string; isError?: boolean; endMs: number }[];
 	recentOutput: string[];
 	toolCount: number;
 	requests: number;
@@ -377,7 +381,8 @@ export type HostFrame =
 	/** Targeted reply to fetch-transcript; `text` is decoded JSONL from `fromByte`, `newSize` the next offset base. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
 	| { t: "bye"; reason: string }
-	| { t: "error"; message: string };
+	/** `resync`: the host no longer counts this guest as joined; the guest should send `hello` again. */
+	| { t: "error"; message: string; resync?: true };
 
 export type WireFrame = GuestFrame | HostFrame;
 
@@ -406,6 +411,30 @@ export const INTENT_FIELD = "i";
 /** Plaintext envelope prefix: `[4B uint32 BE peerId][sealed payload]`. */
 export const ENVELOPE_HEADER_LENGTH = 4;
 
+/**
+ * Prefix `sealed` with its envelope header. Host→relay: peerId 0 broadcasts to
+ * all guests, peerId N targets guest N. Guest→relay: always 0; the relay
+ * rewrites it to the sender's id.
+ */
+export function packEnvelope(peerId: number, sealed: Uint8Array): Uint8Array<ArrayBuffer> {
+	const out = new Uint8Array(ENVELOPE_HEADER_LENGTH + sealed.byteLength);
+	new DataView(out.buffer).setUint32(0, peerId, false);
+	out.set(sealed, ENVELOPE_HEADER_LENGTH);
+	return out;
+}
+
+/** Split an envelope into its peerId and sealed payload; `null` when shorter than the header. */
+export function unpackEnvelope(data: Uint8Array): { peerId: number; payload: Uint8Array } | null {
+	if (data.byteLength < ENVELOPE_HEADER_LENGTH) return null;
+	const peerId = new DataView(data.buffer, data.byteOffset, ENVELOPE_HEADER_LENGTH).getUint32(0, false);
+	return { peerId, payload: data.subarray(ENVELOPE_HEADER_LENGTH) };
+}
+
+/** Rewrite the peerId in place without copying the payload. */
+export function rewriteEnvelopePeer(data: Uint8Array, peerId: number): void {
+	new DataView(data.buffer, data.byteOffset, ENVELOPE_HEADER_LENGTH).setUint32(0, peerId, false);
+}
+
 export const ROOM_ID_BYTES = 16;
 
 /** AES-256-GCM room key; the seal key for every collab frame. */
@@ -417,6 +446,22 @@ export const ROOM_KEY_BYTES = 32;
  * proves prompt/abort/agent-cmd capability to the host.
  */
 export const WRITE_TOKEN_BYTES = 16;
+
+/**
+ * Each automatic rejoin costs the host a full snapshot, and a guest on a link
+ * too slow for the session is shed again after every one. Past the cap the
+ * guest stops rejoining on its own and leaves the decision to the user.
+ */
+export const MAX_AUTO_REJOINS = 3;
+export const AUTO_REJOIN_WINDOW_MS = 5 * 60_000;
+
+/** Records an automatic rejoin in {@link history} if the window has room for one. */
+export function takeAutoRejoin(history: number[], now = Date.now()): boolean {
+	while (history.length > 0 && now - history[0]! >= AUTO_REJOIN_WINDOW_MS) history.shift();
+	if (history.length >= MAX_AUTO_REJOINS) return false;
+	history.push(now);
+	return true;
+}
 
 /** Default public relay; bare `<roomId>.<key>` links resolve against it. */
 export const DEFAULT_RELAY_URL = "wss://my.omp.sh";
@@ -442,3 +487,8 @@ export type RelayControlToHost = { t: "peer-joined" | "peer-left"; peer: number 
 /** Relay → guest control message. */
 export type RelayControlToGuest = { t: "room-closed" };
 export type RelayControlMessage = RelayControlToHost | RelayControlToGuest;
+
+export * from "./shell-trace";
+export * from "./shell-viz";
+export * from "./stream";
+export * from "./tsp";

@@ -1,21 +1,26 @@
 //! HTML to Markdown conversion.
 
 use html_to_markdown_rs::{
-	ConversionOptions, PreprocessingOptions, PreprocessingPreset, WarningKind, convert,
+	ConversionOptions, HiddenContent, PreprocessingOptions, PreprocessingPreset, WarningKind,
+	convert,
 };
-use napi::bindgen_prelude::*;
+use napi::{JsString, bindgen_prelude::*};
 use napi_derive::napi;
 
-use crate::task;
+use crate::{js::into_string, task};
 
 /// Options for HTML to Markdown conversion.
 #[napi(object)]
 #[derive(Debug, Default)]
 pub struct HtmlToMarkdownOptions {
 	/// Remove navigation elements, forms, headers, footers.
-	pub clean_content: Option<bool>,
+	pub clean_content:  Option<bool>,
 	/// Skip images during conversion.
-	pub skip_images:   Option<bool>,
+	pub skip_images:    Option<bool>,
+	/// Hidden content to keep: "drop" (default) omits it, "reachable" keeps
+	/// content the page can reveal (collapsed sections, inactive tab panels),
+	/// "all" also keeps `<template>` and `<noscript>` content.
+	pub hidden_content: Option<String>,
 }
 
 /// Convert HTML source to Markdown with optional preprocessing.
@@ -24,16 +29,23 @@ pub struct HtmlToMarkdownOptions {
 /// Returns an error if the conversion fails or the worker task aborts.
 #[napi]
 pub fn html_to_markdown(
-	html: String,
+	html: JsString,
 	options: Option<HtmlToMarkdownOptions>,
-) -> task::Promise<String> {
+) -> Result<task::Promise<String>> {
+	let html = into_string(html)?;
 	let options = options.unwrap_or_default();
 	let clean_content = options.clean_content.unwrap_or(false);
 	let skip_images = options.skip_images.unwrap_or(false);
+	let hidden_content = match options.hidden_content.as_deref() {
+		Some(value) => HiddenContent::parse(value)
+			.map_err(|err| Error::from_reason(format!("Invalid hiddenContent: {err}")))?,
+		None => HiddenContent::Drop,
+	};
 
-	task::blocking("html_to_markdown", (), move |_| {
+	Ok(task::blocking("html_to_markdown", (), move |_| {
 		let conversion_opts = ConversionOptions {
 			skip_images,
+			hidden_content,
 			preprocessing: PreprocessingOptions {
 				enabled:           clean_content,
 				preset:            PreprocessingPreset::Aggressive,
@@ -54,5 +66,5 @@ pub fn html_to_markdown(
 			return Err(Error::from_reason(format!("Conversion error: {}", warning.message)));
 		}
 		Ok(result.content.unwrap_or_default())
-	})
+	}))
 }

@@ -1,7 +1,6 @@
 import type { Agent } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
-import { disposeJuliaKernelSessionsByOwner } from "../eval/jl/executor";
 import { disposeVmContextsByOwner } from "../eval/js/context-manager";
 import { namespaceSessionId as namespacePythonSessionId } from "../eval/py";
 import {
@@ -9,12 +8,14 @@ import {
 	executePython as executePythonCommand,
 	type PythonResult,
 } from "../eval/py/executor";
-import { disposeRubyKernelSessionsByOwner } from "../eval/rb/executor";
 import { defaultEvalSessionId } from "../eval/session-id";
 import type { ExtensionRunner } from "../extensibility/extensions";
+import type { ToolSession } from "../tools";
 import { outputMeta } from "../tools/output-meta";
 import type { PythonExecutionMessage } from "./messages";
 import type { SessionManager } from "./session-manager";
+
+import { cfgPythonInterpreter, cfgPythonKernelMode } from "../eval/settings";
 
 /** Capabilities the eval runner borrows from its owning session. */
 export interface EvalRunnerHost {
@@ -22,31 +23,36 @@ export interface EvalRunnerHost {
 	sessionManager: SessionManager;
 	settings: Settings;
 	extensionRunner(): ExtensionRunner | undefined;
+	evalToolSession?: ToolSession;
 	isStreaming(): boolean;
 	appendSessionMessage(message: PythonExecutionMessage): void;
+}
+
+export interface PythonExecuteOptions {
+	excludeFromContext?: boolean;
+	/** Receives the `pythonExecution` message the cell is recorded as, once it is persisted or queued for a mid-turn flush. */
+	onRecorded?: (message: PythonExecutionMessage) => void;
 }
 
 /** Owns user-initiated Python execution and retained eval-kernel lifecycle. */
 export class EvalRunner {
 	readonly #host: EvalRunnerHost;
 	readonly #kernelOwnerId: string;
-	readonly #parentSessionId: string | undefined;
 	#abortControllers = new Set<AbortController>();
 	#pendingMessages: PythonExecutionMessage[] = [];
 	#activeExecutions = new Set<Promise<unknown>>();
 	#disposing = false;
 
-	constructor(host: EvalRunnerHost, options: { kernelOwnerId: string; parentSessionId: string | undefined }) {
+	constructor(host: EvalRunnerHost, options: { kernelOwnerId: string }) {
 		this.#host = host;
 		this.#kernelOwnerId = options.kernelOwnerId;
-		this.#parentSessionId = options.parentSessionId;
 	}
 
 	/** Executes Python in the session's shared kernel. */
 	async executePython(
 		code: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean },
+		options?: PythonExecuteOptions,
 	): Promise<PythonResult> {
 		const excludeFromContext = options?.excludeFromContext === true;
 		const cwd = this.#host.sessionManager.getCwd();
@@ -67,20 +73,15 @@ export class EvalRunner {
 					return hookResult.result;
 				}
 			}
-			const sessionId =
-				this.getSessionId() ??
-				defaultEvalSessionId({
-					cwd,
-					getSessionFile: () => this.#host.sessionManager.getSessionFile() ?? null,
-				});
 			const result = await executePythonCommand(code, {
 				cwd,
-				sessionId: namespacePythonSessionId(sessionId),
+				sessionId: namespacePythonSessionId(this.getSessionId()),
 				kernelOwnerId: this.#kernelOwnerId,
-				kernelMode: this.#host.settings.get("python.kernelMode"),
-				interpreter: this.#host.settings.get("python.interpreter")?.trim() || undefined,
+				kernelMode: cfgPythonKernelMode.get(this.#host.settings),
+				interpreter: cfgPythonInterpreter.get(this.#host.settings)?.trim() || undefined,
 				onChunk,
 				signal: abortController.signal,
+				toolSession: this.#host.evalToolSession,
 			});
 			this.recordPythonResult(code, result, options);
 			return result;
@@ -111,7 +112,7 @@ export class EvalRunner {
 	}
 
 	/** Records a Python execution result in session history. */
-	recordPythonResult(code: string, result: PythonResult, options?: { excludeFromContext?: boolean }): void {
+	recordPythonResult(code: string, result: PythonResult, options?: PythonExecuteOptions): void {
 		const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 		const message: PythonExecutionMessage = {
 			role: "pythonExecution",
@@ -128,6 +129,11 @@ export class EvalRunner {
 			this.#pendingMessages.push(message);
 		} else {
 			this.#host.appendSessionMessage(message);
+		}
+		try {
+			options?.onRecorded?.(message);
+		} catch (error) {
+			logger.error("python onRecorded callback failed", { error: String(error) });
 		}
 	}
 
@@ -151,9 +157,8 @@ export class EvalRunner {
 		return this.#kernelOwnerId;
 	}
 
-	/** Returns the eval session shared with the Python backend. */
-	getSessionId(): string | null {
-		if (this.#parentSessionId !== undefined) return this.#parentSessionId;
+	/** Returns this session's eval executor id, shared by the eval tool and user Python shortcuts. */
+	getSessionId(): string {
 		return defaultEvalSessionId({
 			cwd: this.#host.sessionManager.getCwd(),
 			getSessionFile: () => this.#host.sessionManager.getSessionFile() ?? null,
@@ -180,8 +185,6 @@ export class EvalRunner {
 		}
 		const results = await Promise.allSettled([
 			disposeKernelSessionsByOwner(this.#kernelOwnerId),
-			disposeRubyKernelSessionsByOwner(this.#kernelOwnerId),
-			disposeJuliaKernelSessionsByOwner(this.#kernelOwnerId),
 			disposeVmContextsByOwner(this.#kernelOwnerId),
 		]);
 		const errors: unknown[] = [];

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { parseHTML } from "linkedom";
+import { parseHTML } from "@oh-my-pi/pi-utils/dom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { ErrorsRoute } from "../src/client/routes/ErrorsRoute";
@@ -66,16 +66,13 @@ describe("ErrorsRoute range", () => {
 		root = createRoot(container as unknown as Element);
 
 		await act(async () => {
-			root?.render(<ErrorsRoute active range="24h" refreshTrigger={0} onRequestClick={() => {}} />);
+			root?.render(<ErrorsRoute active range="24h" onRequestClick={() => {}} />);
 		});
 		expect(requestedUrls).toEqual(["/api/stats/errors?range=24h&limit=50"]);
 
 		await act(async () => {
-			root?.render(<ErrorsRoute active range="7d" refreshTrigger={0} onRequestClick={() => {}} />);
+			root?.render(<ErrorsRoute active range="7d" onRequestClick={() => {}} />);
 		});
-		expect(requestedUrls).toEqual([
-			"/api/stats/errors?range=24h&limit=50",
-			"/api/stats/errors?range=7d&limit=50",
-		]);
+		expect(requestedUrls).toEqual(["/api/stats/errors?range=24h&limit=50", "/api/stats/errors?range=7d&limit=50"]);
 	});
 });

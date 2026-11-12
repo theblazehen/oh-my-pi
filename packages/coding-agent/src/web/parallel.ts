@@ -1,5 +1,5 @@
 import { type FetchImpl, getEnvApiKey } from "@oh-my-pi/pi-ai";
-import type { AgentStorage } from "../session/agent-storage";
+import type { AgentStorageApi } from "../session/agent-storage";
 import { findCredential, withHardTimeout } from "./search/providers/utils";
 
 const PARALLEL_API_URL = "https://api.parallel.ai";
@@ -146,6 +146,15 @@ export function parseParallelErrorResponse(statusCode: number, responseText: str
 	}
 }
 
+export async function parseParallelJsonResponse(response: Response, operation: "search" | "extract"): Promise<unknown> {
+	try {
+		return await response.json();
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		throw new ParallelApiError(`Parallel ${operation} returned invalid JSON: ${detail}`);
+	}
+}
+
 function getAuthHeaders(apiKey: string): {
 	Accept: string;
 	"Content-Type": string;
@@ -229,7 +238,7 @@ export function parseParallelSearchPayload(
 	};
 }
 
-export function findParallelApiKey(storage: AgentStorage | null | undefined): string | null {
+export function findParallelApiKey(storage: AgentStorageApi | null | undefined): string | null {
 	return findCredential(storage, getEnvApiKey("parallel"), "parallel");
 }
 
@@ -289,7 +298,7 @@ export async function searchWithParallel(
 	objective: string,
 	queries: string[],
 	options: ParallelSearchOptions,
-	storage: AgentStorage | null | undefined,
+	storage: AgentStorageApi | null | undefined,
 ): Promise<ParallelSearchResult> {
 	const apiKey = findParallelApiKey(storage);
 	if (!apiKey) {
@@ -316,14 +325,14 @@ export async function searchWithParallel(
 		throw parseParallelErrorResponse(response.status, await response.text());
 	}
 
-	const payload: unknown = await response.json();
+	const payload = await parseParallelJsonResponse(response, "search");
 	return parseParallelSearchPayload(payload);
 }
 
 export async function extractWithParallel(
 	urls: string[],
 	options: ParallelExtractOptions,
-	storage: AgentStorage | null | undefined,
+	storage: AgentStorageApi | null | undefined,
 ): Promise<ParallelExtractResult> {
 	const apiKey = findParallelApiKey(storage);
 	if (!apiKey) {
@@ -349,6 +358,6 @@ export async function extractWithParallel(
 		throw parseParallelErrorResponse(response.status, await response.text());
 	}
 
-	const payload: unknown = await response.json();
+	const payload = await parseParallelJsonResponse(response, "extract");
 	return parseExtractPayload(payload);
 }

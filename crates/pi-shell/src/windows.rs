@@ -1,32 +1,29 @@
+//! Windows host specifics: the `PATH` the shell starts with and 8.3 path
+//! spellings.
+
 use std::{
-	collections::HashSet,
+	collections::{HashMap, HashSet},
 	env,
+	os::windows::ffi::{OsStrExt, OsStringExt},
 	path::{Path, PathBuf},
 	process::Command,
 };
 
-use anyhow::{Error, Result};
-use brush_core::{Shell as BrushShell, ShellValue, ShellVariable};
+use windows_sys::Win32::Storage::FileSystem::{GetLongPathNameW, GetShortPathNameW};
 use winreg::{RegKey, enums::HKEY_LOCAL_MACHINE};
 
-pub fn configure_windows_path(shell: &mut BrushShell) -> Result<()> {
-	let install_roots = find_git_install_roots();
-	let git_paths = find_git_paths();
+/// Add Git for Windows' tool directories to the shell's starting `PATH` in
+/// `vars`, translating MSYS2-style entries to Windows paths.
+pub fn configure_windows_path<S: std::hash::BuildHasher>(vars: &mut HashMap<String, String, S>) {
+	let GitDiscovery { install_roots, paths: git_paths } = discover_git();
 	if install_roots.is_empty() && git_paths.is_empty() {
-		return Ok(());
+		return;
 	}
 
-	let existing_path = shell
-		.env()
-		.get("PATH")
-		.and_then(|(_, var)| match var.value() {
-			ShellValue::String(value) => Some(value.clone()),
-			_ => None,
-		})
-		.unwrap_or_default();
+	let existing_path = vars.get("PATH").cloned().unwrap_or_default();
 
 	// Translate MSYS2-style entries (e.g. /usr/bin, /mingw64/bin, /c/Users/...)
-	// into Windows-native paths so brush-core's std::path-based lookups can
+	// into Windows-native paths so the shell's std::path-based lookups can
 	// resolve executables shipped with Git Bash.
 	let mut segments: Vec<String> = Vec::new();
 	let mut seen_normalized: HashSet<String> = HashSet::new();
@@ -59,18 +56,56 @@ pub fn configure_windows_path(shell: &mut BrushShell) -> Result<()> {
 	}
 
 	let updated_path = segments.join(";");
-	if updated_path == existing_path {
-		return Ok(());
+	if updated_path != existing_path {
+		vars.insert("PATH".to_owned(), updated_path);
 	}
+}
 
-	let mut var = ShellVariable::new(ShellValue::String(updated_path));
-	var.export();
-	shell
-		.env_mut()
-		.set_global("PATH", var)
-		.map_err(|err| Error::msg(format!("Failed to set PATH: {err}")))?;
+/// Expand 8.3 short-name components (e.g. `ADMINI~1`) in `path` to their long
+/// form, leaving the path otherwise unchanged (symlinks and junctions kept).
+pub fn expand_to_long_path(path: &Path) -> PathBuf {
+	query_path_name(path, GetLongPathNameW)
+}
 
-	Ok(())
+/// The existing 8.3 spelling of `path`, without resolving symlinks or
+/// junctions; the input when no short spelling is available.
+pub fn get_short_path(path: &Path) -> PathBuf {
+	query_path_name(path, GetShortPathNameW)
+}
+
+/// Both Win32 name queries preserve symlinks and junctions, unlike
+/// canonicalize. A failed query (a missing path) returns the input.
+fn query_path_name(
+	path: &Path,
+	query: unsafe extern "system" fn(*const u16, *mut u16, u32) -> u32,
+) -> PathBuf {
+	// Encode straight from the wide form: Windows `OsStr` is UTF-16 and may
+	// not round-trip through UTF-8.
+	let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+	// SAFETY: `wide` is NUL-terminated; a null buffer with length 0 asks only
+	// for the required size (including the NUL).
+	let needed = unsafe { query(wide.as_ptr(), std::ptr::null_mut(), 0) };
+	if needed == 0 {
+		return path.to_path_buf();
+	}
+	let mut buf = vec![0u16; needed as usize];
+	loop {
+		let Ok(len) = u32::try_from(buf.len()) else {
+			return path.to_path_buf();
+		};
+		// SAFETY: `wide` is NUL-terminated and `buf` is writable for `len` u16s.
+		let written = unsafe { query(wide.as_ptr(), buf.as_mut_ptr(), len) };
+		if written == 0 {
+			return path.to_path_buf();
+		}
+		// A result longer than the buffer reports the size it needs instead.
+		if written as usize >= buf.len() {
+			buf.resize(written as usize, 0);
+			continue;
+		}
+		buf.truncate(written as usize);
+		return PathBuf::from(std::ffi::OsString::from_wide(&buf));
+	}
 }
 
 fn normalize_path(path: &Path) -> String {
@@ -94,26 +129,43 @@ fn normalize_path(path: &Path) -> String {
 	normalized.to_string_lossy().into_owned()
 }
 
-fn find_git_paths() -> Vec<String> {
-	let mut paths = Vec::new();
-	let mut seen = HashSet::new();
+struct GitDiscovery {
+	install_roots: Vec<PathBuf>,
+	paths:         Vec<String>,
+}
 
-	for install_path in [query_git_install_path_from_registry(), query_git_install_path_from_where()]
-		.into_iter()
-		.flatten()
-	{
+fn discover_git() -> GitDiscovery {
+	discover_git_with(query_git_install_path_from_registry, query_git_install_path_from_where)
+}
+
+fn discover_git_with<R, W>(registry_query: R, where_query: W) -> GitDiscovery
+where
+	R: FnOnce() -> Option<String>,
+	W: FnOnce() -> Option<String>,
+{
+	let registry_path = registry_query();
+	let where_path = where_query();
+	let mut install_roots = Vec::new();
+	let mut paths = Vec::new();
+	let mut seen_roots = HashSet::new();
+	let mut seen_paths = HashSet::new();
+
+	for install_path in [registry_path, where_path].into_iter().flatten() {
 		for path in git_paths_for_install_root(&install_path) {
-			let normalized = normalize_path(Path::new(&path));
-			if normalized.is_empty() {
-				continue;
-			}
-			if seen.insert(normalized) {
+			let normalized_path = normalize_path(Path::new(&path));
+			if !normalized_path.is_empty() && seen_paths.insert(normalized_path) {
 				paths.push(path);
 			}
 		}
+
+		let root = PathBuf::from(&install_path);
+		let normalized_root = normalize_path(&root);
+		if !normalized_root.is_empty() && seen_roots.insert(normalized_root) {
+			install_roots.push(root);
+		}
 	}
 
-	paths
+	GitDiscovery { install_roots, paths }
 }
 
 fn query_git_install_path_from_registry() -> Option<String> {
@@ -206,28 +258,9 @@ fn has_git_command(dir: &Path) -> bool {
 		.any(|name| dir.join(name).is_file())
 }
 
-fn find_git_install_roots() -> Vec<PathBuf> {
-	let mut roots = Vec::new();
-	let mut seen = HashSet::new();
-	for install_path in [query_git_install_path_from_registry(), query_git_install_path_from_where()]
-		.into_iter()
-		.flatten()
-	{
-		let path = PathBuf::from(install_path);
-		let normalized = normalize_path(&path);
-		if normalized.is_empty() {
-			continue;
-		}
-		if seen.insert(normalized) {
-			roots.push(path);
-		}
-	}
-	roots
-}
-
 /// Translate an MSYS2/Git Bash style path entry (e.g. `/usr/bin`,
 /// `/mingw64/bin`, `/c/Users/foo`) into a Windows-native path so that
-/// `std::path` based executable lookups in brush-core can resolve binaries
+/// the shell's `std::path` based executable lookups can resolve binaries
 /// shipped with Git Bash. Returns `None` when the segment is already a
 /// Windows-style path or cannot be translated.
 fn translate_msys_segment(segment: &str, install_roots: &[PathBuf]) -> Option<String> {
@@ -283,7 +316,129 @@ fn is_windows_style_path(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+	use std::{cell::Cell, fs};
+
 	use super::*;
+
+	fn git_install_fixture() -> tempfile::TempDir {
+		let root = tempfile::tempdir().expect("Git installation fixture");
+		let cmd = root.path().join("cmd");
+		let bin = root.path().join("bin");
+		let usr_bin = root.path().join("usr").join("bin");
+		for path in [&cmd, &bin, &usr_bin] {
+			fs::create_dir_all(path).expect("Git path fixture");
+		}
+		fs::write(cmd.join("git.exe"), []).expect("cmd Git fixture");
+		fs::write(bin.join("git.exe"), []).expect("bin Git fixture");
+		fs::write(usr_bin.join("ls.exe"), []).expect("usr/bin fixture");
+		root
+	}
+
+	#[test]
+	fn git_discovery_queries_each_source_once_per_invocation_and_remains_fresh() {
+		let registry_calls = Cell::new(0);
+		let where_calls = Cell::new(0);
+
+		for _ in 0..2 {
+			let discovery = discover_git_with(
+				|| {
+					registry_calls.update(|v| v + 1);
+					None
+				},
+				|| {
+					where_calls.update(|v| v + 1);
+					None
+				},
+			);
+			assert!(discovery.install_roots.is_empty());
+			assert!(discovery.paths.is_empty());
+		}
+
+		assert_eq!(registry_calls.get(), 2);
+		assert_eq!(where_calls.get(), 2);
+	}
+
+	#[test]
+	fn git_discovery_preserves_provider_and_candidate_order() {
+		let registry_root = git_install_fixture();
+		let where_root = git_install_fixture();
+		let registry_path = registry_root.path().to_string_lossy().into_owned();
+		let where_path = where_root.path().to_string_lossy().into_owned();
+
+		let discovery = discover_git_with(|| Some(registry_path), || Some(where_path));
+
+		assert_eq!(discovery.install_roots, vec![
+			registry_root.path().to_path_buf(),
+			where_root.path().to_path_buf()
+		]);
+		assert_eq!(discovery.paths, vec![
+			registry_root
+				.path()
+				.join("cmd")
+				.to_string_lossy()
+				.into_owned(),
+			registry_root
+				.path()
+				.join("bin")
+				.to_string_lossy()
+				.into_owned(),
+			registry_root
+				.path()
+				.join("usr")
+				.join("bin")
+				.to_string_lossy()
+				.into_owned(),
+			where_root.path().join("cmd").to_string_lossy().into_owned(),
+			where_root.path().join("bin").to_string_lossy().into_owned(),
+			where_root
+				.path()
+				.join("usr")
+				.join("bin")
+				.to_string_lossy()
+				.into_owned(),
+		]);
+	}
+
+	#[test]
+	fn git_discovery_deduplicates_the_same_installation_from_both_sources() {
+		let root = git_install_fixture();
+		let registry_path = root.path().to_string_lossy().into_owned();
+		let where_path = registry_path.clone();
+
+		let discovery = discover_git_with(|| Some(registry_path), || Some(where_path));
+
+		assert_eq!(discovery.install_roots, vec![root.path().to_path_buf()]);
+		assert_eq!(discovery.paths, vec![
+			root.path().join("cmd").to_string_lossy().into_owned(),
+			root.path().join("bin").to_string_lossy().into_owned(),
+			root
+				.path()
+				.join("usr")
+				.join("bin")
+				.to_string_lossy()
+				.into_owned(),
+		]);
+	}
+
+	#[test]
+	fn git_discovery_keeps_valid_candidates_when_duplicate_root_spellings_differ() {
+		let root = git_install_fixture();
+		let clean_path = root.path().to_string_lossy().into_owned();
+		let decorated_path = format!("  \"{clean_path}\"  ");
+
+		let discovery = discover_git_with(|| Some(decorated_path), || Some(clean_path));
+
+		assert_eq!(discovery.paths, vec![
+			root.path().join("cmd").to_string_lossy().into_owned(),
+			root.path().join("bin").to_string_lossy().into_owned(),
+			root
+				.path()
+				.join("usr")
+				.join("bin")
+				.to_string_lossy()
+				.into_owned(),
+		]);
+	}
 
 	#[test]
 	fn drive_letter_segments_translate_to_windows_paths() {

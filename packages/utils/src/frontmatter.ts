@@ -2,8 +2,13 @@ import { YAML } from "bun";
 import { truncate } from "./format";
 import * as logger from "./logger";
 
-function stripHtmlComments(content: string): string {
-	return content.replace(/<!--[\s\S]*?-->/g, "");
+function stripLeadingHtmlComments(content: string): string {
+	const leading = /^(?:(?:\s*<!--[\s\S]*?-->)+)/.exec(content);
+	if (!leading) return content;
+	const rest = content.slice(leading[0].length);
+	// Only repair a comment that precedes frontmatter; leave a plain document
+	// (and every body) byte-identical so HTML comments inside it survive.
+	return /^\s*---/.test(rest) ? rest.replace(/^\s+/, "") : content;
 }
 
 /** Convert kebab-case to camelCase (e.g. "thinking-level" -> "thinkingLevel") */
@@ -12,15 +17,21 @@ function kebabToCamel(key: string): string {
 	return key.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 }
 
-/** Recursively normalize object keys from kebab-case to camelCase */
-function normalizeKeys<T>(obj: T): T {
+/**
+ * Recursively normalize object keys from kebab-case to camelCase — the
+ * representation convention for frontmatter consumed inside this codebase.
+ * Exported for loaders that parse with `rawKeys: true` to validate exact
+ * spec-defined keys, then normalize for storage.
+ */
+export function normalizeFrontmatterKeys<T>(obj: T): T {
 	if (obj === null || typeof obj !== "object") return obj;
 	if (Array.isArray(obj)) {
 		let changed = false;
+		// oxlint-disable-next-line unicorn/no-new-array -- length preallocation
 		const out: unknown[] = new Array(obj.length);
 		for (let i = 0; i < obj.length; i++) {
 			const v = obj[i];
-			const nv = normalizeKeys(v);
+			const nv = normalizeFrontmatterKeys(v);
 			out[i] = nv;
 			if (nv !== v) changed = true;
 		}
@@ -30,7 +41,7 @@ function normalizeKeys<T>(obj: T): T {
 	const result: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
 		const nk = key.includes("-") ? kebabToCamel(key) : key;
-		const nv = normalizeKeys(value);
+		const nv = normalizeFrontmatterKeys(value);
 		result[nk] = nv;
 		if (nk !== key || nv !== value) changed = true;
 	}
@@ -55,8 +66,8 @@ function quoteAmbiguousPlainScalars(metadata: string): string | undefined {
 	return changed ? lines.join("\n") : undefined;
 }
 
-function parseYamlRecord(metadata: string): Record<string, unknown> | null {
-	const loaded = YAML.parse(metadata.replaceAll("\t", "  "));
+function parseYamlRecord(metadata: string, repairTabs: boolean): Record<string, unknown> | null {
+	const loaded = YAML.parse(repairTabs ? metadata.replaceAll("\t", "  ") : metadata);
 	if (loaded === null || loaded === undefined) return null;
 	if (typeof loaded !== "object" || Array.isArray(loaded)) return null;
 	return loaded as Record<string, unknown>;
@@ -71,7 +82,7 @@ export class FrontmatterError extends Error {
 		this.name = "FrontmatterError";
 	}
 
-	toString(): string {
+	override toString(): string {
 		// Format the error with stack and detail, including the error message, stack, and source if present
 		const details: string[] = [this.message];
 		if (this.source !== undefined) {
@@ -97,6 +108,20 @@ export interface FrontmatterOptions {
 	normalize?: boolean;
 	/** Level of error handling */
 	level?: "off" | "warn" | "fatal";
+	/**
+	 * Attempt lenient recovery of near-miss input before failing: quote
+	 * ambiguous plain scalars, replace tabs with spaces, and strip leading HTML
+	 * comments ahead of the opening delimiter. Default `true`. Spec-conformant
+	 * loaders set `false` so malformed input is rejected instead of silently
+	 * repaired (CRLF newline normalization still applies).
+	 */
+	repair?: boolean;
+	/**
+	 * Preserve frontmatter keys verbatim instead of normalizing kebab-case to
+	 * camelCase. Default `false`. Strict spec loaders use this so a standard
+	 * key (e.g. `allowed-tools`) is never aliased with its camelCase form.
+	 */
+	rawKeys?: boolean;
 }
 
 /**
@@ -107,11 +132,23 @@ export function parseFrontmatter(
 	content: string,
 	options?: FrontmatterOptions,
 ): { frontmatter: Record<string, unknown>; body: string } {
-	const { location, source, fallback, normalize = true, level = "warn" } = options ?? {};
+	const {
+		location,
+		source,
+		fallback,
+		normalize = true,
+		level = "warn",
+		repair = true,
+		rawKeys = false,
+	} = options ?? {};
+	const finalizeKeys = (fm: Record<string, unknown>): Record<string, unknown> =>
+		rawKeys ? fm : normalizeFrontmatterKeys(fm);
 	const loc = location ?? source;
 	const frontmatter: Record<string, unknown> = { ...fallback };
 
-	const normalized = normalize ? stripHtmlComments(content.replace(/\r\n?/g, "\n")) : content;
+	const newlineNormalized = normalize ? content.replace(/\r\n?/g, "\n") : content;
+	const repairHtmlComments = normalize && repair;
+	const normalized = repairHtmlComments ? stripLeadingHtmlComments(newlineNormalized) : newlineNormalized;
 	if (!normalized.startsWith("---")) {
 		return { frontmatter, body: normalized };
 	}
@@ -121,18 +158,19 @@ export function parseFrontmatter(
 		return { frontmatter, body: normalized };
 	}
 
-	const metadata = normalized.slice(4, endIndex);
+	const rawMetadata = normalized.slice(4, endIndex);
+	const metadata = repairHtmlComments ? rawMetadata.replace(/<!--[\s\S]*?-->/g, "") : rawMetadata;
 	const body = normalized.slice(endIndex + 4).trim();
 
 	try {
-		const loaded = parseYamlRecord(metadata);
-		return { frontmatter: normalizeKeys({ ...frontmatter, ...loaded }), body };
+		const loaded = parseYamlRecord(metadata, repair);
+		return { frontmatter: finalizeKeys({ ...frontmatter, ...loaded }), body };
 	} catch (error) {
-		const quotedMetadata = quoteAmbiguousPlainScalars(metadata);
+		const quotedMetadata = repair ? quoteAmbiguousPlainScalars(metadata) : undefined;
 		if (quotedMetadata) {
 			try {
-				const loaded = parseYamlRecord(quotedMetadata);
-				return { frontmatter: normalizeKeys({ ...frontmatter, ...loaded }), body };
+				const loaded = parseYamlRecord(quotedMetadata, true);
+				return { frontmatter: finalizeKeys({ ...frontmatter, ...loaded }), body };
 			} catch {
 				// Fall through to the existing warning + simple key/value fallback.
 			}
@@ -170,6 +208,6 @@ export function parseFrontmatter(
 			frontmatter[match[1]] = value;
 		}
 
-		return { frontmatter: normalizeKeys(frontmatter) as Record<string, unknown>, body };
+		return { frontmatter: finalizeKeys(frontmatter), body };
 	}
 }

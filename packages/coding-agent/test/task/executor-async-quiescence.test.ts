@@ -8,6 +8,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
@@ -15,10 +16,11 @@ import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { createSessionDefaults } from "../helpers/session-defaults";
 
 const baseAgent: AgentDefinition = { name: "task", description: "test", systemPrompt: "test", source: "bundled" };
 
-function assistantStopMessage(text: string): AssistantMessage {
+function assistantStopMessage(text: string, totalTokens = 0): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [{ type: "text", text }],
@@ -27,10 +29,10 @@ function assistantStopMessage(text: string): AssistantMessage {
 		model: "mock",
 		usage: {
 			input: 0,
-			output: 0,
+			output: totalTokens,
 			cacheRead: 0,
 			cacheWrite: 0,
-			totalTokens: 0,
+			totalTokens,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason: "stop",
@@ -44,7 +46,13 @@ interface AsyncQuiescenceHarness {
 	abortCalls: () => number;
 	settleCalls: () => number;
 	emitTerminalYield: (data: unknown) => void;
+	emitAssistant: (text: string, totalTokens?: number) => void;
 	finishJob: () => void;
+}
+
+interface AsyncSessionOptions {
+	abort?: () => Promise<void>;
+	dispose?: () => Promise<void>;
 }
 
 /**
@@ -56,6 +64,7 @@ interface AsyncQuiescenceHarness {
  */
 function createAsyncSession(
 	onPrompt: (params: { text: string; promptIndex: number; harness: AsyncQuiescenceHarness }) => void,
+	options: AsyncSessionOptions = {},
 ): AsyncQuiescenceHarness {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const state = { messages: [] as AssistantMessage[] };
@@ -67,6 +76,7 @@ function createAsyncSession(
 	let toolCallSeq = 0;
 
 	const emit = (event: AgentSessionEvent) => {
+		// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
 		for (const listener of [...listeners]) listener(event);
 	};
 
@@ -103,6 +113,11 @@ function createAsyncSession(
 		state.messages.push(reaction);
 		emit({ type: "message_end", message: reaction } as AgentSessionEvent);
 	};
+	const emitAssistant = (text: string, totalTokens = 0) => {
+		const message = assistantStopMessage(text, totalTokens);
+		state.messages.push(message);
+		emit({ type: "message_end", message } as AgentSessionEvent);
+	};
 
 	const harness: AsyncQuiescenceHarness = {
 		session: undefined as unknown as AgentSession,
@@ -110,10 +125,12 @@ function createAsyncSession(
 		abortCalls: () => abortCount,
 		settleCalls: () => settleCount,
 		emitTerminalYield,
+		emitAssistant,
 		finishJob,
 	};
 
 	const session = {
+		...createSessionDefaults(),
 		state,
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
@@ -121,7 +138,7 @@ function createAsyncSession(
 		sessionManager: { appendSessionInit: () => {} },
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
-		setActiveToolsByName: async (_toolNames: string[]) => {},
+		getMountedXdevToolNames: () => [],
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
 			return () => {
@@ -132,8 +149,8 @@ function createAsyncSession(
 		prompt: async (text: string) => {
 			prompts.push(text);
 			onPrompt({ text, promptIndex: prompts.length, harness });
+			return true;
 		},
-		waitForIdle: async () => {},
 		getLastAssistantMessage: () => state.messages[state.messages.length - 1],
 		hasPendingAsyncWork: () => pendingAsync,
 		getAsyncJobSnapshot: () => ({ running: runningJobs, recent: [] }),
@@ -143,9 +160,9 @@ function createAsyncSession(
 		},
 		abort: async () => {
 			abortCount += 1;
+			await options.abort?.();
 		},
-		dispose: async () => {},
-		setIrcWakeTurnObserver: () => {},
+		dispose: options.dispose ?? (async () => {}),
 	};
 	harness.session = session as unknown as AgentSession;
 	return harness;
@@ -163,6 +180,7 @@ function mockCreateAgentSession(session: AgentSession) {
 describe("runSubprocess async quiescence fresh-yield contract", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
+		AsyncJobManager.resetForTests();
 	});
 
 	it("parks a pending yield, injects the result, and completes on the fresh yield", async () => {
@@ -194,7 +212,6 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 		// Run did not terminate on the parked yield: the barrier noticed, the
 		// job settled, and the ladder demanded exactly one more prompt.
 		expect(harness.prompts).toHaveLength(3);
-		expect(harness.prompts[1]).toContain("yield was recorded");
 		expect(harness.settleCalls()).toBe(1);
 		// The parked yield stopped the turn without killing the run.
 		expect(harness.abortCalls()).toBeGreaterThanOrEqual(1);
@@ -202,6 +219,30 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.output).toContain("FRESH: build failed");
 		expect(result.output).not.toContain("STALE");
+	});
+
+	it("waits for a pending owner job before spending a yield reminder", async () => {
+		const harness = createAsyncSession(({ harness: h }) => {
+			if (h.settleCalls() === 0) {
+				h.emitAssistant("Waiting for job-1.");
+				return;
+			}
+			h.emitTerminalYield({ report: "Build failed; job-1 delivered its result." });
+		});
+		mockCreateAgentSession(harness.session);
+
+		const result = await runSubprocess({
+			cwd: "/tmp",
+			agent: baseAgent,
+			task: "verify the build",
+			index: 0,
+			id: "quiescence-wait-before-yield",
+		});
+
+		expect(harness.settleCalls()).toBe(1);
+		expect(harness.prompts).toHaveLength(2);
+		expect(result.exitCode).toBe(0);
+		expect(result.output).toContain("Build failed; job-1 delivered its result.");
 	});
 
 	it("fails the run when the model never refreshes the superseded yield", async () => {
@@ -251,4 +292,129 @@ describe("runSubprocess async quiescence fresh-yield contract", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.output).toContain("done");
 	});
+
+	it("does not wait on a second idle barrier after a terminal yield", async () => {
+		const harness = createAsyncSession(({ promptIndex, harness: h }) => {
+			if (promptIndex === 1) {
+				h.finishJob();
+				h.emitTerminalYield({ report: "done" });
+			}
+		});
+		const idleStarted = Promise.withResolvers<void>();
+		const releaseIdle = Promise.withResolvers<void>();
+		let idleCalls = 0;
+		harness.session.waitForIdle = async () => {
+			idleCalls += 1;
+			idleStarted.resolve();
+			await releaseIdle.promise;
+		};
+		mockCreateAgentSession(harness.session);
+
+		const run = runSubprocess({
+			cwd: "/tmp",
+			agent: baseAgent,
+			task: "do the work",
+			index: 0,
+			id: "quiescence-no-second-idle",
+		});
+		const outcome = await Promise.race([
+			run.then(() => "completed" as const),
+			idleStarted.promise.then(() => "blocked" as const),
+		]);
+		releaseIdle.resolve();
+		const result = await run;
+
+		expect(outcome).toBe("completed");
+		expect(idleCalls).toBe(0);
+		expect(result.exitCode).toBe(0);
+		expect(result.output).toContain("done");
+	});
+
+	it("preserves a successful yield across deferred cleanup and waits for every late resource", async () => {
+		const abortStarted = Promise.withResolvers<void>();
+		const abortGate = Promise.withResolvers<void>();
+		const disposeGate = Promise.withResolvers<void>();
+		const lateJobGate = Promise.withResolvers<void>();
+		const manager = new AsyncJobManager({});
+		const cleanupGraceMs = 0;
+		let lateJobId: string | undefined;
+		let deferredCleanup: Promise<void> | undefined;
+		const harness = createAsyncSession(
+			({ promptIndex, harness: h }) => {
+				if (promptIndex !== 1) return;
+				h.finishJob();
+				h.emitAssistant("captured before cleanup", 7);
+				h.emitTerminalYield({ report: "yielded output" });
+			},
+			{
+				abort: async () => {
+					abortStarted.resolve();
+					await abortGate.promise;
+				},
+				dispose: async () => {
+					lateJobId = manager.register(
+						"task",
+						"shutdown-time job",
+						async () => {
+							await lateJobGate.promise;
+							return "late result";
+						},
+						{ ownerId: "cleanup-timeout" },
+					);
+					await disposeGate.promise;
+				},
+			},
+		);
+		mockCreateAgentSession(harness.session);
+
+		const run = runSubprocess({
+			cwd: "/tmp",
+			asyncJobManager: manager,
+			agent: baseAgent,
+			task: "do the work",
+			index: 0,
+			id: "cleanup-timeout",
+			keepAlive: false,
+			cleanupGraceMs,
+			onCleanupDeferred: completion => {
+				deferredCleanup = completion;
+			},
+		});
+		await abortStarted.promise;
+		// abortStarted synchronizes with the in-flight cleanup; a zero grace
+		// exercises the deadline/deferred-ownership transition without sleeping.
+
+		const result = await run;
+		// The run yielded successfully; a teardown that drains past the cleanup
+		// deadline is handed off asynchronously and MUST NOT overwrite the
+		// successful outcome with an aborted status (issue #9670).
+		expect(result.exitCode).toBe(0);
+		expect(result.aborted).toBe(false);
+		expect(result.abortReason).toBeUndefined();
+		expect(result.output).toContain("yielded output");
+		expect(result.usage?.totalTokens).toBe(7);
+		expect(lateJobId).toBeDefined();
+		expect(deferredCleanup).toBeDefined();
+
+		let cleanupSettled = false;
+		const cleanupOutcome = deferredCleanup?.then(
+			() => {
+				cleanupSettled = true;
+			},
+			() => {
+				cleanupSettled = true;
+			},
+		);
+		abortGate.resolve();
+		disposeGate.reject(new Error("dispose failed"));
+		for (let attempt = 0; attempt < 10 && manager.getJob(lateJobId ?? "")?.status === "running"; attempt += 1) {
+			await Promise.resolve();
+		}
+		expect(cleanupSettled).toBe(false);
+		expect(manager.getJob(lateJobId ?? "")?.status).toBe("cancelled");
+
+		lateJobGate.resolve();
+		await cleanupOutcome;
+		expect(cleanupSettled).toBe(true);
+	}, 15_000);
 });

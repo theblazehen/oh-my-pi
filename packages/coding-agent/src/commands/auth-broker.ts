@@ -1,6 +1,7 @@
 /**
  * `omp auth-broker` — manage the omp credential vault.
  */
+
 import { Args, Command, Flags, renderCommandHelp } from "@oh-my-pi/pi-utils/cli";
 import {
 	AUTH_BROKER_ACTIONS,
@@ -8,11 +9,11 @@ import {
 	type AuthBrokerCommandArgs,
 	runAuthBrokerCommand,
 } from "../cli/auth-broker-cli";
-import { initTheme } from "../modes/theme/theme";
+import { authBrokerHelp as commandHelp } from "../cli/command-help";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 
 export default class AuthBroker extends Command {
-	static description = "Manage the omp auth-broker (credential vault)";
-
+	static description = commandHelp.description;
 	static args = {
 		action: Args.string({
 			description: "Sub-command",
@@ -49,11 +50,15 @@ export default class AuthBroker extends Command {
 			description: "Also upload OAuth from local SQLite during migrate (default skips them)",
 		}),
 		"dry-run": Flags.boolean({ description: "Print actions without executing (import / login --via / migrate)" }),
+		"trust-proxy-headers": Flags.boolean({
+			description: "Trust forwarded peer IP headers from a reverse proxy (serve); off by default.",
+		}),
 	};
 
 	static examples = [
 		"# Boot the broker against the local SQLite store\n  omp auth-broker serve",
 		"# Boot on a non-default port\n  omp auth-broker serve --bind=127.0.0.1:9000",
+		"# Trust client IP headers from a trusted reverse proxy\n  omp auth-broker serve --trust-proxy-headers",
 		"# Print the bearer token\n  omp auth-broker token",
 		"# Rotate the bearer token\n  omp auth-broker token --regenerate",
 		"# List supported OAuth providers\n  omp auth-broker list",
@@ -91,6 +96,7 @@ export default class AuthBroker extends Command {
 				includeEnv: flags["include-env"],
 				includeOauth: flags["include-oauth"],
 				dryRun: flags["dry-run"],
+				trustProxyHeaders: flags["trust-proxy-headers"],
 			},
 		};
 		await initTheme();

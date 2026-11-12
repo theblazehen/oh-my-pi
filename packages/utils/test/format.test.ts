@@ -17,10 +17,17 @@ describe("formatDuration", () => {
 
 	it("formats sub-second, sub-minute, sub-hour, sub-day, and multi-day ranges", () => {
 		expect(formatDuration(500)).toBe("500ms");
+		expect(formatDuration(289.99999999999994)).toBe("289ms");
 		expect(formatDuration(1_500)).toBe("1.5s");
 		expect(formatDuration(90_000)).toBe("1m30s");
 		expect(formatDuration(3_600_000)).toBe("1h");
 		expect(formatDuration(3_660_000)).toBe("1h1m");
 		expect(formatDuration(2 * 86_400_000 + 3_600_000)).toBe("2d1h");
+	});
+
+	it("never prints a 60-second remainder at the minute boundary", () => {
+		expect(formatDuration(59_940)).toBe("59.9s");
+		expect(formatDuration(59_960)).toBe("1m");
+		expect(formatDuration(119_600)).toBe("1m59s");
 	});
 });

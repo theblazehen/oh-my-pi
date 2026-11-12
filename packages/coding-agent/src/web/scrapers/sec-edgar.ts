@@ -1,4 +1,4 @@
-import { tryParseJson } from "@oh-my-pi/pi-utils";
+import { tryParseJson, USER_AGENT } from "@oh-my-pi/pi-utils";
 import type { RenderResult, SpecialHandler } from "./types";
 import { buildResult, loadPage } from "./types";
 
@@ -85,8 +85,9 @@ function extractCik(url: URL): string | null {
 		return null;
 	}
 
-	// Pattern: Filing URLs like /Archives/edgar/data/XXXXXXXXXX/...
-	const archivesMatch = pathname.match(/\/Archives\/edgar\/data\/(\d+)/);
+	// Pattern: the company's filing directory /Archives/edgar/data/XXXXXXXXXX/. Deeper paths name a
+	// filing or one of its documents, which the generic reader fetches as requested.
+	const archivesMatch = pathname.match(/^\/Archives\/edgar\/data\/(\d+)\/?$/);
 	if (archivesMatch) {
 		return normalizeCik(archivesMatch[1]);
 	}
@@ -178,7 +179,7 @@ export const handleSecEdgar: SpecialHandler = async (
 			timeout,
 			signal,
 			headers: {
-				"User-Agent": "CodingAgent/1.0 (research tool)",
+				"User-Agent": USER_AGENT,
 				Accept: "application/json",
 			},
 		});

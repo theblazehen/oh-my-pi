@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import {
 	buildTransformedCodexRequestBody,
 	convertCodexResponsesMessages,
@@ -20,7 +21,6 @@ import {
 import type { AssistantMessage, Context, Model, ModelSpec, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { sanitizeOpenAIResponsesHistoryItemsForReplay } from "@oh-my-pi/pi-ai/utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { type } from "arktype";
 
 function model<TApi extends "openai-responses" | "openai-codex-responses">(
 	api: TApi,

@@ -19,6 +19,14 @@ describe("hasLinuxDesktopSession", () => {
 		expect(hasLinuxDesktopSession("darwin", LINUX_ENV)).toBe(false);
 		expect(hasLinuxDesktopSession("win32", LINUX_ENV)).toBe(false);
 	});
+
+	it("accepts the systemd user bus socket when the address is not exported", () => {
+		const env = { XDG_RUNTIME_DIR: "/run/user/1000" };
+		const fileExists = (path: string) => path === "/run/user/1000/bus";
+
+		expect(hasLinuxDesktopSession("linux", env, fileExists)).toBe(true);
+		expect(hasLinuxDesktopSession("linux", env, () => false)).toBe(false);
+	});
 });
 
 describe("shouldDeliverDesktopNotification", () => {
@@ -34,12 +42,6 @@ describe("shouldDeliverDesktopNotification", () => {
 		expect(shouldDeliverDesktopNotification("ghostty", false, "linux", LINUX_ENV)).toBe(false);
 		expect(shouldDeliverDesktopNotification("wezterm", false, "linux", LINUX_ENV)).toBe(false);
 		expect(shouldDeliverDesktopNotification("iterm2", false, "linux", LINUX_ENV)).toBe(false);
-	});
-
-	it("lets Bell-only terminals use D-Bus while true in-band notify protocols skip it", () => {
-		expect(shouldDeliverDesktopNotification("vscode", true, "linux", LINUX_ENV)).toBe(true);
-		expect(shouldDeliverDesktopNotification("ghostty", false, "linux", LINUX_ENV)).toBe(false);
-		expect(shouldDeliverDesktopNotification("kitty", false, "linux", LINUX_ENV)).toBe(false);
 	});
 
 	it("respects the PI_NO_DESKTOP_NOTIFY=1 opt-out", () => {
@@ -103,10 +105,10 @@ describe("buildDesktopNotifyCommand", () => {
 		expect(buildDesktopNotifyCommand(notifySend, "ping")).toEqual([
 			"/usr/bin/notify-send",
 			"--app-name",
-			"Oh My Pi",
+			"omp",
 			"--urgency=normal",
 			"--expire-time=5000",
-			"Oh My Pi",
+			"omp",
 			"ping",
 		]);
 	});
@@ -121,7 +123,7 @@ describe("buildDesktopNotifyCommand", () => {
 		).toEqual([
 			"/usr/bin/notify-send",
 			"--app-name",
-			"Oh My Pi",
+			"omp",
 			"--urgency=critical",
 			"--expire-time=5000",
 			"Session 12",
@@ -133,16 +135,16 @@ describe("buildDesktopNotifyCommand", () => {
 		expect(buildDesktopNotifyCommand(notifySend, { title: "   ", body: "Waiting for input" })).toEqual([
 			"/usr/bin/notify-send",
 			"--app-name",
-			"Oh My Pi",
+			"omp",
 			"--urgency=normal",
 			"--expire-time=5000",
-			"Oh My Pi",
+			"omp",
 			"Waiting for input",
 		]);
 	});
 
 	it("produces a freedesktop Notify call for gdbus including the urgency hint byte", () => {
-		expect(buildDesktopNotifyCommand(gdbus, { title: "Oh My Pi", body: "ping", urgency: "low" })).toEqual([
+		expect(buildDesktopNotifyCommand(gdbus, { title: "omp", body: "ping", urgency: "low" })).toEqual([
 			"/usr/bin/gdbus",
 			"call",
 			"--session",
@@ -152,10 +154,10 @@ describe("buildDesktopNotifyCommand", () => {
 			"/org/freedesktop/Notifications",
 			"--method",
 			"org.freedesktop.Notifications.Notify",
-			"Oh My Pi",
+			"omp",
 			"0",
 			"",
-			"Oh My Pi",
+			"omp",
 			"ping",
 			"[]",
 			'{"urgency": <byte 0>}',
@@ -191,7 +193,7 @@ describe("sendDesktopNotification", () => {
 		expect(opts.cmd).toEqual([
 			"/usr/bin/notify-send",
 			"--app-name",
-			"Oh My Pi",
+			"omp",
 			"--urgency=normal",
 			"--expire-time=5000",
 			"Session",

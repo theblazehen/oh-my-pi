@@ -1,10 +1,16 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
-import { createMockModel, type MockResponseSource, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import {
+	createMockModel,
+	type MockHandler,
+	type MockResponseSource,
+	registerMockApi,
+} from "@oh-my-pi/pi-ai/providers/mock";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { $ } from "bun";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
@@ -20,11 +26,13 @@ import { SessionManager } from "../../src/session/session-manager";
 
 const MOCK_SOURCE_ID = "security-coordinator-test";
 let temporaryRoot = "";
+let registryRoot = "";
 let repositoryRoot = "";
 let stateRoot = "";
 let credentialStore: AuthCredentialStore | null = null;
 let authStorage: AuthStorage;
 let settings: Settings;
+let modelRegistry: ModelRegistry;
 let credentialId = 0;
 
 const gitAdapter: SecurityGitAdapter = {
@@ -37,15 +45,13 @@ const gitAdapter: SecurityGitAdapter = {
 	untracked: async () => [],
 };
 
-beforeEach(async () => {
-	temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-security-coordinator-"));
-	repositoryRoot = path.join(temporaryRoot, "repo");
-	stateRoot = path.join(temporaryRoot, "state");
-	await fs.mkdir(path.join(repositoryRoot, "src"), { recursive: true });
-	await Bun.write(path.join(repositoryRoot, "src", "app.ts"), "export const app = true;\n");
-	credentialStore = await SqliteAuthCredentialStore.open(path.join(temporaryRoot, "agent.db"));
+// Credentials and the bundled-model view are immutable fixtures. Keep their SQLite
+// store and registry for the suite; repository/store state remains fresh per test.
+beforeAll(async () => {
+	registryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-security-coordinator-auth-"));
+	credentialStore = await SqliteAuthCredentialStore.open(path.join(registryRoot, "agent.db"));
 	authStorage = new AuthStorage(credentialStore);
-	await authStorage.set("openai-codex", {
+	await authStorage.credentials.set("openai-codex", {
 		type: "oauth",
 		access: "fixture-access-token",
 		refresh: "fixture-refresh-token",
@@ -55,9 +61,18 @@ beforeEach(async () => {
 		orgId: "workspace-fixture",
 		orgName: "pro",
 	});
-	const account = authStorage.listOAuthAccounts("openai-codex")[0];
+	const account = authStorage.oauth.accounts("openai-codex")[0];
 	if (!account) throw new Error("expected fixture OAuth account");
 	credentialId = account.credentialId;
+	modelRegistry = new ModelRegistry(authStorage, path.join(registryRoot, "models.yml"));
+});
+
+beforeEach(async () => {
+	temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-security-coordinator-"));
+	repositoryRoot = path.join(temporaryRoot, "repo");
+	stateRoot = path.join(temporaryRoot, "state");
+	await fs.mkdir(path.join(repositoryRoot, "src"), { recursive: true });
+	await Bun.write(path.join(repositoryRoot, "src", "app.ts"), "export const app = true;\n");
 	settings = Settings.isolated({ "security.enabled": true, "compaction.enabled": false });
 	registerMockApi(MOCK_SOURCE_ID);
 });
@@ -66,22 +81,45 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	unregisterCustomApis(MOCK_SOURCE_ID);
 	settings.cancelPendingSaves();
+	await fs.rm(temporaryRoot, { recursive: true, force: true });
+});
+
+afterAll(async () => {
 	credentialStore?.close();
 	credentialStore = null;
-	await fs.rm(temporaryRoot, { recursive: true, force: true });
+	await fs.rm(registryRoot, { recursive: true, force: true });
 });
 
 function storeFactory(): Promise<SecurityStore> {
 	return SecurityStore.open(repositoryRoot, { stateRoot });
 }
 
-function coordinatorWithMockSession(responses: MockResponseSource) {
+const FIXTURE_PUBLICATION = {
+	findings: [
+		{
+			rule_id: "fixture.command-injection",
+			title: "Untrusted command reaches a shell",
+			summary: "A fixture value is interpolated into a shell command.",
+			severity: "high",
+			confidence: "high",
+			category: "command-injection",
+			locations: [{ path: "src/app.ts", start_line: 1, role: "sink" }],
+			evidence: [{ label: "shell sink", explanation: "Fixture evidence" }],
+			remediation: "Use an argument-vector API.",
+			validation: "validated",
+		},
+	],
+	coverage: { completeness: "complete" },
+	report: "# Fixture security report\n\nOne validated finding.\n",
+};
+
+function coordinatorWithMockSession(responses: MockResponseSource, handler?: MockHandler) {
 	const mock = createMockModel({
 		id: "security-mock",
 		provider: "openai-codex",
 		responses,
+		handler,
 	});
-	const modelRegistry = new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml"));
 	const coordinator = new SecurityCoordinator(
 		{
 			cwd: repositoryRoot,
@@ -98,34 +136,26 @@ function coordinatorWithMockSession(responses: MockResponseSource) {
 }
 
 describe("native security coordinator", () => {
+	test("preflight accepts provider-owned Bedrock auth without an OAuth row", async () => {
+		const bedrockModel = getBundledModel("amazon-bedrock", "us.anthropic.claude-opus-4-8");
+		if (!bedrockModel) throw new Error("Expected bundled Bedrock model");
+		const coordinator = new SecurityCoordinator(
+			{
+				cwd: repositoryRoot,
+				settings,
+				authStorage,
+				modelRegistry,
+				activeModel: bedrockModel,
+			},
+			{ openStore: storeFactory, gitAdapter },
+		);
+		const plan = await coordinator.preflight();
+		expect(plan.account).toEqual({ provider: "amazon-bedrock", api: "bedrock-converse-stream" });
+	});
+
 	test("scripted mock model publishes a canonical completed scan and restartable session", async () => {
 		const { coordinator, mock } = coordinatorWithMockSession([
-			{
-				content: [
-					{
-						type: "toolCall",
-						name: "security_publish",
-						arguments: {
-							findings: [
-								{
-									rule_id: "fixture.command-injection",
-									title: "Untrusted command reaches a shell",
-									summary: "A fixture value is interpolated into a shell command.",
-									severity: "high",
-									confidence: "high",
-									category: "command-injection",
-									locations: [{ path: "src/app.ts", start_line: 1, role: "sink" }],
-									evidence: [{ label: "shell sink", explanation: "Fixture evidence" }],
-									remediation: "Use an argument-vector API.",
-									validation: "validated",
-								},
-							],
-							coverage: { completeness: "complete" },
-							report: "# Fixture security report\n\nOne validated finding.\n",
-						},
-					},
-				],
-			},
+			{ content: [{ type: "toolCall", name: "security_publish", arguments: FIXTURE_PUBLICATION }] },
 			{ content: ["Security publication completed."] },
 		]);
 		const createdPlan = await coordinator.preflight({ credentialId, model: mock.model });
@@ -144,6 +174,51 @@ describe("native security coordinator", () => {
 		expect(reopened.getSessionId()).toBeTruthy();
 	});
 
+	test("waits for background security-reviewer workers before ending the scan", async () => {
+		// Coordinator delegates, ends its turn while the worker runs as a background
+		// job, and publishes only once the worker's result is delivered back.
+		const { coordinator, mock } = coordinatorWithMockSession([], context => {
+			if (context.tools?.some(tool => tool.name === "yield")) {
+				return {
+					delayMs: 200,
+					content: [
+						{
+							type: "toolCall",
+							name: "yield",
+							arguments: { type: "result", data: { coverage_summary: "Reviewed src/app.ts" } },
+						},
+					],
+				};
+			}
+			const toolResults = context.messages.filter(message => message.role === "toolResult");
+			if (toolResults.some(message => message.toolName === "security_publish")) {
+				return { content: ["Security publication completed."] };
+			}
+			if (!toolResults.some(message => message.toolName === "task")) {
+				return {
+					content: [
+						{
+							type: "toolCall",
+							name: "task",
+							arguments: {
+								context: "Review the fixture repository.",
+								tasks: [{ task: "Review src/app.ts", solutionSpace: "open" }],
+							},
+						},
+					],
+				};
+			}
+			if (context.messages.at(-1)?.role === "toolResult") {
+				return { content: ["Waiting for the security-reviewer result."] };
+			}
+			return { content: [{ type: "toolCall", name: "security_publish", arguments: FIXTURE_PUBLICATION }] };
+		});
+		const plan = await coordinator.preflight({ credentialId, model: mock.model });
+		const started = await coordinator.start({ planId: plan.id });
+		const terminal = await coordinator.wait(started.operationId);
+		expect(terminal).toMatchObject({ phase: "completed", findingCount: 1 });
+	});
+
 	test("records a terminal failure when initial scan persistence fails", async () => {
 		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
 		const store = await storeFactory();
@@ -152,7 +227,7 @@ describe("native security coordinator", () => {
 				cwd: repositoryRoot,
 				settings,
 				authStorage,
-				modelRegistry: new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml")),
+				modelRegistry,
 				activeModel: mock.model,
 			},
 			{
@@ -176,7 +251,6 @@ describe("native security coordinator", () => {
 	test("cancellation before session launch has no inference side effects", async () => {
 		let sessionCreations = 0;
 		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
-		const modelRegistry = new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml"));
 		const coordinator = new SecurityCoordinator(
 			{
 				cwd: repositoryRoot,
@@ -211,7 +285,6 @@ describe("native security coordinator", () => {
 		const promptFinished = Promise.withResolvers<void>();
 		let abortCalls = 0;
 		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
-		const modelRegistry = new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml"));
 		const coordinator = new SecurityCoordinator(
 			{
 				cwd: repositoryRoot,
@@ -231,6 +304,8 @@ describe("native security coordinator", () => {
 						throw new Error("review interrupted");
 					},
 					waitForIdle: async () => undefined,
+					hasPendingAsyncWork: () => false,
+					settleAsyncWork: async () => undefined,
 					abort: async () => {
 						abortCalls++;
 						promptFinished.resolve();
@@ -254,6 +329,9 @@ describe("native security coordinator", () => {
 		await $`git init --initial-branch=main`.cwd(repositoryRoot).quiet();
 		await $`git config user.name Fixture`.cwd(repositoryRoot).quiet();
 		await $`git config user.email fixture@example.invalid`.cwd(repositoryRoot).quiet();
+		// The checked-out head is compared byte-for-byte; Git for Windows'
+		// system `core.autocrlf=true` would check it out as CRLF.
+		await $`git config core.autocrlf false`.cwd(repositoryRoot).quiet();
 		await $`git add src/app.ts`.cwd(repositoryRoot).quiet();
 		await $`git commit -m base`.cwd(repositoryRoot).quiet();
 		const baseRevision = (await $`git rev-parse HEAD`.cwd(repositoryRoot).text()).trim();
@@ -270,7 +348,7 @@ describe("native security coordinator", () => {
 				cwd: repositoryRoot,
 				settings,
 				authStorage,
-				modelRegistry: new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml")),
+				modelRegistry,
 				activeModel: mock.model,
 			},
 			{
@@ -285,6 +363,8 @@ describe("native security coordinator", () => {
 							return true;
 						},
 						waitForIdle: async () => undefined,
+						hasPendingAsyncWork: () => false,
+						settleAsyncWork: async () => undefined,
 						abort: async () => undefined,
 						dispose: async () => undefined,
 					};
@@ -352,7 +432,7 @@ describe("native security coordinator", () => {
 				cwd: repositoryRoot,
 				settings,
 				authStorage,
-				modelRegistry: new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml")),
+				modelRegistry,
 				activeModel: mock.model,
 			},
 			{ openStore: storeFactory, gitAdapter },

@@ -7,33 +7,32 @@
 import {
 	type AnthropicAuthConfig,
 	type AnthropicSystemBlock,
+	type Api,
 	type ApiKey,
 	type AuthStorage,
 	buildAnthropicAuthConfig,
 	buildAnthropicSearchHeaders,
-	buildAnthropicSystemBlocks,
 	buildAnthropicUrl,
 	type FetchImpl,
+	type Model,
 	resolveAnthropicMetadataUserId,
 	stripClaudeToolPrefix,
 	withAuth,
-	wrapFetchForCch,
 } from "@oh-my-pi/pi-ai";
+import { buildAnthropicSystemBlocks, wrapFetchForCch } from "@oh-my-pi/pi-ai/providers/anthropic";
+import {
+	anthropicApiVersionAcceptsSamplingParams,
+	resolveAnthropicApiVersion,
+} from "@oh-my-pi/pi-catalog/compat/anthropic";
 import { $env } from "@oh-my-pi/pi-utils";
-import type {
-	AnthropicApiResponse,
-	AnthropicCitation,
-	SearchCitation,
-	SearchResponse,
-	SearchSource,
-} from "../../../web/search/types";
+import type { AnthropicApiResponse, AnthropicCitation } from "../../../web/search/types";
+import type { SearchCitation, SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../../../web/search/types";
 import { formatQuery, parseSearchQuery, type QuerySyntax, type StructuredQuery } from "../query";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
-const DEFAULT_MODEL = "claude-haiku-4-5";
 const DEFAULT_MAX_TOKENS = 4096;
 const WEB_SEARCH_TOOL_NAME = "web_search";
 const WEB_SEARCH_TOOL_TYPE = "web_search_20250305";
@@ -90,52 +89,33 @@ function planQuery(rawQuery: string, parsed: StructuredQuery): AnthropicQueryPla
 	};
 }
 
-export interface AnthropicSearchParams {
-	query: string;
-	system_prompt?: string;
-	num_results?: number;
-	max_tokens?: number;
-	temperature?: number;
-	signal?: AbortSignal;
-	fetch?: FetchImpl;
-}
-
-/**
- * Gets the model to use for web search from environment or default.
- * @returns Model identifier string
- */
-function getModel(): string {
-	return $env.ANTHROPIC_SEARCH_MODEL ?? DEFAULT_MODEL;
-}
-
 /**
  * Builds system instruction blocks for the Anthropic API request.
  * @param auth - Authentication configuration
- * @param model - Model identifier (affects whether Claude Code instruction is included)
+ * @param injectClaudeCodeInstruction - Catalog policy for OAuth system fingerprinting
  * @param systemPrompt - Optional system prompt for guiding response style
  * @returns Array of system blocks for the API request
  */
 function buildSystemBlocks(
 	auth: AnthropicAuthConfig,
-	model: string,
+	injectClaudeCodeInstruction: boolean,
 	systemPrompt?: string,
 ): AnthropicSystemBlock[] | undefined {
 	// Match the streaming path: the CC billing header + system instruction are
 	// an OAuth fingerprint and must not be claimed on API-key requests.
-	const includeClaudeCode = auth.isOAuth && !model.startsWith("claude-3-5-haiku");
+	const includeClaudeCode = auth.isOAuth && injectClaudeCodeInstruction;
 	const extraInstructions = auth.isOAuth ? ["You are a helpful AI assistant with web search capabilities."] : [];
 
 	return buildAnthropicSystemBlocks(systemPrompt ? [systemPrompt] : undefined, {
 		includeClaudeCodeInstruction: includeClaudeCode,
 		extraInstructions,
-		cacheControl: { type: "ephemeral" },
 	});
 }
 
 /**
  * Calls the Anthropic API with web search tool enabled.
  * @param auth - Authentication configuration (API key or OAuth)
- * @param model - Model identifier to use
+ * @param model - Selected catalog model
  * @param plan - Query text plus native domain filters derived from parsed directives
  * @param metadataUserId - Optional Anthropic Messages metadata.user_id (already shaped for OAuth)
  * @param systemPrompt - Optional system prompt for guiding response style
@@ -144,7 +124,8 @@ function buildSystemBlocks(
  */
 async function callSearch(
 	auth: AnthropicAuthConfig,
-	model: string,
+	configuredHeaders: Record<string, string> | undefined,
+	model: Model<Api>,
 	plan: AnthropicQueryPlan,
 	metadataUserId?: string,
 	systemPrompt?: string,
@@ -152,14 +133,25 @@ async function callSearch(
 	temperature?: number,
 	signal?: AbortSignal,
 	fetchImpl: FetchImpl = fetch,
+	timeoutMs?: number,
 ): Promise<AnthropicApiResponse> {
 	const url = buildAnthropicUrl(auth);
-	const headers = buildAnthropicSearchHeaders(auth);
+	const headers = buildAnthropicSearchHeaders(auth, {
+		modelHeaders: configuredHeaders,
+		allowAnthropicHeaderOverrides:
+			model.compat !== undefined &&
+			"allowAnthropicHeaderOverrides" in model.compat &&
+			model.compat.allowAnthropicHeaderOverrides === true,
+	});
 
-	const systemBlocks = buildSystemBlocks(auth, model, systemPrompt);
+	const injectClaudeCodeInstruction =
+		model.compat === undefined ||
+		!("injectClaudeCodeInstruction" in model.compat) ||
+		model.compat.injectClaudeCodeInstruction !== false;
+	const systemBlocks = buildSystemBlocks(auth, injectClaudeCodeInstruction, systemPrompt);
 
 	const body: Record<string, unknown> = {
-		model,
+		model: model.id,
 		max_tokens: maxTokens ?? DEFAULT_MAX_TOKENS,
 		messages: [{ role: "user", content: plan.query }],
 		tools: [
@@ -176,7 +168,15 @@ async function callSearch(
 		body.metadata = { user_id: metadataUserId };
 	}
 
-	if (temperature !== undefined) {
+	// Sampling restrictions come from the resolved catalog policy; API version
+	// 2026-10-21 also rejects sampling parameters for otherwise compatible models.
+	if (
+		temperature !== undefined &&
+		(model.compat === undefined ||
+			!("supportsSamplingParams" in model.compat) ||
+			model.compat.supportsSamplingParams !== false) &&
+		anthropicApiVersionAcceptsSamplingParams(resolveAnthropicApiVersion(auth.baseUrl))
+	) {
 		body.temperature = temperature;
 	}
 
@@ -191,7 +191,7 @@ async function callSearch(
 		method: "POST",
 		headers,
 		body: JSON.stringify(body),
-		signal: withHardTimeout(signal),
+		signal: withHardTimeout(signal, timeoutMs),
 	});
 
 	if (!response.ok) {
@@ -250,12 +250,16 @@ function parsePageAge(pageAge: string | null | undefined): number | undefined {
  * @returns Normalized response with answer, sources, citations, and usage
  */
 function parseResponse(response: AnthropicApiResponse): SearchResponse {
-	const answerParts: string[] = [];
+	// Citations split continuous text into adjacent text blocks; insert a paragraph
+	// break only when non-empty text resumes after a non-text block.
+	let answer = "";
+	let previousWasText = false;
 	const searchQueries: string[] = [];
 	const sources: SearchSource[] = [];
 	const citations: SearchCitation[] = [];
 
 	for (const block of response.content) {
+		if (block.type !== "text") previousWasText = false;
 		if (
 			block.type === "server_tool_use" &&
 			block.name &&
@@ -280,7 +284,9 @@ function parseResponse(response: AnthropicApiResponse): SearchResponse {
 			}
 		} else if (block.type === "text" && block.text) {
 			// Synthesized answer with citations
-			answerParts.push(block.text);
+			if (answer && !previousWasText) answer += "\n\n";
+			answer += block.text;
+			previousWasText = true;
 			if (block.citations) {
 				for (const c of block.citations as AnthropicCitation[]) {
 					citations.push({
@@ -295,7 +301,7 @@ function parseResponse(response: AnthropicApiResponse): SearchResponse {
 
 	return {
 		provider: "anthropic",
-		answer: answerParts.join("\n\n") || undefined,
+		answer: answer || undefined,
 		sources,
 		citations: citations.length > 0 ? citations : undefined,
 		searchQueries: searchQueries.length > 0 ? searchQueries : undefined,
@@ -315,36 +321,23 @@ function parseResponse(response: AnthropicApiResponse): SearchResponse {
  * @returns Search response with synthesized answer, sources, and citations
  * @throws {Error} If no Anthropic credentials are configured
  */
-export async function searchAnthropic(
-	params: SearchParams | AnthropicSearchParams,
-	_legacyStorage?: unknown,
-): Promise<SearchResponse> {
-	const searchApiKey = $env.ANTHROPIC_SEARCH_API_KEY;
-	const searchBaseUrl = $env.ANTHROPIC_SEARCH_BASE_URL;
-	const keyOrResolver: ApiKey | undefined = searchApiKey
-		? searchApiKey
-		: "authStorage" in params
-			? params.authStorage.resolver("anthropic", { sessionId: params.sessionId })
-			: undefined;
-
-	if (!keyOrResolver) {
-		throw new Error(
-			"No Anthropic credentials found. Set ANTHROPIC_SEARCH_API_KEY or ANTHROPIC_API_KEY, or configure Anthropic OAuth.",
-		);
-	}
-
-	const model = getModel();
-	const systemPrompt = "authStorage" in params ? params.systemPrompt : params.system_prompt;
-	const maxTokens = "authStorage" in params ? params.maxOutputTokens : params.max_tokens;
-	const callerSessionId = "authStorage" in params ? params.sessionId : undefined;
-	const accountId =
-		"authStorage" in params ? params.authStorage.getOAuthAccountId("anthropic", params.sessionId) : undefined;
-	const parsed = ("parsedQuery" in params ? params.parsedQuery : undefined) ?? parseSearchQuery(params.query);
+export async function searchAnthropic(params: SearchParams): Promise<SearchResponse> {
+	const registryResolver = params.modelRegistry.resolver(params.model, params.sessionId);
+	const searchApiKey = params.model.provider === "anthropic" ? $env.ANTHROPIC_SEARCH_API_KEY : undefined;
+	const keyOrResolver: ApiKey = searchApiKey
+		? async context => {
+				if (context.error === undefined && !context.lastChance) return searchApiKey;
+				return (await registryResolver(context)) ?? searchApiKey;
+			}
+		: registryResolver;
+	const accountId = params.authStorage.oauth.identity(params.model.provider, params.sessionId)?.accountId;
+	const parsed = params.parsedQuery ?? parseSearchQuery(params.query);
 	const plan = planQuery(params.query, parsed);
 	const response = await withAuth(
 		keyOrResolver,
-		key => {
-			const auth = buildAnthropicAuthConfig(key, searchBaseUrl);
+		async key => {
+			const auth = buildAnthropicAuthConfig(key, params.model.baseUrl, { isOAuth: params.model.isOAuth });
+			const configuredHeaders = await params.modelRegistry.resolveModelHeaders(params.model, params.signal);
 			// Mirror the main Messages path: OAuth requests need a Claude-Code-shaped
 			// metadata.user_id (`{session_id, account_uuid?, device_id}`) so the
 			// CC billing header + system fingerprint installed by
@@ -352,33 +345,34 @@ export async function searchAnthropic(
 			// attribution Anthropic and enterprise gateways expect. API-key tokens
 			// forward the raw session id verbatim.
 			const metadataUserId = resolveAnthropicMetadataUserId(
-				callerSessionId,
+				params.sessionId,
 				auth.isOAuth,
-				callerSessionId,
+				params.sessionId,
 				accountId,
 			);
 			return callSearch(
 				auth,
-				model,
+				configuredHeaders,
+				params.model,
 				plan,
 				metadataUserId,
-				systemPrompt,
-				maxTokens,
+				params.systemPrompt,
+				params.maxOutputTokens,
 				params.temperature,
 				params.signal,
 				params.fetch,
+				params.timeoutMs,
 			);
 		},
 		{
 			signal: params.signal,
-			missingKeyMessage:
-				"No Anthropic credentials found. Set ANTHROPIC_SEARCH_API_KEY or ANTHROPIC_API_KEY, or configure Anthropic OAuth.",
+			missingKeyMessage: `Anthropic credentials not found for selected provider "${params.model.provider}".`,
 		},
 	);
 
 	const result = parseResponse(response);
 
-	const numResults = "authStorage" in params ? (params.numSearchResults ?? params.limit) : params.num_results;
+	const numResults = params.numSearchResults ?? params.limit;
 	if (numResults && result.sources.length > numResults) {
 		result.sources = result.sources.slice(0, numResults);
 	}
@@ -391,8 +385,14 @@ export class AnthropicProvider extends SearchProvider {
 	readonly id = "anthropic";
 	readonly label = "Anthropic";
 
-	isAvailable(authStorage: AuthStorage): Promise<boolean> | boolean {
-		return Boolean($env.ANTHROPIC_SEARCH_API_KEY) || authStorage.hasAuth("anthropic");
+	isAvailable(authStorage: AuthStorage, model?: Model<Api>): Promise<boolean> | boolean {
+		if (model) {
+			return (
+				authStorage.keys.source(model.provider) !== undefined ||
+				(model.provider === "anthropic" && Boolean($env.ANTHROPIC_SEARCH_API_KEY))
+			);
+		}
+		return Boolean($env.ANTHROPIC_SEARCH_API_KEY) || authStorage.keys.source("anthropic") !== undefined;
 	}
 
 	search(params: SearchParams): Promise<SearchResponse> {

@@ -35,15 +35,41 @@ export function parseSlashCommand(text: string): ParsedSlashCommand | null {
 	};
 }
 
-/** Mark a command as fully consumed in the ACP shape. */
-export function commandConsumed(): { consumed: true } {
-	return { consumed: true };
+/**
+ * Mark a command as fully consumed in the ACP shape.
+ *
+ * Pass `agentInvoked` when the command scheduled a real agent turn whose events
+ * will stream after it returns (e.g. `/retry`). RPC hosts use that marker to
+ * tell local-only commands apart from work that starts a turn, so reporting
+ * `agentInvoked: false` there would have them finalize the request while the
+ * agent is still running.
+ *
+ * Pass `failed` when the command consumed the input but did not accomplish
+ * what was asked (usage error, unknown server, refused operation): interactive
+ * hosts ignore it, print mode turns it into a nonzero exit code so `omp -p`
+ * automation does not treat a failed builtin as success.
+ */
+export function commandConsumed(options?: { agentInvoked?: boolean; failed?: boolean }): {
+	consumed: true;
+	agentInvoked?: boolean;
+	failed?: boolean;
+} {
+	return {
+		consumed: true,
+		...(options?.agentInvoked ? { agentInvoked: true } : {}),
+		...(options?.failed ? { failed: true } : {}),
+	};
 }
 
-/** Emit a usage/error message and consume the command. */
+/**
+ * Emit a usage/error message and consume the command as failed: the command
+ * consumed the input but did not accomplish what was asked. Interactive hosts
+ * ignore the marker; print mode turns it into a nonzero exit code so `omp -p`
+ * automation does not treat a failed builtin as success.
+ */
 export async function usage(text: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
 	await runtime.output(text);
-	return commandConsumed();
+	return commandConsumed({ failed: true });
 }
 
 /** Split `<verb> <rest>` on the first whitespace; lowercases `verb`. */

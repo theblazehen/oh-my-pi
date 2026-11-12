@@ -8,7 +8,7 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
-	const { z } = pi.zod;
+	const z = pi.zod;
 
 	// Command entrypoint for reload.
 	// Treat reload as terminal for this handler.
@@ -28,7 +28,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Reload extensions, skills, prompts, and themes",
 		parameters: z.object({}),
 		async execute() {
-			pi.sendUserMessage("/reload-runtime", { deliverAs: "followUp" });
+			pi.sendUserMessage("/reload-runtime", { deliverAs: "followUp", attribution: "agent" });
 			return {
 				content: [{ type: "text", text: "Queued /reload-runtime as a follow-up command." }],
 				details: {},

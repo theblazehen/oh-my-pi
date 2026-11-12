@@ -1,5 +1,4 @@
-import { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
+import type { Database } from "bun:sqlite";
 import {
 	copyFileSync,
 	existsSync,
@@ -90,8 +89,8 @@ function timestampForBackup(now = new Date()): string {
 	return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
 }
 
-function sha256Hex16(bytes: NodeJS.ArrayBufferView): string {
-	return createHash("sha256").update(bytes).digest("hex").slice(0, 16);
+function sha256Hex16(bytes: Uint8Array): string {
+	return Bun.SHA256.hash(bytes, "hex").slice(0, 16);
 }
 
 function nextUniqueToken(): string {
@@ -188,7 +187,7 @@ function isSqliteFile(bytes: Uint8Array): boolean {
 function writeGzippedSqlDump(sql: string, tempPath: string): void {
 	let db: Database | null = null;
 	try {
-		db = new Database(tempPath, { create: true, readwrite: true, strict: true });
+		db = openDatabase(tempPath, { pragmas: false });
 		db.exec(sql);
 	} finally {
 		closeQuietly(db);

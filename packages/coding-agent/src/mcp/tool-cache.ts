@@ -3,8 +3,8 @@
  *
  * Stores tool definitions per server in agent.db for fast startup.
  */
-import { isRecord, logger } from "@oh-my-pi/pi-utils";
-import type { AgentStorage } from "../session/agent-storage";
+import { isRecord, logger, stableStringifyJson } from "@oh-my-pi/pi-utils";
+import type { AgentStorageApi } from "../session/agent-storage";
 import type { MCPServerConfig, MCPToolDefinition } from "./types";
 
 const CACHE_VERSION = 1;
@@ -17,37 +17,8 @@ type MCPToolCachePayload = {
 	tools: MCPToolDefinition[];
 };
 
-function stableClone(value: unknown): unknown {
-	if (Array.isArray(value)) {
-		return value.map(item => stableClone(item));
-	}
-	if (isRecord(value)) {
-		const sorted: Record<string, unknown> = {};
-		for (const key of Object.keys(value).sort()) {
-			sorted[key] = stableClone(value[key]);
-		}
-		return sorted;
-	}
-	return value;
-}
-
-function stableStringify(value: unknown): string {
-	return JSON.stringify(stableClone(value));
-}
-
-function toHex(buffer: ArrayBuffer): string {
-	const bytes = new Uint8Array(buffer);
-	let output = "";
-	for (const byte of bytes) {
-		output += byte.toString(16).padStart(2, "0");
-	}
-	return output;
-}
-
-async function hashConfig(config: MCPServerConfig): Promise<string> {
-	const stable = stableStringify(config);
-	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(stable));
-	return toHex(digest);
+function hashConfig(config: MCPServerConfig): string {
+	return Bun.SHA256.hash(stableStringifyJson(config), "hex");
 }
 
 function cacheKey(serverName: string): string {
@@ -55,7 +26,7 @@ function cacheKey(serverName: string): string {
 }
 
 export class MCPToolCache {
-	constructor(private storage: AgentStorage) {}
+	constructor(private storage: AgentStorageApi) {}
 
 	async get(serverName: string, config: MCPServerConfig): Promise<MCPToolDefinition[] | null> {
 		const key = cacheKey(serverName);
@@ -77,7 +48,7 @@ export class MCPToolCache {
 
 		let currentHash: string;
 		try {
-			currentHash = await hashConfig(config);
+			currentHash = hashConfig(config);
 		} catch (error) {
 			logger.warn("MCP tool cache hash failed", { serverName, error: String(error) });
 			return null;
@@ -91,7 +62,7 @@ export class MCPToolCache {
 	async set(serverName: string, config: MCPServerConfig, tools: MCPToolDefinition[]): Promise<void> {
 		let configHash: string;
 		try {
-			configHash = await hashConfig(config);
+			configHash = hashConfig(config);
 		} catch (error) {
 			logger.warn("MCP tool cache hash failed", { serverName, error: String(error) });
 			return;

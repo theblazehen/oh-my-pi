@@ -10,7 +10,7 @@
 import { type ApiKey, type AuthStorage, type FetchImpl, withAuth } from "@oh-my-pi/pi-ai";
 import { $env } from "@oh-my-pi/pi-utils";
 
-import type { SearchResponse, SearchSource } from "../../../web/search/types";
+import type { SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../../../web/search/types";
 import { formatQuery, parseSearchQuery, type QuerySyntax, type StructuredQuery } from "../query";
 import { clampNumResults, dateToAgeSeconds } from "../utils";
@@ -42,6 +42,7 @@ export interface KimiSearchParams {
 	num_results?: number;
 	include_content?: boolean;
 	signal?: AbortSignal;
+	timeoutMs?: number;
 	authStorage: AuthStorage;
 	sessionId?: string;
 	fetch?: FetchImpl;
@@ -93,8 +94,8 @@ async function resolveKey(
 	const envKey = asTrimmed($env.MOONSHOT_SEARCH_API_KEY) ?? asTrimmed($env.KIMI_SEARCH_API_KEY);
 	if (envKey) return envKey;
 
-	const stored = await authStorage.getApiKey("kimi-code", sessionId, { signal });
-	if (stored) return authStorage.resolver("kimi-code", { sessionId });
+	const stored = await authStorage.keys.get("kimi-code", sessionId, { signal });
+	if (stored) return authStorage.keys.resolver("kimi-code", { sessionId });
 	return undefined;
 }
 
@@ -105,6 +106,7 @@ async function callKimiSearch(
 		limit: number;
 		includeContent: boolean;
 		signal?: AbortSignal;
+		timeoutMs?: number;
 		fetch?: FetchImpl;
 	},
 ): Promise<{ response: KimiSearchResponse; requestId?: string }> {
@@ -122,7 +124,7 @@ async function callKimiSearch(
 			enable_page_crawling: params.includeContent,
 			timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
 		}),
-		signal: withHardTimeout(params.signal),
+		signal: withHardTimeout(params.signal, params.timeoutMs),
 	});
 
 	if (!response.ok) {
@@ -161,6 +163,7 @@ export async function searchKimi(params: KimiSearchParams): Promise<SearchRespon
 				limit,
 				includeContent: params.include_content ?? false,
 				signal: params.signal,
+				timeoutMs: params.timeoutMs,
 				fetch: params.fetch,
 			}),
 		{ signal: params.signal },
@@ -197,7 +200,7 @@ export class KimiProvider extends SearchProvider {
 		return (
 			!!asTrimmed($env.MOONSHOT_SEARCH_API_KEY) ||
 			!!asTrimmed($env.KIMI_SEARCH_API_KEY) ||
-			authStorage.hasAuth("kimi-code")
+			authStorage.keys.source("kimi-code") !== undefined
 		);
 	}
 
@@ -209,6 +212,7 @@ export class KimiProvider extends SearchProvider {
 			parsedQuery: params.parsedQuery,
 			num_results: params.numSearchResults ?? params.limit,
 			signal: params.signal,
+			timeoutMs: params.timeoutMs,
 			authStorage: params.authStorage,
 			sessionId: params.sessionId,
 			fetch: fetchImpl,

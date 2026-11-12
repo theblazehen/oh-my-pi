@@ -1,18 +1,26 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import * as themeModule from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import * as themeModule from "@oh-my-pi/pi-tui/theme";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
+import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { createTools, type Tool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { githubToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/gh-renderer";
-import { ToolError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
-import { WriteTool, writeToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/write";
+import { requiresApproval, resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
+import { Text } from "@oh-my-pi/pi-tui";
+import { githubToolRenderer } from "@oh-my-pi/pi-tui/tools/github";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
+import { type WriteRenderContext, writeToolRenderer } from "@oh-my-pi/pi-tui/tools/write";
+import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import {
+	dispatchXdevTool,
 	listXdevTools,
 	resolveMountedXdevTool,
+	resolveXdevTool,
 	XDEV_DOCS_PER_DEVICE_CAP,
 	XDEV_DOCS_TOTAL_BUDGET,
 	XDEV_EXTERNAL_DESCRIPTION_CAP,
@@ -22,7 +30,17 @@ import {
 	xdevEntries,
 } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
+
+import { cfgToolsXdev, cfgToolsXdevDocs } from "@oh-my-pi/pi-coding-agent/tools/settings";
+
+/**
+ * Mirrors `ToolExecutionComponent#buildRenderContext`: the host state's own
+ * resolver (mounted devices plus active top-level tools, the same predicate
+ * dispatch uses) is what the write renderer renders through.
+ */
+function mountedRenderContext(xdev: XdevState): WriteRenderContext {
+	return { resolveXdevMounted: xdev.resolve };
+}
 
 // xdev mounting is default-on: discoverable tools like ast_edit unmount into
 // xd://, and a plain `write xd://ast_edit` dispatches them. These guard the
@@ -41,13 +59,19 @@ function xdevSession(cwd: string, overrides: Partial<ToolSession> = {}): ToolSes
 	};
 }
 
-function createTestXdevState(tools: Tool[], builtInNames: Iterable<string> = tools.map(tool => tool.name)): XdevState {
-	return {
+function createTestXdevState(
+	tools: Tool[],
+	builtInNames: Iterable<string> = tools.map(tool => tool.name),
+	isActive: (name: string) => boolean = () => false,
+): XdevState {
+	const state: XdevState = {
 		tools: new Map(tools.map(tool => [tool.name, tool])),
 		mountedNames: new Set(tools.map(tool => tool.name)),
 		builtInNames: new Set(builtInNames),
-		isActive: () => false,
+		isActive,
+		resolve: name => resolveXdevTool(state, name),
 	};
+	return state;
 }
 
 describe("read and write route xd:// device URLs", () => {
@@ -87,7 +111,7 @@ describe("read and write route xd:// device URLs", () => {
 			const approval = write!.approval;
 			expect(typeof approval).toBe("function");
 			if (typeof approval === "function") {
-				expect(approval({ path: "xd://ast_edit", content })).toBe("write");
+				expect(approval({ path: "xd://ast_edit", content })).toEqual({ tier: "write", policyKey: "ast_edit" });
 			}
 
 			// Execute dispatches through the xdev registry to the mounted ast_edit,
@@ -96,6 +120,9 @@ describe("read and write route xd:// device URLs", () => {
 			expect(previewResult.isError).toBeUndefined();
 			expect(previewResult.details?.xdev?.tool).toBe("ast_edit");
 			expect(previewResult.details?.xdev?.mode).toBe("execute");
+			// The dispatch records the wrapped tool's approval tier so prewalk can
+			// tell a mutation from a read-only device call (issue #7312).
+			expect(previewResult.details?.xdev?.tier).toBe("write");
 			const previewText = previewResult.content.find(entry => entry.type === "text")?.text ?? "";
 			expect(previewText).toContain("modernWrap");
 
@@ -107,6 +134,108 @@ describe("read and write route xd:// device URLs", () => {
 		} finally {
 			await removeWithRetries(tempDir);
 		}
+	});
+
+	it("records a read tier on the dispatch of a read-only device", async () => {
+		const readDevice: AgentTool = {
+			name: "peek",
+			label: "Peek",
+			description: "Read-only device",
+			parameters: type({ q: "string" }),
+			approval: () => "read",
+			async execute() {
+				return { content: [{ type: "text", text: "peeked" }] };
+			},
+		};
+		const xdev = createTestXdevState([readDevice]);
+		const write = new WriteTool(xdevSession(process.cwd(), { xdev }));
+
+		const result = await write.execute("write-xdev-read", { path: "xd://peek", content: JSON.stringify({ q: "x" }) });
+		expect(result.isError).toBeUndefined();
+		expect(result.details?.xdev).toMatchObject({ tool: "peek", mode: "execute", tier: "read" });
+	});
+
+	it("resolves device dispatches against the device's user policy, falling back to write's", async () => {
+		// Like the pi-knowledge plugin in #7923: the mounted device declares no
+		// approval, so it defaults to exec tier — but a device-scoped user policy
+		// must still gate, and without one the dispatch must honor `write`'s policy.
+		const device: AgentTool = {
+			name: "knowledge_search",
+			label: "Knowledge Search",
+			description: "Read-only device without a tier declaration",
+			parameters: type({ q: "string" }),
+			async execute() {
+				return { content: [{ type: "text", text: "ok" }] };
+			},
+		};
+		const xdev = createTestXdevState([device]);
+		const write = new WriteTool(xdevSession(process.cwd(), { xdev }));
+		const args = { path: "xd://knowledge_search", content: JSON.stringify({ q: "x" }) };
+
+		const approval = write.approval;
+		expect(typeof approval).toBe("function");
+		if (typeof approval !== "function") throw new Error("expected a function approval");
+		// The gate reports the mounted tool's (default exec) tier and keys user
+		// policy on the device name.
+		expect(approval(args)).toEqual({ tier: "exec", policyKey: "knowledge_search" });
+
+		// No device policy → falls back to the write tool's own policy.
+		expect(resolveApproval(write, args, "always-ask", { write: "prompt" }).policy).toBe("prompt");
+		expect(resolveApproval(write, args, "always-ask", { write: "allow" }).policy).toBe("allow");
+
+		// Device-scoped allow lets the dispatch through even while the blanket
+		// write policy stays prompt — the exact scenario from #7923.
+		const allowed = resolveApproval(write, args, "always-ask", { write: "prompt", knowledge_search: "allow" });
+		expect(allowed).toMatchObject({ policy: "allow", source: "user", policyKey: "knowledge_search" });
+
+		// Device-scoped deny blocks the dispatch and names the device in the refusal.
+		expect(() => requiresApproval(write, args, "always-ask", { knowledge_search: "deny" })).toThrow(
+			'remove "tools.approval.knowledge_search: deny"',
+		);
+
+		// Device-scoped prompt forces a prompt for this device.
+		expect(resolveApproval(write, args, "always-ask", { knowledge_search: "prompt" }).policy).toBe("prompt");
+
+		// An unrelated device's policy does not leak into this dispatch.
+		expect(resolveApproval(write, args, "always-ask", { other_device: "deny" }).policy).toBe("prompt");
+	});
+
+	it("records the effective tier reported after an execution decorator rewrites device args", async () => {
+		let executedQuery: string | undefined;
+		const device: AgentTool = {
+			name: "peek",
+			label: "Peek",
+			description: "Argument-dependent device",
+			parameters: type({ q: "string" }),
+			approval: args => (args && typeof args === "object" && "q" in args && args.q === "mutate" ? "write" : "read"),
+			async execute(_id, args) {
+				if (!args || typeof args !== "object" || !("q" in args) || typeof args.q !== "string") {
+					throw new Error("Expected a string query");
+				}
+				executedQuery = args.q;
+				return { content: [{ type: "text", text: "done" }] };
+			},
+		};
+		const xdev = createTestXdevState([device]);
+		xdev.decorateExecution = canonical => ({
+			...canonical,
+			async execute(id, _args, signal, onUpdate, context) {
+				const revised = { q: "mutate" };
+				context?.xdevTierResolved?.("write");
+				return canonical.execute(id, revised as never, signal, onUpdate, context);
+			},
+		});
+		const write = new WriteTool(xdevSession(process.cwd(), { xdev }));
+
+		const result = await write.execute(
+			"write-xdev-revised",
+			{ path: "xd://peek", content: JSON.stringify({ q: "inspect" }) },
+			undefined,
+			undefined,
+			{} as never,
+		);
+		expect(executedQuery).toBe("mutate");
+		expect(result.details?.xdev?.tier).toBe("write");
 	});
 
 	it("rejects near-miss xd addresses before filesystem fallback", async () => {
@@ -131,8 +260,8 @@ describe("read and write route xd:// device URLs", () => {
 			expect(escaped.isError).toBeUndefined();
 			expect(await Bun.file(path.join(tempDir, "xd/web_search")).text()).toBe("intentional file");
 
-			// conflict:// has no router handler but is a documented write scheme —
-			// the guard must let it reach the conflict resolver, not reject it.
+			// conflict:// is a registered write scheme — the guard must let it
+			// reach the conflict handler, not reject it.
 			await expect(write!.execute("write-conflict", { path: "conflict://1", content: "x" })).rejects.toThrow(
 				"Conflict #1 not found",
 			);
@@ -154,21 +283,27 @@ describe("read and write route xd:// device URLs", () => {
 			if (typeof approval !== "function") throw new Error("expected a function approval");
 			const tier = (path: string, content: string) => approval({ path, content });
 
-			// ast_edit on a filesystem path → write; on internal URLs only → read.
+			// ast_edit on a filesystem path → write; on read-tier sandbox URLs only → read.
 			const astFsPath = JSON.stringify({
 				ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
 				paths: [filePath],
 			});
 			const astInternalPath = JSON.stringify({
 				ops: [{ pat: "a", out: "b" }],
-				paths: ["artifact://abc"],
+				paths: ["local://notes.ts"],
 			});
-			expect(tier("xd://ast_edit", astFsPath)).toBe("write");
-			expect(tier("xd://ast_edit", astInternalPath)).toBe("read");
+			expect(tier("xd://ast_edit", astFsPath)).toEqual({ tier: "write", policyKey: "ast_edit" });
+			expect(tier("xd://ast_edit", astInternalPath)).toEqual({ tier: "read", policyKey: "ast_edit" });
 
 			// debug: inspection action → read; a real launch → exec (control).
-			expect(tier("xd://debug", JSON.stringify({ action: "sessions" }))).toBe("read");
-			expect(tier("xd://debug", JSON.stringify({ action: "launch", program: "./app" }))).toBe("exec");
+			expect(tier("xd://debug", JSON.stringify({ action: "sessions" }))).toEqual({
+				tier: "read",
+				policyKey: "debug",
+			});
+			expect(tier("xd://debug", JSON.stringify({ action: "launch", program: "./app" }))).toEqual({
+				tier: "exec",
+				policyKey: "debug",
+			});
 
 			// Fail closed: malformed JSON, non-object or schema-invalid payloads,
 			// missing content, and unknown devices all stay exec so the gate never
@@ -176,7 +311,11 @@ describe("read and write route xd:// device URLs", () => {
 			expect(tier("xd://ast_edit", "{ not json")).toBe("exec");
 			expect(tier("xd://ast_edit", "[1,2,3]")).toBe("exec");
 			expect(tier("xd://ast_edit", '"a string"')).toBe("exec");
-			expect(tier("xd://ast_edit", JSON.stringify({ paths: [null] }))).toBe("exec");
+			// ast_edit's own approval fails a malformed path entry closed at exec.
+			expect(tier("xd://ast_edit", JSON.stringify({ paths: [null] }))).toEqual({
+				tier: "exec",
+				policyKey: "ast_edit",
+			});
 			expect(approval({ path: "xd://ast_edit" })).toBe("exec");
 			expect(tier("xd://no_such_device", "{}")).toBe("exec");
 		} finally {
@@ -184,7 +323,7 @@ describe("read and write route xd:// device URLs", () => {
 		}
 	});
 
-	it("renderCall withholds a partial xd:// URL, then delegates once settled", async () => {
+	it("renderCall withholds a partial xd:// URL, then queues until execution starts", async () => {
 		await themeModule.initTheme();
 		const uiTheme = (await themeModule.getThemeByName("dark")) ?? (await themeModule.getThemeByName("light"));
 		if (!uiTheme) throw new Error("expected an initialized theme");
@@ -199,10 +338,56 @@ describe("read and write route xd:// device URLs", () => {
 		// never sees a half-typed "xd://ast_" frame.
 		expect(writeToolRenderer.renderCall({ path: "xd://ast_e" }, options, uiTheme)).toBeUndefined();
 
-		// Path settled + content streaming: delegate to the mounted tool's renderer
+		// Path settled + content streaming, but the write has not executed yet:
+		// show a queued card instead of the inner tool's in-flight renderer.
+		const queued = writeToolRenderer.renderCall({ path: "xd://ast_edit", content }, options, uiTheme);
+		expect(queued).toBeDefined();
+		const queuedText = Bun.stripANSI(queued!.render(80).join("\n"));
+		expect(queuedText).toContain("queued");
+		expect(queuedText).toContain("ast_edit");
+
+		// Args can be final at message_end while an earlier exclusive write still
+		// runs — keep the queued card until this call's tool_execution_start.
+		const argsCompleteOnly = writeToolRenderer.renderCall(
+			{ path: "xd://ast_edit", content },
+			{ ...options, argsComplete: true },
+			uiTheme,
+		);
+		expect(Bun.stripANSI(argsCompleteOnly!.render(80).join("\n"))).toContain("queued");
+
+		// Same payload after tool_execution_start: delegate to the inner renderer
 		// instead of throwing ReferenceError inside a generic Write frame.
-		const rendered = writeToolRenderer.renderCall({ path: "xd://ast_edit", content }, options, uiTheme);
-		expect(rendered).toBeDefined();
+		const executing = writeToolRenderer.renderCall(
+			{ path: "xd://ast_edit", content },
+			{ ...options, argsComplete: true, executionStarted: true },
+			uiTheme,
+		);
+		expect(executing).toBeDefined();
+		const executingText = Bun.stripANSI(executing!.render(80).join("\n"));
+		expect(executingText).not.toContain("queued");
+	});
+
+	it("renders streamed MCP device writes as queued until execution starts", async () => {
+		await themeModule.initTheme();
+		const uiTheme = (await themeModule.getThemeByName("dark")) ?? (await themeModule.getThemeByName("light"));
+		if (!uiTheme) throw new Error("expected an initialized theme");
+		const content = JSON.stringify({
+			action: "grep_all",
+			pattern: "Broken",
+			scope: "game.StarterPlayer",
+			studio: "AED Content Development",
+			maxResults: 20,
+		});
+		const queued = writeToolRenderer.renderCall(
+			{ path: "xd://mcp__ecoport_search", content },
+			{ expanded: false, isPartial: true },
+			uiTheme,
+		);
+		expect(queued).toBeDefined();
+		const queuedText = Bun.stripANSI(queued!.render(120).join("\n"));
+		expect(queuedText).toContain("queued");
+		expect(queuedText).toContain("ecoport/search");
+		expect(queuedText).toContain("Broken");
 	});
 
 	it("renders device execution errors as the mounted tool instead of write", async () => {
@@ -237,7 +422,7 @@ describe("read and write route xd:// device URLs", () => {
 			{
 				expanded: false,
 				isPartial: false,
-				renderContext: { resolveXdevMounted: name => resolveMountedXdevTool(xdev, name) },
+				renderContext: mountedRenderContext(xdev),
 			},
 			uiTheme,
 			{ path: "xd://github", content },
@@ -275,7 +460,7 @@ describe("read and write route xd:// device URLs", () => {
 			{
 				expanded: false,
 				isPartial: false,
-				renderContext: { resolveXdevMounted: name => resolveMountedXdevTool(xdev, name) },
+				renderContext: mountedRenderContext(xdev),
 			},
 			uiTheme,
 			{ path: "xd://weather", content },
@@ -290,6 +475,51 @@ describe("read and write route xd:// device URLs", () => {
 		expect(rendered).toContain("Tokyo: 22°C");
 		expect(backgroundPrefix).not.toBe("");
 		expect(lines.some(line => line.includes(backgroundPrefix))).toBe(true);
+	});
+
+	it("renders a dispatched top-level tool through its own renderer while it stays unmounted", async () => {
+		await themeModule.initTheme();
+		const uiTheme = (await themeModule.getThemeByName("dark")) ?? (await themeModule.getThemeByName("light"));
+		if (!uiTheme) throw new Error("expected an initialized theme");
+
+		// Inferred (like the neighboring device fixtures): `mergeCallAndResult` and
+		// the render hooks live on the coding-agent `Tool`, not on `AgentTool`.
+		const topLevelDevice = {
+			name: "pwsh",
+			label: "PowerShell 7",
+			description: "fixture",
+			parameters: type({ command: "string" }),
+			mergeCallAndResult: true,
+			renderCall: () => new Text("TOP-LEVEL-CALL", 0, 0),
+			renderResult: () => new Text("TOP-LEVEL-RESULT", 0, 0),
+			async execute() {
+				return { content: [{ type: "text" as const, text: "42" }] };
+			},
+		};
+		// An `essential` tool stays top-level: never mounted, but dispatchable.
+		const xdev = createTestXdevState([topLevelDevice], [], name => name === topLevelDevice.name);
+		xdev.mountedNames.clear();
+		const write = new WriteTool(xdevSession(process.cwd(), { xdev }));
+		const content = JSON.stringify({ command: "Write-Output 42" });
+		const result = await write.execute("write-xdev-top-level", { path: "xd://pwsh", content });
+		expect(result.isError ?? false).toBe(false);
+		expect(result.details?.xdev).toMatchObject({ tool: "pwsh", mode: "execute" });
+
+		const component = writeToolRenderer.renderResult(
+			result,
+			{
+				expanded: false,
+				isPartial: false,
+				renderContext: mountedRenderContext(xdev),
+			},
+			uiTheme,
+			{ path: "xd://pwsh", content },
+		);
+		const rendered = Bun.stripANSI(component.render(80).join("\n"));
+
+		expect(rendered).toContain("TOP-LEVEL-RESULT");
+		// The generic device card would have inlined the args instead.
+		expect(rendered).not.toContain('command="Write-Output 42"');
 	});
 
 	// Dynamic device summaries are third-party text inlined into the system
@@ -353,7 +583,7 @@ describe("read and write route xd:// device URLs", () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-docs-"));
 		try {
 			const session = xdevSession(tempDir);
-			expect(session.settings.get("tools.xdevDocs")).toBe("builtins");
+			expect(cfgToolsXdevDocs.get(session.settings)).toBe("catalog");
 			await createTools(session);
 			const xdev = session.xdev;
 			if (!xdev) throw new Error("expected xdev state");
@@ -384,7 +614,7 @@ describe("read and write route xd:// device URLs", () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-external-"));
 		try {
 			const session = xdevSession(tempDir);
-			expect(session.settings.get("tools.xdevDocs")).toBe("builtins");
+			expect(cfgToolsXdevDocs.get(session.settings)).toBe("catalog");
 			await createTools(session);
 			const xdev = session.xdev;
 			if (!xdev) throw new Error("expected xdev state");
@@ -454,7 +684,7 @@ describe("web_search stays top-level under xdev", () => {
 		try {
 			const session = xdevSession(tempDir);
 			// Default config: tools.xdev is on.
-			expect(session.settings.get("tools.xdev")).toBe(true);
+			expect(cfgToolsXdev.get(session.settings)).toBe(true);
 			const tools = await createTools(session);
 			// Regression for #5973: models call web_search directly, so it must
 			// remain a top-level function and never mount behind the xd:// device.
@@ -526,5 +756,391 @@ describe("xd:// and top-level calls share the canonical tool map", () => {
 		} finally {
 			await removeWithRetries(tempDir);
 		}
+	});
+
+	it("resolves bare and case-insensitive xd:// direct device names (#10342)", () => {
+		const githubDevice = {
+			name: "github",
+			label: "GitHub",
+			description: "fixture",
+			parameters: type({ op: "string" }),
+			async execute() {
+				return { content: [{ type: "text" as const, text: "ok" }] };
+			},
+		};
+		const xdev = createTestXdevState([githubDevice]);
+
+		// Direct calls accept the same case-insensitive xd scheme as read/write
+		// URL dispatch while preserving the canonical device name.
+		expect(resolveMountedXdevTool(xdev, "github")).toBe(githubDevice);
+		expect(resolveMountedXdevTool(xdev, "xd://github")).toBe(githubDevice);
+		expect(resolveMountedXdevTool(xdev, "XD://github")).toBe(githubDevice);
+		expect(resolveMountedXdevTool(xdev, "Xd://github")).toBe(githubDevice);
+		// A genuinely unmounted name still misses, prefixed or not.
+		expect(resolveMountedXdevTool(xdev, "xd://no_such_tool")).toBeUndefined();
+	});
+});
+
+describe("device-only write transport for explicit lists omitting write", () => {
+	it("grants a device-only write so xd:// state is allocated, and rejects filesystem writes", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-device-only-"));
+		try {
+			const session = xdevSession(tempDir);
+			const tools = await createTools(session, ["read", "grep"]);
+
+			// The device-only grant: write joins the set purely as the xd://
+			// execution transport, and xd:// state is allocated for mounting.
+			const write = tools.find(entry => entry.name === "write");
+			expect(write).toBeDefined();
+			expect(session.deviceOnlyWrite).toBe(true);
+			expect(session.xdev).toBeDefined();
+
+			// Filesystem writes are rejected before any handler or guard runs.
+			await expect(
+				write!.execute("write-device-only-fs", { path: path.join(tempDir, "nope.txt"), content: "x" }),
+			).rejects.toThrow("Other filesystem paths are refused");
+
+			// Device dispatch still flows: an unknown device reaches the router and
+			// fails there, not at the transport guard.
+			const unknown = await write!.execute("write-device-only-unknown", {
+				path: "xd://no_such_tool",
+				content: "{}",
+			});
+			expect(unknown.isError).toBe(true);
+			expect(unknown.details?.xdev?.tool).toBe("no_such_tool");
+			expect(unknown.content.find(entry => entry.type === "text")?.text).toContain(
+				"No such tool: xd://no_such_tool",
+			);
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	// #14308: a read-only subagent is handed `write` purely as the xd:// device
+	// transport (createTools grants it when the explicit list has `read` but not
+	// `write`), so a parent briefing that names a file path lands on this
+	// rejection. The message is correct but not actionable: it never names the
+	// channel that does work. `yield` arrives through the real tool plan
+	// (`requireYieldTool`), and the assertions read it back through the
+	// session's own `isToolActive` predicate and the returned tool list — the
+	// exact signals write.ts reads.
+	it("names the yield fallback for a device-only session that can yield (#14308)", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-yield-fallback-"));
+		try {
+			const activeNames = new Set(["read", "grep"]);
+			const session = xdevSession(tempDir, {
+				requireYieldTool: true,
+				isToolActive: name => activeNames.has(name),
+				setActiveToolNames: names => {
+					for (const name of names) activeNames.add(name);
+				},
+			});
+			const tools = await createTools(session, ["read", "grep"]);
+
+			// The device-only grant still happens: the fallback is additive.
+			const write = tools.find(entry => entry.name === "write");
+			expect(write).toBeDefined();
+			expect(session.deviceOnlyWrite).toBe(true);
+			expect(tools.some(entry => entry.name === "yield")).toBe(true);
+			expect(session.isToolActive?.("yield")).toBe(true);
+
+			await expect(
+				write!.execute("write-device-only-yield", { path: path.join(tempDir, "findings.md"), content: "x" }),
+			).rejects.toThrow("return the content in `yield` instead");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	// With both a local:// root and `yield`, the refusal used to name two
+	// competing deliverables ("give that path" immediately followed by "return
+	// the content in `yield` instead"), which reads as "do not hand over the
+	// path". The path and `yield` must be one route.
+	it("offers the local:// path through yield rather than against it", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-yield-local-"));
+		try {
+			const activeNames = new Set(["read", "grep"]);
+			const getSessionId = () => "device-only-yield-local";
+			const session = xdevSession(tempDir, {
+				requireYieldTool: true,
+				getSessionId,
+				getArtifactsDir: () => path.join(tempDir, "artifacts"),
+				isToolActive: name => activeNames.has(name),
+				setActiveToolNames: names => {
+					for (const name of names) activeNames.add(name);
+				},
+			});
+			const tools = await createTools(session, ["read", "grep"]);
+			const write = tools.find(entry => entry.name === "write");
+			expect(write).toBeDefined();
+			expect(session.isToolActive?.("yield")).toBe(true);
+
+			const err = await write!
+				.execute("write-device-only-yield-local", { path: path.join(tempDir, "findings.md"), content: "x" })
+				.then(
+					() => null,
+					(caught: unknown) => caught,
+				);
+			const message = err instanceof Error ? err.message : String(err);
+			expect(message).toContain(shortenPath(path.join(tempDir, "artifacts", "local", "<name>")));
+			expect(message).toContain("`yield`");
+			expect(message).not.toContain("instead");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	// The refusal reaches transcripts and exports, so the hint carries the
+	// home-relative form, not the user's home directory.
+	it("names the local:// root home-relative when it sits under the home directory", async () => {
+		const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-home-"));
+		const homedirSpy = spyOn(os, "homedir").mockReturnValue(homeDir);
+		const tempDir = path.join(homeDir, "work");
+		try {
+			await fs.mkdir(tempDir, { recursive: true });
+			const session = xdevSession(tempDir, {
+				getSessionId: () => "device-only-home",
+				getArtifactsDir: () => path.join(homeDir, ".omp", "artifacts"),
+			});
+			const tools = await createTools(session, ["read"]);
+			const write = tools.find(entry => entry.name === "write");
+			expect(write).toBeDefined();
+
+			const err = await write!
+				.execute("write-device-only-home", { path: path.join(tempDir, "nope.txt"), content: "x" })
+				.then(
+					() => null,
+					(caught: unknown) => caught,
+				);
+			const message = err instanceof Error ? err.message : String(err);
+			expect(message).toContain("~/.omp/artifacts/local/<name>");
+			expect(message).not.toContain(homeDir);
+		} finally {
+			homedirSpy.mockRestore();
+			await removeWithRetries(homeDir);
+		}
+	});
+
+	// Negative branch. Without `yield` the suggestion would not work, so the
+	// rejection must still refuse the filesystem write without naming a
+	// channel the session does not have.
+	it("leaves the device-only rejection unchanged when yield is unavailable (#14308)", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-no-yield-"));
+		try {
+			const activeNames = new Set(["read", "grep"]);
+			const session = xdevSession(tempDir, {
+				isToolActive: name => activeNames.has(name),
+				setActiveToolNames: names => {
+					for (const name of names) activeNames.add(name);
+				},
+			});
+			const tools = await createTools(session, ["read", "grep"]);
+
+			const write = tools.find(entry => entry.name === "write");
+			expect(write).toBeDefined();
+			expect(session.deviceOnlyWrite).toBe(true);
+			expect(session.isToolActive?.("yield")).toBe(false);
+
+			const err = await write!
+				.execute("write-device-only-no-yield", { path: path.join(tempDir, "findings.md"), content: "x" })
+				.then(
+					() => null,
+					(caught: unknown) => caught,
+				);
+			expect(err).toBeInstanceOf(Error);
+			const message = err instanceof Error ? err.message : String(err);
+			expect(message).toContain("xd://");
+			expect(message).not.toContain("yield");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("previews the full-write description without relaxing device-only execution", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-pending-full-"));
+		try {
+			const session = xdevSession(tempDir);
+			const tools = await createTools(session, ["read"]);
+			const write = tools.find(entry => entry.name === "write");
+			expect(write).toBeDefined();
+
+			const restrictedDescription = write!.description;
+			session.pendingFullWriteDescription = true;
+			expect(write!.description).not.toBe(restrictedDescription);
+			await expect(
+				write!.execute("write-pending-full-fs", { path: path.join(tempDir, "nope.txt"), content: "x" }),
+			).rejects.toThrow("Other filesystem paths are refused");
+			expect(await Bun.file(path.join(tempDir, "nope.txt")).exists()).toBe(false);
+
+			session.pendingFullWriteDescription = undefined;
+			expect(write!.description).toBe(restrictedDescription);
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("allows the local sandbox outside plan mode while other targets stay rejected", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-local-sandbox-"));
+		try {
+			// A subagent pins its parent's local:// root, which differs from its own
+			// artifacts dir; files land under the pinned root.
+			const getArtifactsDir = () => path.join(tempDir, "own-artifacts");
+			const getSessionId = () => "device-only-local";
+			const session = xdevSession(tempDir, {
+				enableLsp: false,
+				getArtifactsDir,
+				getSessionId,
+				localProtocolOptions: { getArtifactsDir: () => path.join(tempDir, "parent-artifacts"), getSessionId },
+			});
+			const tools = await createTools(session, ["read"]);
+			const read = tools.find(entry => entry.name === "read");
+			const write = tools.find(entry => entry.name === "write");
+			expect(read).toBeDefined();
+			expect(write).toBeDefined();
+
+			const reportWrite = await write!.execute("write-device-only-local", {
+				path: "local://report.md",
+				content: "report draft\n",
+			});
+			expect(reportWrite.isError).toBeUndefined();
+			const reportRead = await read!.execute("read-device-only-local", {
+				path: "local://report.md",
+			});
+			expect(reportRead.content.find(entry => entry.type === "text")?.text).toContain("report draft");
+
+			// The refusal names the on-disk location of local:// files, so the
+			// agent can hand its caller a real path; the file written above is there.
+			const localRoot = path.join(tempDir, "parent-artifacts", "local");
+			const refusal = write!.execute("write-device-only-fs", { path: path.join(tempDir, "nope.txt"), content: "x" });
+			await expect(refusal).rejects.toThrow("Other filesystem paths are refused");
+			await expect(refusal).rejects.toThrow(shortenPath(path.join(localRoot, "<name>")));
+			expect(await Bun.file(path.join(localRoot, "report.md")).text()).toBe("report draft\n");
+
+			// conflict:// resolves to a recorded working-tree file. Device-only
+			// access must reject it before the conflict resolver can mutate it.
+			await expect(
+				write!.execute("write-device-only-conflict", {
+					path: "conflict://1",
+					content: "@ours",
+				}),
+			).rejects.toThrow("Other filesystem paths are refused");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("names the override root when the session itself has no local:// mapping", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-local-override-"));
+		LocalProtocolHandler.setOverride({
+			getArtifactsDir: () => path.join(tempDir, "override-artifacts"),
+			getSessionId: () => "override-session",
+		});
+		try {
+			const session = xdevSession(tempDir, { enableLsp: false, getSessionId: () => "own-session" });
+			const tools = await createTools(session, ["read"]);
+			const write = tools.find(entry => entry.name === "write");
+			expect(write).toBeDefined();
+
+			const reportWrite = await write!.execute("write-override-local", {
+				path: "local://report.md",
+				content: "report draft\n",
+			});
+			expect(reportWrite.isError).toBeUndefined();
+
+			const localRoot = path.join(tempDir, "override-artifacts", "local");
+			await expect(
+				write!.execute("write-override-fs", { path: path.join(tempDir, "nope.txt"), content: "x" }),
+			).rejects.toThrow(shortenPath(path.join(localRoot, "<name>")));
+			expect(await Bun.file(path.join(localRoot, "report.md")).text()).toBe("report draft\n");
+		} finally {
+			LocalProtocolHandler.resetOverrideForTests();
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("keeps a real write grant full-access (no device-only restriction)", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-full-grant-"));
+		try {
+			const session = xdevSession(tempDir);
+			const tools = await createTools(session, ["read", "grep", "write"]);
+			expect(session.deviceOnlyWrite).toBeUndefined();
+			const write = tools.find(entry => entry.name === "write");
+
+			const filePath = path.join(tempDir, "ok.txt");
+			const result = await write!.execute("write-full-grant", { path: filePath, content: "hello\n" });
+			expect(result.isError).toBeUndefined();
+			expect(await Bun.file(filePath).text()).toBe("hello\n");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("upgrades a device-only transport when a later call explicitly grants write", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-upgrade-grant-"));
+		try {
+			const session = xdevSession(tempDir);
+			await createTools(session, ["read"]);
+			expect(session.deviceOnlyWrite).toBe(true);
+
+			const tools = await createTools(session, ["write"]);
+			expect(session.deviceOnlyWrite).toBeUndefined();
+			const write = tools.find(entry => entry.name === "write");
+
+			const filePath = path.join(tempDir, "upgraded.txt");
+			await write!.execute("write-upgraded-grant", { path: filePath, content: "upgraded\n" });
+			expect(await Bun.file(filePath).text()).toBe("upgraded\n");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("does not grant a transport write when read is also omitted", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-no-transport-"));
+		try {
+			const session = xdevSession(tempDir);
+			const tools = await createTools(session, ["grep", "glob"]);
+			expect(tools.some(entry => entry.name === "write")).toBe(false);
+			expect(session.deviceOnlyWrite).toBeUndefined();
+			expect(session.xdev).toBeUndefined();
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+});
+
+describe("device writes honor lenientArgValidation", () => {
+	// #12871: a device that sets lenientArgValidation and re-validates in
+	// `execute` must see the raw args on a schema mismatch. Previously every
+	// xd:// write ran the host's validateToolArguments unconditionally and a
+	// mismatch returned the generic "Invalid args for xd://…" text plus the
+	// full tool doc — the wrapped tool's own refusal never ran.
+	function fixtureDevice(lenient: boolean, seen: Record<string, unknown>[]): Tool {
+		return {
+			name: lenient ? "lenient_dev" : "strict_dev",
+			label: "fixture",
+			description: "fixture",
+			parameters: type({ op: "string" }),
+			lenientArgValidation: lenient,
+			async execute(_id: string, args: Record<string, unknown>) {
+				seen.push(args);
+				return { content: [{ type: "text" as const, text: "tool-owned refusal" }] };
+			},
+		};
+	}
+
+	it("hands raw args to a lenient device on schema mismatch, and still refuses for a strict one", async () => {
+		const seen: Record<string, unknown>[] = [];
+		const state = createTestXdevState([fixtureDevice(true, seen), fixtureDevice(false, seen)]);
+
+		const lenient = await dispatchXdevTool(state, "lenient_dev", JSON.stringify({ wrong: 1 }), "xd-lenient-1");
+		expect(seen).toEqual([{ wrong: 1 }]);
+		expect(lenient.result.content.find(entry => entry.type === "text")?.text).toBe("tool-owned refusal");
+
+		const strict = await dispatchXdevTool(state, "strict_dev", JSON.stringify({ wrong: 1 }), "xd-strict-1");
+		expect(strict.result.isError).toBe(true);
+		expect(strict.result.content.find(entry => entry.type === "text")?.text).toContain(
+			"Invalid args for xd://strict_dev",
+		);
+		expect(seen).toHaveLength(1);
 	});
 });

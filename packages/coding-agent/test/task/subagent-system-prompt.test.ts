@@ -17,6 +17,7 @@ describe("subagent system prompt", () => {
 	it("revokes native output labels when caller schema overrides the agent", () => {
 		const out = prompt.render(subagentSystemPromptTemplate, {
 			agent: 'Use incremental yield with type: ["findings"].',
+			structured: true,
 			outputSchemaOverridesAgent: true,
 			outputSchema: {
 				properties: {
@@ -28,6 +29,6 @@ describe("subagent system prompt", () => {
 
 		expect(out).toContain("Caller schema overrides agent-native output instructions");
 		expect(out).toContain("Ignore ROLE-provided output/yield labels");
-		expect(out).toContain("omit `type` and terminal-yield the full `result.data` object");
+		expect(out).toContain("omit `type` and terminal-yield the full `data` object");
 	});
 });

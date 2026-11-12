@@ -20,7 +20,9 @@
 //! 6. `truncate_lines_at`    — per-line Unicode-safe char cap
 //! 7. `head_lines` / `tail_lines` — keep first/last N lines with a marker
 //! 8. `max_lines`            — hard cap after head/tail
-//! 9. `on_empty`             — replace an empty result with a sentinel
+//! 9. `preserve_if_empty`    — keep the original input when filtering removes
+//!    every line
+//! 10. `on_empty`            — replace an empty result with a sentinel
 //!
 //! Pipelines never panic for the caller: regex compilation errors are
 //! surfaced when the pipeline is loaded, and runtime application is total.
@@ -38,41 +40,49 @@ use crate::minimizer::primitives;
 pub struct PipelineDef {
 	/// Human-readable one-liner. Not consumed at runtime.
 	#[serde(default)]
-	pub description:          Option<String>,
+	pub description:            Option<String>,
 	/// Regex that selects which commands this pipeline claims. Matched against
 	/// the first token of the command (post-wrapper stripping).
-	pub match_command:        String,
+	pub match_command:          String,
 	/// Optional regex matched against the detected subcommand. When absent,
 	/// any subcommand is accepted.
 	#[serde(default)]
-	pub match_subcommand:     Option<String>,
+	pub match_subcommand:       Option<String>,
 	#[serde(default)]
-	pub strip_ansi:           bool,
+	pub strip_ansi:             bool,
 	#[serde(default)]
-	pub replace:              Vec<ReplaceDef>,
+	pub replace:                Vec<ReplaceDef>,
 	#[serde(default)]
-	pub match_output:         Vec<MatchOutputDef>,
+	pub match_output:           Vec<MatchOutputDef>,
 	#[serde(default)]
-	pub strip_lines_matching: Vec<String>,
+	pub strip_lines_matching:   Vec<String>,
 	#[serde(default)]
-	pub keep_lines_matching:  Vec<String>,
+	pub keep_lines_matching:    Vec<String>,
 	/// Ordered regex substitutions applied after the strip/keep line filter
 	/// and before `truncate_lines_at`, so substitutions that shorten lines
 	/// (e.g. path compaction) see the full, untruncated text.
 	#[serde(default)]
-	pub replace_after:        Vec<ReplaceDef>,
-	pub truncate_lines_at:    Option<usize>,
-	pub head_lines:           Option<usize>,
-	pub tail_lines:           Option<usize>,
-	pub max_lines:            Option<usize>,
-	pub on_empty:             Option<String>,
+	pub replace_after:          Vec<ReplaceDef>,
+	pub truncate_lines_at:      Option<usize>,
+	pub head_lines:             Option<usize>,
+	pub tail_lines:             Option<usize>,
+	pub max_lines:              Option<usize>,
+	pub on_empty:               Option<String>,
+	/// Return the original input unchanged when all filtering stages remove it.
+	/// Useful for diagnostic filters that must not discard an unrecognized
+	/// successful output, such as a compiler query response.
+	#[serde(default)]
+	pub preserve_if_empty:      bool,
 	/// Apply only when the command exit code is in this list. Empty = always.
 	#[serde(default)]
-	pub only_on_exit:         Vec<i32>,
+	pub only_on_exit:           Vec<i32>,
 	/// Apply only when the command exit code is NOT in this list. Empty =
 	/// always.
 	#[serde(default)]
-	pub except_on_exit:       Vec<i32>,
+	pub except_on_exit:         Vec<i32>,
+	/// Leave output of at most this many bytes untouched. Unset = always
+	/// apply.
+	pub keep_whole_up_to_bytes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,23 +141,25 @@ pub struct CompiledMatchOutput {
 /// A pipeline with every regex pre-compiled.
 #[derive(Debug)]
 pub struct CompiledPipeline {
-	pub name:              String,
-	pub description:       Option<String>,
-	pub match_command:     Regex,
-	pub match_subcommand:  Option<Regex>,
-	pub strip_ansi:        bool,
-	pub replace:           Vec<CompiledReplace>,
-	pub match_output:      Vec<CompiledMatchOutput>,
-	pub strip_lines:       Option<RegexSet>,
-	pub keep_lines:        Option<RegexSet>,
-	pub replace_after:     Vec<CompiledReplace>,
-	pub truncate_lines_at: Option<usize>,
-	pub head_lines:        Option<usize>,
-	pub tail_lines:        Option<usize>,
-	pub max_lines:         Option<usize>,
-	pub on_empty:          Option<String>,
-	pub only_on_exit:      Vec<i32>,
-	pub except_on_exit:    Vec<i32>,
+	pub name:                   String,
+	pub description:            Option<String>,
+	pub match_command:          Regex,
+	pub match_subcommand:       Option<Regex>,
+	pub strip_ansi:             bool,
+	pub replace:                Vec<CompiledReplace>,
+	pub match_output:           Vec<CompiledMatchOutput>,
+	pub strip_lines:            Option<RegexSet>,
+	pub keep_lines:             Option<RegexSet>,
+	pub replace_after:          Vec<CompiledReplace>,
+	pub truncate_lines_at:      Option<usize>,
+	pub head_lines:             Option<usize>,
+	pub tail_lines:             Option<usize>,
+	pub max_lines:              Option<usize>,
+	pub on_empty:               Option<String>,
+	pub preserve_if_empty:      bool,
+	pub only_on_exit:           Vec<i32>,
+	pub except_on_exit:         Vec<i32>,
+	pub keep_whole_up_to_bytes: Option<usize>,
 }
 
 /// Compile an ordered regex-substitution list; `label` names the TOML key
@@ -225,8 +237,10 @@ pub fn compile(name: String, def: PipelineDef) -> Result<CompiledPipeline, Strin
 		tail_lines: def.tail_lines,
 		max_lines: def.max_lines,
 		on_empty: def.on_empty,
+		preserve_if_empty: def.preserve_if_empty,
 		only_on_exit: def.only_on_exit,
 		except_on_exit: def.except_on_exit,
+		keep_whole_up_to_bytes: def.keep_whole_up_to_bytes,
 	})
 }
 
@@ -258,7 +272,25 @@ impl CompiledPipeline {
 		false
 	}
 
-	/// Apply the full 9-stage pipeline to `input`.
+	/// Whether this pipeline leaves `input_bytes` of output untouched.
+	#[must_use]
+	pub fn skipped_by_size(&self, input_bytes: usize) -> bool {
+		self
+			.keep_whole_up_to_bytes
+			.is_some_and(|max| input_bytes <= max)
+	}
+
+	/// Whether this pipeline, run on `input_bytes` of output from a run that
+	/// exited with `exit_code`, drops whole lines (`max_lines`, `head_lines`,
+	/// `tail_lines`).
+	#[must_use]
+	pub fn caps_lines(&self, exit_code: i32, input_bytes: usize) -> bool {
+		!self.skipped_by_exit(exit_code)
+			&& !self.skipped_by_size(input_bytes)
+			&& (self.max_lines.is_some() || self.head_lines.is_some() || self.tail_lines.is_some())
+	}
+
+	/// Apply the full 10-stage pipeline to `input`.
 	#[must_use]
 	pub fn apply<'a>(&self, input: &'a str) -> Cow<'a, str> {
 		// Stage 1: strip_ansi
@@ -330,7 +362,15 @@ impl CompiledPipeline {
 			stage7
 		};
 
-		// Stage 9: on_empty
+		// Stage 9: preserve the source when a keep-only filter removed every
+		// line. This prevents a successful query/diagnostic command's
+		// meaningful output from being replaced by the engine's generic "OK"
+		// sentinel.
+		if self.preserve_if_empty && stage8.trim().is_empty() {
+			return Cow::Borrowed(input);
+		}
+
+		// Stage 10: on_empty
 		if let Some(msg) = self.on_empty.as_deref()
 			&& stage8.trim().is_empty()
 		{
@@ -447,11 +487,11 @@ pub fn run_tests(registry: &PipelineRegistry) -> Vec<TestOutcome> {
 			continue;
 		};
 		for test in tests {
-			if let Some(exit) = test.exit
-				&& pipeline.skipped_by_exit(exit)
+			if test.exit.is_some_and(|exit| pipeline.skipped_by_exit(exit))
+				|| pipeline.skipped_by_size(test.input.len())
 			{
-				// Explicit exit gate — pipeline is disabled for this exit;
-				// expected output should be the raw input unchanged.
+				// Exit or size gate: the pipeline leaves this input alone, so
+				// the expected output is the raw input unchanged.
 				let passed = test.input == test.expected;
 				out.push(TestOutcome {
 					filter_name: filter_name.clone(),
@@ -590,6 +630,20 @@ replacement = ""
 		// ran first, the pattern would no longer match the clipped line.
 		let out = pipeline.apply("/workspace/project/deep/file.rs\n");
 		assert_eq!(out.as_ref(), "file.rs\n");
+	}
+
+	#[test]
+	fn preserve_if_empty_returns_original_when_filter_drops_every_line() {
+		let src = r#"
+schema_version = 1
+[filters.keep]
+match_command = "^keep$"
+keep_lines_matching = ["^diagnostic:"]
+preserve_if_empty = true
+"#;
+		let pipeline = compile_one(src);
+		let input = "query result\n";
+		assert_eq!(pipeline.apply(input).as_ref(), input);
 	}
 
 	#[test]

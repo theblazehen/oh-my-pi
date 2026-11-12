@@ -1,14 +1,21 @@
+import { isRecord } from "@oh-my-pi/pi-utils";
+import {
+	type DaemonState,
+	type DaemonRestartPolicy,
+	type DaemonReadySpec,
+	type DaemonSpec,
+	type DaemonSnapshot,
+} from "@oh-my-pi/pi-tui/tools/daemon";
 /**
  * Cross-process daemon broker protocol shared by the tool, client, and broker.
  */
-/** Hidden CLI selector used to re-enter the daemon broker worker. */
-export const DAEMON_BROKER_WORKER_ARG = "__omp_worker_daemon_broker";
+export { DAEMON_BROKER_WORKER_ARG } from "../cli/worker-selectors";
 
 /** Fixed dimensions negotiated with every supervised PTY. */
 export const DAEMON_PTY_COLUMNS = 120;
 export const DAEMON_PTY_ROWS = 40;
 
-/** Environment key carrying the broker's canonical project directory. */
+/** Environment key carrying the broker's canonical project or synthetic global scope directory. */
 export const DAEMON_PROJECT_DIR_ENV = "OMP_DAEMON_PROJECT_DIR";
 
 /** Environment key carrying the broker's private runtime directory. */
@@ -17,63 +24,20 @@ export const DAEMON_RUNTIME_DIR_ENV = "OMP_DAEMON_RUNTIME_DIR";
 /** Optional environment key overriding last-client shutdown grace. */
 export const DAEMON_IDLE_GRACE_ENV = "OMP_DAEMON_IDLE_GRACE_MS";
 
-/** Stable lifecycle states exposed by the launch tool. */
-export type DaemonState = "starting" | "running" | "ready" | "restarting" | "stopping" | "exited" | "failed";
-
-/** Restart behavior applied after an unexpected daemon exit. */
-export type DaemonRestartPolicy = "no" | "on-failure" | "always";
-
-/** Readiness conditions; every configured condition must pass. */
-export interface DaemonReadySpec {
-	log?: string;
-	port?: number;
-	host?: string;
-	timeoutMs: number;
-}
-
-/** Immutable launch specification retained for restart and inspection. */
-export interface DaemonSpec {
-	name: string;
-	application: string;
-	args: string[];
-	env: Record<string, string>;
-	cwd: string;
-	pty: boolean;
-	ready?: DaemonReadySpec;
-	restart: DaemonRestartPolicy;
-	persist: boolean;
-	detached: boolean;
-}
-
-/** Serializable daemon state visible to every client in one project directory. */
-export interface DaemonSnapshot {
-	name: string;
-	id: string;
-	state: DaemonState;
-	pid?: number;
-	createdAt: number;
-	startedAt: number;
-	readyAt?: number;
-	exitedAt?: number;
-	exitCode?: number;
-	exitReason?: string;
-	restartCount: number;
-	outputBytes: number;
-	owner?: string;
-	readyMatch?: string;
-	/** Readiness conditions still unmet while `state` is `starting`; absent once ready or without a ready spec. */
-	readyPending?: ("log" | "port")[];
-	persist: boolean;
-	detached: boolean;
-}
-
 /** Signals accepted by daemon input operations. */
 export type DaemonSignal = "SIGINT" | "SIGTERM" | "SIGHUP" | "SIGQUIT" | "SIGKILL";
 
 /** Typed broker operation sent over the authenticated socket. */
 export type DaemonOperation =
 	| { op: "ping" }
-	| { op: "start"; spec: DaemonSpec; owner?: string }
+	| {
+			op: "start";
+			spec: DaemonSpec;
+			owner?: string;
+			replace?: boolean;
+			/** `false` answers once the process launches; follow with a `wait` for readiness. Legacy brokers ignore it and wait. */
+			awaitReady?: boolean;
+	  }
 	| { op: "list" }
 	| {
 			op: "logs";
@@ -89,9 +53,18 @@ export type DaemonOperation =
 	  }
 	| { op: "wait"; name: string; for: "ready" | "exit"; pattern?: string; timeoutMs: number }
 	| { op: "send"; name: string; data?: string; signal?: DaemonSignal }
-	| { op: "stop"; name: string; timeoutMs: number }
+	| {
+			op: "stop";
+			name: string;
+			timeoutMs: number;
+			/** Stop only this generation (`DaemonSnapshot.id`); another one is left running. Legacy brokers ignore it. */
+			id?: string;
+	  }
 	| { op: "restart"; name: string }
+	| { op: "mode"; name: string; mode: "persist" | "session" | "detached" }
 	| { op: "describe"; name: string }
+	/** Abort this connection's in-flight `wait`/follow-`logs` request `requestId`. Legacy brokers reject it. */
+	| { op: "cancel"; requestId: string }
 	| { op: "shutdown" };
 
 /** Typed broker result decoded before it reaches tool code. */
@@ -115,22 +88,37 @@ export type DaemonRpcResult =
 	| { op: "send"; daemon: DaemonSnapshot }
 	| { op: "stop"; daemon: DaemonSnapshot }
 	| { op: "restart"; daemon: DaemonSnapshot }
+	| { op: "mode"; daemon: DaemonSnapshot }
 	| { op: "describe"; daemon: DaemonSnapshot; spec: DaemonSpec }
+	| { op: "cancel"; cancelled: boolean }
 	| { op: "shutdown" };
 
 /** Authenticated request envelope used by socket clients. */
 export interface DaemonWireRequest {
 	id: string;
 	token: string;
+	owners?: string[];
+	detachedOwners?: string[];
+	completionEvents?: boolean;
+	completionAcks?: string[];
+	completionUnsubscribes?: string[];
+	completionReplays?: string[];
+	completionSubscriptionId?: string;
 	operation: DaemonOperation;
 }
 
 /** Response envelope kept raw until matched with its pending operation. */
 export type DaemonWireResponse = { id: string; ok: true; result: unknown } | { id: string; ok: false; error: string };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+/** Unsolicited terminal completion sent to the socket that owns a daemon. */
+export interface DaemonCompletionNotification {
+	event: "daemon-completed";
+	completionId: string;
+	owner: string;
+	daemon: DaemonSnapshot;
 }
+
+export type DaemonWireMessage = DaemonWireResponse | DaemonCompletionNotification;
 
 function record(value: unknown, label: string): Record<string, unknown> {
 	if (!isRecord(value)) throw new Error(`${label} must be an object`);
@@ -149,6 +137,11 @@ function rawString(value: unknown, label: string): string {
 function optionalString(value: unknown, label: string): string | undefined {
 	if (value === undefined) return undefined;
 	return stringValue(value, label);
+}
+
+function optionalRawString(value: unknown, label: string): string | undefined {
+	if (value === undefined) return undefined;
+	return rawString(value, label);
 }
 
 function booleanValue(value: unknown, label: string): boolean {
@@ -255,7 +248,7 @@ export function parseDaemonSnapshot(value: unknown): DaemonSnapshot {
 		restartCount: numberValue(source.restartCount, "daemon.restartCount"),
 		outputBytes: numberValue(source.outputBytes, "daemon.outputBytes"),
 		owner: optionalString(source.owner, "daemon.owner"),
-		readyMatch: optionalString(source.readyMatch, "daemon.readyMatch"),
+		readyMatch: optionalRawString(source.readyMatch, "daemon.readyMatch"),
 		readyPending: source.readyPending === undefined ? undefined : readyPendingList(source.readyPending),
 		persist: booleanValue(source.persist, "daemon.persist"),
 		detached: source.detached === undefined ? false : booleanValue(source.detached, "daemon.detached"),
@@ -268,6 +261,27 @@ export function parseDaemonWireRequest(value: unknown): DaemonWireRequest {
 	return {
 		id: stringValue(source.id, "request.id"),
 		token: stringValue(source.token, "request.token"),
+		owners: source.owners === undefined ? undefined : stringArray(source.owners, "request.owners"),
+		detachedOwners:
+			source.detachedOwners === undefined ? undefined : stringArray(source.detachedOwners, "request.detachedOwners"),
+		completionEvents:
+			source.completionEvents === undefined
+				? undefined
+				: booleanValue(source.completionEvents, "request.completionEvents"),
+		completionAcks:
+			source.completionAcks === undefined ? undefined : stringArray(source.completionAcks, "request.completionAcks"),
+		completionUnsubscribes:
+			source.completionUnsubscribes === undefined
+				? undefined
+				: stringArray(source.completionUnsubscribes, "request.completionUnsubscribes"),
+		completionReplays:
+			source.completionReplays === undefined
+				? undefined
+				: stringArray(source.completionReplays, "request.completionReplays"),
+		completionSubscriptionId:
+			source.completionSubscriptionId === undefined
+				? undefined
+				: stringValue(source.completionSubscriptionId, "request.completionSubscriptionId"),
 		operation: parseDaemonOperation(source.operation),
 	};
 }
@@ -279,6 +293,20 @@ export function parseDaemonWireResponse(value: unknown): DaemonWireResponse {
 	if (source.ok === true) return { id, ok: true, result: source.result };
 	if (source.ok === false) return { id, ok: false, error: stringValue(source.error, "response.error") };
 	throw new Error("response.ok must be a boolean");
+}
+
+/** Decode one broker response or unsolicited completion notification. */
+export function parseDaemonWireMessage(value: unknown): DaemonWireMessage {
+	const source = record(value, "daemon message");
+	if (source.event === "daemon-completed") {
+		return {
+			event: "daemon-completed",
+			completionId: stringValue(source.completionId, "completion.id"),
+			owner: stringValue(source.owner, "completion.owner"),
+			daemon: parseDaemonSnapshot(source.daemon),
+		};
+	}
+	return parseDaemonWireResponse(value);
 }
 
 function parseDaemonOperation(value: unknown): DaemonOperation {
@@ -294,6 +322,9 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 				op,
 				spec: parseDaemonSpec(source.spec),
 				owner: optionalString(source.owner, "operation.owner"),
+				replace: source.replace === undefined ? undefined : booleanValue(source.replace, "operation.replace"),
+				awaitReady:
+					source.awaitReady === undefined ? undefined : booleanValue(source.awaitReady, "operation.awaitReady"),
 			};
 		case "logs":
 			return {
@@ -333,10 +364,19 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 				op,
 				name: stringValue(source.name, "operation.name"),
 				timeoutMs: numberValue(source.timeoutMs, "operation.timeoutMs"),
+				id: optionalString(source.id, "operation.id"),
 			};
 		case "restart":
 		case "describe":
 			return { op, name: stringValue(source.name, "operation.name") };
+		case "cancel":
+			return { op, requestId: stringValue(source.requestId, "operation.requestId") };
+		case "mode": {
+			const mode = stringValue(source.mode, "operation.mode");
+			if (mode !== "persist" && mode !== "session" && mode !== "detached")
+				throw new Error("operation.mode must be persist, session, or detached");
+			return { op, name: stringValue(source.name, "operation.name"), mode };
+		}
 		default:
 			throw new Error(`Unknown daemon operation: ${op}`);
 	}
@@ -375,7 +415,7 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 			return {
 				op: "wait",
 				daemon: parseDaemonSnapshot(source.daemon),
-				matched: optionalString(source.matched, "result.matched"),
+				matched: optionalRawString(source.matched, "result.matched"),
 				timedOut: booleanValue(source.timedOut, "result.timedOut"),
 			};
 		case "send":
@@ -384,12 +424,16 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 			return { op: "stop", daemon: parseDaemonSnapshot(source.daemon) };
 		case "restart":
 			return { op: "restart", daemon: parseDaemonSnapshot(source.daemon) };
+		case "mode":
+			return { op: "mode", daemon: parseDaemonSnapshot(source.daemon) };
 		case "describe":
 			return {
 				op: "describe",
 				daemon: parseDaemonSnapshot(source.daemon),
 				spec: parseDaemonSpec(source.spec),
 			};
+		case "cancel":
+			return { op: "cancel", cancelled: booleanValue(source.cancelled, "result.cancelled") };
 		case "shutdown":
 			return { op: "shutdown" };
 	}

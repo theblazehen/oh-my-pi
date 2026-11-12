@@ -11,11 +11,27 @@
 //! file-system magic; the caller pays full filesystem-copy cost up front
 //! and an `rm -rf` on teardown.
 
-use std::path::{Path, PathBuf};
+use std::{
+	ffi::OsStr,
+	fmt,
+	fs::FileType,
+	io::{self, Write as _},
+	path::Path,
+	process::{Child, ChildStdin, Command, Output, Stdio},
+	sync::{
+		Arc, Mutex, PoisonError,
+		mpsc::{self, Receiver},
+	},
+	thread,
+	time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 
-use crate::{BackendKind, IsoError, IsoResult, IsolationBackend, ProbeResult, command_failed};
+use crate::{
+	BackendKind, IsoError, IsoResult, IsolationBackend, ProbeResult, command_failed,
+	tree::{self, TreeCopy},
+};
 
 pub struct RcopyBackend;
 
@@ -34,9 +50,9 @@ impl IsolationBackend for RcopyBackend {
 	}
 
 	fn start(&self, lower: &Path, merged: &Path) -> IsoResult<()> {
-		let lower = canonical_existing_dir(lower)?;
-		let merged = absolutize(merged);
-		prepare_destination(&merged)?;
+		let lower = tree::canonical_existing_dir(lower, "rcopy source", IsoError::other)?;
+		let merged = std::path::absolute(merged).unwrap_or_else(|_| merged.to_path_buf());
+		tree::prepare_destination(&merged, "rcopy", tree::remove_existing)?;
 		if is_git_worktree(&lower) {
 			git_worktree_add(&lower, &merged)?;
 			// `worktree add --detach HEAD` lands on a clean checkout. omp
@@ -66,50 +82,6 @@ impl IsolationBackend for RcopyBackend {
 	}
 }
 
-fn canonical_existing_dir(path: &Path) -> IsoResult<PathBuf> {
-	let resolved = if path.is_absolute() {
-		path.to_path_buf()
-	} else {
-		std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-	};
-	let meta = std::fs::metadata(&resolved).map_err(|err| {
-		IsoError::other(format!("invalid rcopy source {}: {err}", resolved.display()))
-	})?;
-	if !meta.is_dir() {
-		return Err(IsoError::other(format!(
-			"rcopy source {} is not a directory",
-			resolved.display()
-		)));
-	}
-	Ok(std::fs::canonicalize(&resolved).unwrap_or(resolved))
-}
-
-fn absolutize(path: &Path) -> PathBuf {
-	if path.is_absolute() {
-		path.to_path_buf()
-	} else {
-		std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
-	}
-}
-
-fn prepare_destination(merged: &Path) -> IsoResult<()> {
-	if let Some(parent) = merged.parent() {
-		std::fs::create_dir_all(parent)
-			.map_err(|err| IsoError::other(format!("create parent of {}: {err}", merged.display())))?;
-	}
-	match std::fs::remove_dir_all(merged) {
-		Ok(()) => {},
-		Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
-		Err(err) => {
-			return Err(IsoError::other(format!(
-				"unable to clear {} before rcopy: {err}",
-				merged.display()
-			)));
-		},
-	}
-	Ok(())
-}
-
 fn is_git_worktree(path: &Path) -> bool {
 	// A regular working tree has `.git` as a dir; a linked worktree has it
 	// as a `gitdir: …` text file. Either way, presence of `.git` is the
@@ -118,46 +90,20 @@ fn is_git_worktree(path: &Path) -> bool {
 }
 
 fn git_worktree_add(lower: &Path, merged: &Path) -> IsoResult<()> {
-	let output = std::process::Command::new("git")
-		.arg("-C")
-		.arg(lower)
-		.args(["worktree", "add", "--detach"])
-		.arg(merged)
-		.arg("HEAD")
-		.stdin(std::process::Stdio::null())
-		.stdout(std::process::Stdio::piped())
-		.stderr(std::process::Stdio::piped())
-		.output()
-		.map_err(|err| {
-			if err.kind() == std::io::ErrorKind::NotFound {
-				IsoError::unavailable(
-					"`git` not on PATH; rcopy cannot materialise a worktree from a git source",
-				)
-			} else {
-				IsoError::other(format!("spawn git worktree add: {err}"))
-			}
-		})?;
-	if output.status.success() {
-		return Ok(());
-	}
-	Err(command_failed("git worktree add", output.status.code().unwrap_or(-1), &output.stderr))
+	let args = [
+		OsStr::new("worktree"),
+		OsStr::new("add"),
+		OsStr::new("--detach"),
+		merged.as_os_str(),
+		OsStr::new("HEAD"),
+	];
+	checked("git worktree add", run_git(lower, &args, None)?).map(drop)
 }
 
 fn git_worktree_remove(merged: &Path) -> IsoResult<()> {
-	let output = std::process::Command::new("git")
-		.arg("-C")
-		.arg(merged)
-		.args(["worktree", "remove", "--force"])
-		.arg(merged)
-		.stdin(std::process::Stdio::null())
-		.stdout(std::process::Stdio::piped())
-		.stderr(std::process::Stdio::piped())
-		.output()
-		.map_err(|err| IsoError::other(format!("spawn git worktree remove: {err}")))?;
-	if output.status.success() {
-		return Ok(());
-	}
-	Err(command_failed("git worktree remove", output.status.code().unwrap_or(-1), &output.stderr))
+	let args =
+		[OsStr::new("worktree"), OsStr::new("remove"), OsStr::new("--force"), merged.as_os_str()];
+	checked("git worktree remove", run_git(merged, &args, None)?).map(drop)
 }
 
 /// Replicate `lower`'s live working tree on top of a freshly-checked-out
@@ -177,13 +123,13 @@ fn git_worktree_remove(merged: &Path) -> IsoResult<()> {
 /// contract ("merged mirrors lower's live working tree") holds for
 /// rcopy on git inputs too.
 fn seed_dirty_state(lower: &Path, merged: &Path) -> IsoResult<()> {
-	let staged = git_capture(lower, &["diff", "--binary", "--no-color", "--cached"])?;
+	let staged = Arc::new(git_capture(lower, &["diff", "--binary", "--no-color", "--cached"])?);
 	if !staged.is_empty() {
 		git_apply(merged, &staged, &["--cached"])?;
 		git_apply(merged, &staged, &[])?;
 	}
 
-	let unstaged = git_capture(lower, &["diff", "--binary", "--no-color"])?;
+	let unstaged = Arc::new(git_capture(lower, &["diff", "--binary", "--no-color"])?);
 	if !unstaged.is_empty() {
 		git_apply(merged, &unstaged, &[])?;
 	}
@@ -208,267 +154,308 @@ fn seed_dirty_state(lower: &Path, merged: &Path) -> IsoResult<()> {
 }
 
 fn git_capture(cwd: &Path, args: &[&str]) -> IsoResult<Vec<u8>> {
-	let output = std::process::Command::new("git")
+	checked(format_args!("git {}", args.join(" ")), run_git(cwd, args, None)?)
+}
+
+fn git_apply(cwd: &Path, patch: &Arc<Vec<u8>>, extra: &[&str]) -> IsoResult<()> {
+	let mut args = vec!["apply", "--binary", "--whitespace=nowarn"];
+	args.extend_from_slice(extra);
+	checked("git apply", run_git(cwd, &args, Some(Arc::clone(patch)))?).map(drop)
+}
+
+/// Stdout of a successful `output`; [`command_failed`] labelled `what`
+/// otherwise.
+fn checked(what: impl fmt::Display, output: Output) -> IsoResult<Vec<u8>> {
+	if output.status.success() {
+		return Ok(output.stdout);
+	}
+	Err(command_failed(what, output.status.code().unwrap_or(-1), &output.stderr))
+}
+
+/// Deadlines for one `git` invocation, see [`GIT_LIMITS`].
+#[derive(Clone, Copy)]
+struct Limits {
+	/// How long the child may run before it is killed.
+	exit:  Duration,
+	/// How long stdout/stderr may stay open once the child has exited.
+	drain: Duration,
+}
+
+/// Limits for every rcopy `git` call.
+///
+/// `exit` is generous because a Windows checkout of a very large repository
+/// legitimately takes minutes; it exists so a `git` that never exits fails the
+/// isolation instead of parking a blocking thread, and the task that awaits
+/// it, forever (#17901). `drain` covers pipes that outlive the child: every
+/// process holding an inherited write end keeps them open, whether a lingering
+/// git grandchild or, on Windows, where handle inheritance is process-wide, an
+/// unrelated child the host spawned while the pipes were inheritable. The
+/// child's output is complete once it exits, so EOF is not awaited past
+/// `drain`.
+const GIT_LIMITS: Limits = Limits { exit: Duration::from_mins(10), drain: Duration::from_secs(5) };
+
+/// Exit-status poll interval while waiting under [`Limits::exit`].
+const EXIT_POLL: Duration = Duration::from_millis(10);
+
+/// Run `git -C <cwd> <args>` under [`GIT_LIMITS`], feeding `stdin` when
+/// given. A non-zero exit is returned, not raised; see [`run_program`] for
+/// the errors.
+fn run_git(
+	cwd: &Path,
+	args: &[impl AsRef<OsStr>],
+	stdin: Option<Arc<Vec<u8>>>,
+) -> IsoResult<Output> {
+	run_program(Path::new("git"), cwd, args, stdin, GIT_LIMITS)
+}
+
+/// [`run_git`] with an explicit program and limits.
+///
+/// # Errors
+/// - [`IsoError::Unavailable`] when `program` is not on `PATH`.
+/// - [`IsoError::Other`] when the child cannot be spawned or waited on, its
+///   pipe threads cannot start, it is still running after `limits.exit` (it is
+///   killed; on Windows its descendants may survive), or it exits 0 without
+///   consuming all of `stdin`.
+fn run_program(
+	program: &Path,
+	cwd: &Path,
+	args: &[impl AsRef<OsStr>],
+	stdin: Option<Arc<Vec<u8>>>,
+	limits: Limits,
+) -> IsoResult<Output> {
+	let label = || {
+		let mut label = String::from("git");
+		for arg in args {
+			label.push(' ');
+			label.push_str(&arg.as_ref().to_string_lossy());
+		}
+		label
+	};
+	let mut child = Command::new(program)
 		.arg("-C")
 		.arg(cwd)
 		.args(args)
-		.stdin(std::process::Stdio::null())
-		.stdout(std::process::Stdio::piped())
-		.stderr(std::process::Stdio::piped())
-		.output()
-		.map_err(|err| {
-			if err.kind() == std::io::ErrorKind::NotFound {
-				IsoError::unavailable(
-					"`git` not on PATH; rcopy cannot seed dirty state from a git source",
-				)
-			} else {
-				IsoError::other(format!("spawn git {}: {err}", args.first().unwrap_or(&"<args>")))
-			}
-		})?;
-	if !output.status.success() {
-		return Err(command_failed(
-			format_args!("git {}", args.join(" ")),
-			output.status.code().unwrap_or(-1),
-			&output.stderr,
-		));
-	}
-	Ok(output.stdout)
-}
-
-fn git_apply(cwd: &Path, patch: &[u8], extra: &[&str]) -> IsoResult<()> {
-	git_apply_with_program(Path::new("git"), cwd, patch, extra)
-}
-
-fn git_apply_with_program(
-	program: &Path,
-	cwd: &Path,
-	patch: &[u8],
-	extra: &[&str],
-) -> IsoResult<()> {
-	use std::io::{Read as _, Write as _};
-	let mut child = std::process::Command::new(program)
-		.arg("-C")
-		.arg(cwd)
-		.args(["apply", "--binary", "--whitespace=nowarn"])
-		.args(extra)
-		.stdin(std::process::Stdio::piped())
-		.stdout(std::process::Stdio::null())
-		.stderr(std::process::Stdio::piped())
+		.stdin(if stdin.is_some() {
+			Stdio::piped()
+		} else {
+			Stdio::null()
+		})
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
 		.spawn()
 		.map_err(|err| {
-			if err.kind() == std::io::ErrorKind::NotFound {
+			if err.kind() == io::ErrorKind::NotFound {
 				IsoError::unavailable(
-					"`git` not on PATH; rcopy cannot seed dirty state from a git source",
+					"`git` not on PATH; rcopy cannot materialise a worktree from a git source",
 				)
 			} else {
-				IsoError::other(format!("spawn git apply: {err}"))
+				IsoError::other(format!("spawn {}: {err}", label()))
 			}
 		})?;
-	let mut stderr = child
-		.stderr
-		.take()
-		.ok_or_else(|| IsoError::other("git apply: child stderr was not piped".to_string()))?;
-	let stderr_reader = std::thread::Builder::new()
-		.name("pi-iso-git-apply-stderr".to_string())
-		.spawn(move || {
-			let mut bytes = Vec::new();
-			stderr.read_to_end(&mut bytes).map(|_| bytes)
-		})
-		.map_err(|err| IsoError::other(format!("spawn git apply stderr reader: {err}")))?;
-	let write_result = {
-		let mut stdin = child
-			.stdin
-			.take()
-			.ok_or_else(|| IsoError::other("git apply: child stdin was not piped".to_string()))?;
-		let result = stdin.write_all(patch);
-		drop(stdin);
-		result
+	let pipes = Pipes::attach(&mut child, stdin).map_err(|err| {
+		reap(&mut child);
+		IsoError::other(format!("{}: start pipe threads: {err}", label()))
+	})?;
+	let started = Instant::now();
+	let status = loop {
+		match child.try_wait() {
+			Ok(Some(status)) => break status,
+			Ok(None) if started.elapsed() < limits.exit => thread::sleep(EXIT_POLL),
+			Ok(None) => {
+				reap(&mut child);
+				return Err(IsoError::other(format!(
+					"{} did not exit within {:?}; killed it",
+					label(),
+					limits.exit
+				)));
+			},
+			Err(err) => {
+				reap(&mut child);
+				return Err(IsoError::other(format!("wait {}: {err}", label())));
+			},
+		}
 	};
-	let status = child
-		.wait()
-		.map_err(|err| IsoError::other(format!("wait git apply: {err}")))?;
-	let stderr = stderr_reader
-		.join()
-		.map_err(|_| IsoError::other("wait git apply: stderr reader panicked".to_string()))?
-		.map_err(|err| IsoError::other(format!("read git apply stderr: {err}")))?;
-	if status.success() {
-		write_result.map_err(|err| IsoError::other(format!("write patch to git apply: {err}")))?;
-		return Ok(());
+	let deadline = Instant::now() + limits.drain;
+	let stdout = pipes.stdout.collect(deadline);
+	let stderr = pipes.stderr.collect(deadline);
+	if status.success()
+		&& let Some(written) = pipes.stdin
+	{
+		match written.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+			Ok(Ok(())) => {},
+			Ok(Err(err)) => return Err(IsoError::other(format!("write stdin to {}: {err}", label()))),
+			Err(_) => {
+				return Err(IsoError::other(format!("{} exited before reading all of stdin", label())));
+			},
+		}
 	}
-	Err(command_failed("git apply", status.code().unwrap_or(-1), &stderr))
+	Ok(Output { status, stdout, stderr })
+}
+
+/// Kill `child` and reap it. Only the direct child: on Windows a killed `git`
+/// launcher leaves its descendants running.
+fn reap(child: &mut Child) {
+	let _ = child.kill();
+	let _ = child.wait();
+}
+
+/// Helper threads that own a child's pipes, so a pipe that never closes parks
+/// only its thread, never the caller.
+struct Pipes {
+	stdout: Drain,
+	stderr: Drain,
+	/// Result of writing stdin, when the child was given any.
+	stdin:  Option<Receiver<io::Result<()>>>,
+}
+
+impl Pipes {
+	fn attach(child: &mut Child, stdin: Option<Arc<Vec<u8>>>) -> io::Result<Self> {
+		let stdout = Drain::spawn("pi-iso-git-stdout", child.stdout.take())?;
+		let stderr = Drain::spawn("pi-iso-git-stderr", child.stderr.take())?;
+		let stdin = match (stdin, child.stdin.take()) {
+			(Some(bytes), Some(pipe)) => Some(feed(pipe, bytes)?),
+			_ => None,
+		};
+		Ok(Self { stdout, stderr, stdin })
+	}
+}
+
+/// Write `bytes` to `pipe` on a helper thread, then close it.
+fn feed(mut pipe: ChildStdin, bytes: Arc<Vec<u8>>) -> io::Result<Receiver<io::Result<()>>> {
+	let (tx, rx) = mpsc::channel();
+	thread::Builder::new()
+		.name("pi-iso-git-stdin".into())
+		.spawn(move || {
+			// A child that exits early closes the pipe; its exit status is the
+			// answer, so the receiver may already be gone.
+			let _ = tx.send(pipe.write_all(&bytes));
+		})?;
+	Ok(rx)
+}
+
+/// One child output stream, accumulated on a helper thread.
+struct Drain {
+	bytes: Arc<Mutex<Vec<u8>>>,
+	/// Disconnects when the thread reaches EOF.
+	eof:   Receiver<()>,
+}
+
+impl Drain {
+	fn spawn(name: &str, stream: Option<impl io::Read + Send + 'static>) -> io::Result<Self> {
+		let bytes = Arc::new(Mutex::new(Vec::new()));
+		let (done, eof) = mpsc::channel();
+		if let Some(mut stream) = stream {
+			let sink = Arc::clone(&bytes);
+			thread::Builder::new().name(name.into()).spawn(move || {
+				let _done = done;
+				let mut buf = [0u8; 8 * 1024];
+				loop {
+					match stream.read(&mut buf) {
+						Ok(0) => break,
+						Ok(n) => sink
+							.lock()
+							.unwrap_or_else(PoisonError::into_inner)
+							.extend_from_slice(&buf[..n]),
+						Err(err) if err.kind() == io::ErrorKind::Interrupted => {},
+						Err(_) => break,
+					}
+				}
+			})?;
+		}
+		Ok(Self { bytes, eof })
+	}
+
+	/// Everything read by EOF or `deadline`, whichever comes first.
+	fn collect(self, deadline: Instant) -> Vec<u8> {
+		let _ = self
+			.eof
+			.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+		std::mem::take(&mut *self.bytes.lock().unwrap_or_else(PoisonError::into_inner))
+	}
 }
 
 /// Copy a single path (regular file, symlink, or directory) from `src`
-/// to `dst`, preserving mode and mtime on supported platforms. Used by
-/// the untracked-files pass; directories are recursed via the existing
-/// [`copy_dir_contents`] helper.
+/// to `dst`, preserving mtime. Used by the untracked-files pass;
+/// directories are recursed via [`tree::copy_dir_contents`].
 fn copy_path(src: &Path, dst: &Path) -> IsoResult<()> {
 	let meta = std::fs::symlink_metadata(src)
 		.map_err(|err| IsoError::other(format!("stat {}: {err}", src.display())))?;
 	if meta.file_type().is_symlink() {
-		copy_symlink(src, dst)
+		tree::copy_symlink(src, dst, meta.file_type())
 	} else if meta.file_type().is_dir() {
 		std::fs::create_dir_all(dst)
 			.map_err(|err| IsoError::other(format!("create {}: {err}", dst.display())))?;
-		copy_dir_contents(src, dst)?;
-		copy_dir_mtime(src, dst);
-		Ok(())
+		tree::copy_dir_contents(src, dst, &[], &Rcopy)?;
+		Rcopy.finish_dir(src, dst)
 	} else {
-		std::fs::copy(src, dst).map_err(|err| {
-			IsoError::other(format!("copy {} -> {}: {err}", src.display(), dst.display()))
-		})?;
-		copy_file_mtime(src, dst);
-		Ok(())
+		Rcopy.file(src, dst, meta.file_type())
 	}
 }
 
-/// Recursive copy preserving file modes (unix) and mtimes on both unix
-/// and windows. We don't use `std::fs::copy` for the final mtime fix-up
-/// because `copy` already preserves mtime on the macOS/Linux platforms we
-/// care about — but we still set it explicitly to keep behaviour
-/// consistent across hosts where the stdlib promise is weaker.
+/// Recursive copy preserving file modes (via `std::fs::copy`) and mtimes.
+/// `copy` already preserves mtime on the macOS/Linux platforms we care
+/// about, but we still set it explicitly to keep behaviour consistent
+/// across hosts where the stdlib promise is weaker.
 fn recursive_copy(lower: &Path, merged: &Path) -> IsoResult<()> {
 	std::fs::create_dir_all(merged)
 		.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
-	copy_dir_contents(lower, merged)
+	tree::copy_dir_contents(lower, merged, &[], &Rcopy)
 }
 
-fn copy_dir_contents(src: &Path, dst: &Path) -> IsoResult<()> {
-	let entries = std::fs::read_dir(src)
-		.map_err(|err| IsoError::other(format!("read_dir {}: {err}", src.display())))?;
-	for entry in entries {
-		let entry =
-			entry.map_err(|err| IsoError::other(format!("dir entry in {}: {err}", src.display())))?;
-		let file_type = entry
-			.file_type()
-			.map_err(|err| IsoError::other(format!("file_type {}: {err}", entry.path().display())))?;
-		let src_path = entry.path();
-		let dst_path = dst.join(entry.file_name());
-		if file_type.is_symlink() {
-			copy_symlink(&src_path, &dst_path)?;
-		} else if file_type.is_dir() {
-			std::fs::create_dir_all(&dst_path)
-				.map_err(|err| IsoError::other(format!("create {}: {err}", dst_path.display())))?;
-			copy_dir_contents(&src_path, &dst_path)?;
-			copy_dir_mtime(&src_path, &dst_path);
-		} else {
-			std::fs::copy(&src_path, &dst_path).map_err(|err| {
-				IsoError::other(format!("copy {} -> {}: {err}", src_path.display(), dst_path.display()))
-			})?;
-			copy_file_mtime(&src_path, &dst_path);
-		}
+struct Rcopy;
+
+impl TreeCopy for Rcopy {
+	fn symlink(&self, src: &Path, dst: &Path, file_type: FileType) -> IsoResult<()> {
+		tree::copy_symlink(src, dst, file_type)
 	}
-	Ok(())
+
+	fn file(&self, src: &Path, dst: &Path, _file_type: FileType) -> IsoResult<()> {
+		std::fs::copy(src, dst).map_err(|err| {
+			IsoError::other(format!("copy {} -> {}: {err}", src.display(), dst.display()))
+		})?;
+		copy_mtime(src, dst);
+		Ok(())
+	}
+
+	fn finish_dir(&self, src: &Path, dst: &Path) -> IsoResult<()> {
+		copy_mtime(src, dst);
+		Ok(())
+	}
 }
 
-#[cfg(unix)]
-fn copy_symlink(src: &Path, dst: &Path) -> IsoResult<()> {
-	let target = std::fs::read_link(src)
-		.map_err(|err| IsoError::other(format!("read_link {}: {err}", src.display())))?;
-	std::os::unix::fs::symlink(target, dst)
-		.map_err(|err| IsoError::other(format!("symlink {}: {err}", dst.display())))
-}
-
-#[cfg(windows)]
-fn copy_symlink(src: &Path, dst: &Path) -> IsoResult<()> {
-	let target = std::fs::read_link(src)
-		.map_err(|err| IsoError::other(format!("read_link {}: {err}", src.display())))?;
-	let meta = std::fs::symlink_metadata(src)
-		.map_err(|err| IsoError::other(format!("symlink_metadata {}: {err}", src.display())))?;
-	let res = if meta.file_type().is_dir() {
-		std::os::windows::fs::symlink_dir(target, dst)
-	} else {
-		std::os::windows::fs::symlink_file(target, dst)
-	};
-	res.map_err(|err| IsoError::other(format!("symlink {}: {err}", dst.display())))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn copy_symlink(_src: &Path, _dst: &Path) -> IsoResult<()> {
-	Err(IsoError::other("symlink copy unsupported on this platform"))
-}
-
-/// Mirror `src`'s mtime onto `dst`. Failures are silently ignored — the
-/// mtime hint is an optimisation for [`crate::diff`], not a correctness
-/// requirement.
-fn copy_file_mtime(src: &Path, dst: &Path) {
-	let Ok(meta) = std::fs::metadata(src) else {
+/// Mirror `src`'s mtime onto the file or directory `dst`. Failures are
+/// silently ignored — the mtime hint is an optimisation for [`crate::diff`],
+/// not a correctness requirement.
+fn copy_mtime(src: &Path, dst: &Path) {
+	let Ok(mtime) = std::fs::metadata(src).and_then(|meta| meta.modified()) else {
 		return;
 	};
-	let Ok(mtime) = meta.modified() else { return };
-	let _ = filetime_set(dst, mtime);
+	let _ = set_mtime(dst, mtime);
 }
 
-fn copy_dir_mtime(src: &Path, dst: &Path) {
-	let Ok(meta) = std::fs::metadata(src) else {
-		return;
-	};
-	let Ok(mtime) = meta.modified() else { return };
-	let _ = filetime_set(dst, mtime);
-}
-
+/// One path-based time update: rcopy holds no handle to `dst`
+/// (`std::fs::copy` closes it), so opening one for `futimens` would add an
+/// open and a close per copied entry. `dst` is never a symlink here, but not
+/// following keeps a swapped-in link from redirecting the write. Pre-epoch
+/// times are not mirrored.
 #[cfg(unix)]
-fn filetime_set(path: &Path, mtime: std::time::SystemTime) -> std::io::Result<()> {
-	use std::os::unix::ffi::OsStrExt;
-	let dur = mtime
+fn set_mtime(path: &Path, mtime: std::time::SystemTime) -> std::io::Result<()> {
+	mtime
 		.duration_since(std::time::UNIX_EPOCH)
 		.map_err(std::io::Error::other)?;
-	let times = [libc::timespec { tv_sec: dur.as_secs() as _, tv_nsec: 0 }, libc::timespec {
-		tv_sec:  dur.as_secs() as _,
-		tv_nsec: dur.subsec_nanos() as libc::c_long,
-	}];
-	let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-	// SAFETY: `c_path` and `times` outlive the syscall; the kernel does
-	// not retain the pointers.
-	let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
-	if rc == 0 {
-		Ok(())
-	} else {
-		Err(std::io::Error::last_os_error())
-	}
+	std::fs::set_times_nofollow(path, std::fs::FileTimes::new().set_modified(mtime))
 }
 
+/// `fs::set_times` opens `path` with just write-attributes access and backup
+/// semantics, so it works on readonly files and directories.
 #[cfg(windows)]
-fn filetime_set(path: &Path, mtime: std::time::SystemTime) -> std::io::Result<()> {
-	use std::{
-		fs::OpenOptions,
-		os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
-	};
-
-	use windows_sys::Win32::{
-		Foundation::FILETIME,
-		Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, SetFileTime},
-	};
-
-	let dur = mtime
-		.duration_since(std::time::UNIX_EPOCH)
-		.map_err(|err| std::io::Error::other(err.to_string()))?;
-	// Windows FILETIME = 100-ns ticks since 1601-01-01.
-	const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
-	let ticks = EPOCH_DIFF_100NS + dur.as_secs() * 10_000_000 + u64::from(dur.subsec_nanos() / 100);
-	let ft = FILETIME {
-		dwLowDateTime:  (ticks & 0xffff_ffff) as u32,
-		dwHighDateTime: (ticks >> 32) as u32,
-	};
-
-	let mut opts = OpenOptions::new();
-	opts.write(true);
-	opts.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
-	let file = opts.open(path)?;
-	// SAFETY: file owns the HANDLE for the duration of the call.
-	let ok = unsafe {
-		SetFileTime(file.as_raw_handle() as _, std::ptr::null(), std::ptr::null(), &raw const ft)
-	};
-	if ok != 0 {
-		Ok(())
-	} else {
-		Err(std::io::Error::last_os_error())
-	}
+fn set_mtime(path: &Path, mtime: std::time::SystemTime) -> std::io::Result<()> {
+	std::fs::set_times(path, std::fs::FileTimes::new().set_modified(mtime))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn filetime_set(_path: &Path, _mtime: std::time::SystemTime) -> std::io::Result<()> {
-	Ok(())
+fn set_mtime(path: &Path, mtime: std::time::SystemTime) -> std::io::Result<()> {
+	std::fs::File::open(path)?.set_modified(mtime)
 }
 
 #[cfg(test)]
@@ -481,6 +468,69 @@ mod tests {
 	};
 
 	use super::*;
+
+	/// The non-git `start` path mirrors file and directory mtimes, including
+	/// on readonly files, so the mtime-skipping diff stays fast.
+	#[cfg(unix)]
+	#[test]
+	fn rcopy_preserves_file_and_dir_mtimes() {
+		use std::os::unix::fs::PermissionsExt as _;
+
+		let root = TempDirGuard::new();
+		let lower = root.path().join("lower");
+		let sub = lower.join("sub");
+		fs::create_dir_all(&sub).expect("create lower/sub");
+		let file = sub.join("file.txt");
+		fs::write(&file, b"hello").expect("write lower file");
+		let file_mtime = UNIX_EPOCH + std::time::Duration::new(1_000_000_000, 123_456_789);
+		let dir_mtime = UNIX_EPOCH + std::time::Duration::new(1_100_000_000, 0);
+		fs::File::open(&file)
+			.and_then(|f| f.set_modified(file_mtime))
+			.expect("set file mtime");
+		fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).expect("make file readonly");
+		fs::File::open(&sub)
+			.and_then(|d| d.set_modified(dir_mtime))
+			.expect("set dir mtime");
+
+		let merged = root.path().join("merged");
+		RcopyBackend.start(&lower, &merged).expect("rcopy start");
+
+		let mtime = |path: &Path| {
+			fs::metadata(path)
+				.and_then(|m| m.modified())
+				.expect("mtime")
+		};
+		assert_eq!(mtime(&merged.join("sub/file.txt")), file_mtime);
+		assert_eq!(mtime(&merged.join("sub")), dir_mtime);
+	}
+
+	/// A directory symlink must be recreated as a directory link; Windows
+	/// cannot traverse a file link that points at a directory.
+	#[cfg(windows)]
+	#[test]
+	fn rcopy_recreates_directory_symlink_as_directory_link() {
+		use std::os::windows::fs::FileTypeExt as _;
+
+		let root = TempDirGuard::new();
+		let lower = root.path().join("lower");
+		fs::create_dir_all(lower.join("target")).expect("create lower/target");
+		fs::write(lower.join("target/inner.txt"), b"inner").expect("write inner file");
+		if let Err(err) = std::os::windows::fs::symlink_dir("target", lower.join("link")) {
+			// Creating symlinks needs Developer Mode or the symlink privilege.
+			eprintln!("skipping: cannot create directory symlink: {err}");
+			return;
+		}
+
+		let merged = root.path().join("merged");
+		RcopyBackend.start(&lower, &merged).expect("rcopy start");
+
+		let link = merged.join("link");
+		let file_type = fs::symlink_metadata(&link)
+			.expect("link metadata")
+			.file_type();
+		assert!(file_type.is_symlink_dir(), "expected a directory link, got {file_type:?}");
+		assert_eq!(fs::read(link.join("inner.txt")).expect("read through link"), b"inner");
+	}
 
 	struct TempDirGuard(PathBuf);
 
@@ -511,26 +561,75 @@ mod tests {
 		}
 	}
 
+	/// An executable stub standing in for `git`.
 	#[cfg(unix)]
-	#[test]
-	fn git_apply_drains_stderr_while_writing_stdin() {
+	fn stub(root: &TempDirGuard, script: &str) -> PathBuf {
 		use std::os::unix::fs::PermissionsExt as _;
 
-		let root = TempDirGuard::new();
-		let fake_git = root.path().join("git");
-		fs::write(
-			&fake_git,
-			"#!/bin/sh\nprintf 'simulated apply failure\\n' >&2\nyes x | head -c 4194304 >&2\ncat \
-			 >/dev/null\nexit 42\n",
-		)
-		.expect("write fake git");
-		fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755))
-			.expect("make fake git executable");
+		let path = root.path().join("git");
+		fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("write stub git");
+		fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("make stub executable");
+		path
+	}
 
-		let patch = vec![b'p'; 4 * 1024 * 1024];
-		let err = git_apply_with_program(&fake_git, root.path(), &patch, &[])
-			.expect_err("fake git apply should fail after consuming stdin");
-		let message = err.to_string();
-		assert!(message.starts_with("git apply (exit 42): simulated apply failure"));
+	#[cfg(unix)]
+	#[test]
+	fn run_program_drains_stderr_while_writing_stdin() {
+		let root = TempDirGuard::new();
+		let git = stub(
+			&root,
+			"printf 'simulated apply failure\\n' >&2\nyes x | head -c 4194304 >&2\ncat \
+			 >/dev/null\nexit 42",
+		);
+
+		let patch = Arc::new(vec![b'p'; 4 * 1024 * 1024]);
+		let output = run_program(&git, root.path(), &["apply"], Some(patch), GIT_LIMITS)
+			.expect("stub consumes stdin and exits");
+		let err = checked("git apply", output).expect_err("exit 42 is a failure");
+		assert!(
+			err.to_string()
+				.starts_with("git apply (exit 42): simulated apply failure")
+		);
+	}
+
+	/// A `git` that never exits is killed at the deadline instead of blocking
+	/// isolation setup forever (#17901).
+	#[cfg(unix)]
+	#[test]
+	fn run_program_kills_a_child_that_never_exits() {
+		let root = TempDirGuard::new();
+		let git = stub(&root, "exec sleep 30");
+		let limits = Limits { exit: Duration::from_millis(200), drain: Duration::from_secs(5) };
+
+		let started = Instant::now();
+		let err = run_program(&git, root.path(), &["worktree", "add"], None, limits)
+			.expect_err("stalled child must fail");
+		assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+		assert!(err.to_string().contains("did not exit within 200ms"), "{err}");
+	}
+
+	/// Output pipes that another process still holds after `git` exits must not
+	/// keep the caller waiting for EOF (#17901).
+	#[cfg(unix)]
+	#[test]
+	fn run_program_returns_when_pipes_outlive_the_child() {
+		let root = TempDirGuard::new();
+		let pid_file = root.path().join("holder.pid");
+		let git = stub(
+			&root,
+			&format!("printf out\nsleep 30 &\necho $! > '{}'\nexit 0", pid_file.display()),
+		);
+		let limits = Limits { exit: Duration::from_secs(10), drain: Duration::from_millis(200) };
+
+		let started = Instant::now();
+		let result = run_program(&git, root.path(), &["worktree", "add"], None, limits);
+		let elapsed = started.elapsed();
+		if let Ok(pid) = fs::read_to_string(&pid_file) {
+			let _ = Command::new("kill").arg(pid.trim()).status();
+		}
+		let output = result.expect("child exited 0");
+		assert!(elapsed < Duration::from_secs(10), "took {elapsed:?}");
+		assert!(output.status.success());
+		assert_eq!(output.stdout, b"out");
 	}
 }

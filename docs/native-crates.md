@@ -1,48 +1,64 @@
 # Native Crates
 
-Contributor-facing map of the Rust crates under `crates/`. These crates back
-`@oh-my-pi/pi-natives` and the embedded shell/PTY runtime. They are intentionally
-internal: end users see `@oh-my-pi/pi-natives` exports, not these crate APIs.
+Contributor map for Rust workspace members under `crates/`. They are implementation details behind `@oh-my-pi/pi-natives` and its embedded shell; package consumers use JavaScript entrypoints, not these crate APIs.
 
-For the consumer-side runtime contract see
-[`natives-architecture.md`](./natives-architecture.md). For inclusion policy
-covering when a crate should be promoted to user-facing docs, see
-[`user-facing-packages.md`](./user-facing-packages.md).
+The root `Cargo.toml` lists every crate under `crates/` explicitly in `workspace.members` — add new crates there. Its `[patch.crates-io]` selects vendored `cfg_aliases`, `grep-searcher`, `napi`, and `tree-sitter-go`.
 
-## Crate map
+## First-party crates
 
-| Crate | Path | Role |
-| --- | --- | --- |
-| `pi-natives` | [`crates/pi-natives`](../crates/pi-natives) | Top-level N-API `cdylib`; aggregates the other crates and exposes the JS-visible API. |
-| `pi-shell` | [`crates/pi-shell`](../crates/pi-shell) | Embedded shell / PTY / process management split out of `pi-natives` (wraps `brush-*`). |
-| `pi-ast` | [`crates/pi-ast`](../crates/pi-ast) | tree-sitter-based code summarizer and AST utilities; 50+ language grammars. |
-| `pi-iso` | [`crates/pi-iso`](../crates/pi-iso) | Task isolation backend resolver: APFS clones, btrfs/zfs reflinks, overlayfs, projfs, rcopy. |
-| `pi-walker` | [`crates/pi-walker`](../crates/pi-walker) | Parallel filesystem walker (ignore + globset) shared by grep, glob, and fs-scan cache. |
-| `pi_uu_grep` | [`crates/pi-uu-grep`](../crates/pi-uu-grep) | `grep` re-implemented on `grep-regex` / `grep-searcher`; runs in-process as a shell builtin. Entry: `pi_uu_grep::run`. |
-| `pi-uutils-ctx` | [`crates/pi-uutils-ctx`](../crates/pi-uutils-ctx) | Thread-local stdio + cwd context shim for embedding vendored uutils as in-process shell builtins. |
-| `brush-core` | [`crates/vendor/brush-core`](../crates/vendor/brush-core) | Vendored fork of [brush-shell](https://github.com/reubeno/brush) for embedded bash execution. |
-| `brush-builtins` | [`crates/vendor/brush-builtins`](../crates/vendor/brush-builtins) | Vendored bash builtins (`cd`, `echo`, `test`, `printf`, `read`, `export`, ...). |
+| Crate         | Path                                          | Role and consumers                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------- | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pi-natives`  | [`crates/pi-natives`](../crates/pi-natives)   | Top-level N-API `cdylib`. It exposes the JS-visible API and depends on `pi-ast`, `pi-diff`, `pi-edit`, `pi-iso`, `pi-predict`, `pi-shell`, `pi-vcs`, `pi-vfs`, `pi-voice`, and `pi-walker`.                                                                                                                                                                                                                                                                                                                                                     |
+| `pi-builtins` | [`crates/pi-builtins`](../crates/pi-builtins) | pi's in-process extras for the embedded shell: one module per command-line utility (`cat`, `grep`/`rg`, `sed`, `ls`, `find`, `jq`, `fd`, `diff`, the moreutils set, …) plus the process builtins (`ps`, `top`, `sleep`, `pgrep`, `pkill`, `pidwait`). `src/host.rs` holds the `Utility` trait and the `Host` view of the shell (stdio, working directory, exported environment, cancellation, `Host::vfs()`) that the utilities run against. `rg`, `grep`, `fd`, `find`, and `ast-grep`/`sg` are `AsyncUtility`s: the host awaits them as tokio tasks (synchronous utilities run on the blocking pool), and cancellation drops the body. Their output goes to memory-backed writers that `Host::flush_output` drains, and all input (stdin, operands, FIFOs, `<(…)`, decompressor pipes) is read through `stdio::Source`: provider files through the async `pi_vfs` API, regular files inline, descriptors readiness-driven through tokio `AsyncFd` (inherited ones via a private dup, each syscall gated by a zero-timeout `poll`, since `O_NONBLOCK` on a shared description would leak into other processes). Searches are fed chunk by chunk through the vendored grep-searcher's `Searcher::search_push`, so no utility uses the blocking pool on unix. Ports of uutils coreutils/findutils/sed and jaq live here too; see the crate `LICENSE` for third-party notices. |
+| `pi-diff`     | [`crates/pi-diff`](../crates/pi-diff)         | N-API-free jsdiff-compatible Myers, line, word, and structured-patch primitives, consumed by native diff bindings and the edit engine.                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `pi-edit`     | [`crates/pi-edit`](../crates/pi-edit)         | Edit-mode parsing, matching, staging, streaming previews, snapshots, and host-writer application (missing-path suffix recovery lives in the async layer of `pi-natives/src/edit.rs`); wrapped by native `EditSession` / `EditStore`.                                                                                                                                                                                                                                                                                                                                                                                                |
+| `pi-predict`  | [`crates/pi-predict`](../crates/pi-predict)   | N-API-free ngram, SmolLM, and macOS spelling-backed word-completion engines, wrapped by `TextPredictor`.                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `pi-vfs`      | [`crates/pi-vfs`](../crates/pi-vfs)           | Injectable async filesystem (with a blocking facade for sync callers), native host fast paths, and URL-preserving lexical helpers shared by shell, builtins, and traversal.                                                                                                                                                                                                                                                                                                                                                                                        |
+| `pi-shell`    | [`crates/pi-shell`](../crates/pi-shell)       | pi's embedded bash and the shell API `pi-natives` exports. `bash` is the bash 5.3 engine (IR, VM scheduler with safepoints, bash's builtins, host and state-store seams; `bash::syntax` lexer/parser with alias expansion and the `declare -f` printer, `bash::pattern` glob/extglob/ERE matching); `sys` holds the OS pieces (process spawner with sessions, process groups and Job Objects, files, pumps, `PATHEXT`, shebangs); `vfs` is the engine filesystem over `pi-vfs`; `host` (`PiHost`, every external leads its own session), `session` (the persistent driver), `tools` (`timeout`, `nohup`, `git`, command-running extras), `extras` (`pi-builtins` utilities as engine commands) and `git`; `testkit` holds the engine test kit, and `src/bin/obash` is the engine as a standalone shell (OS host, in-memory store) for differential tests and benchmarks against bash. On top sit `Shell`/`execute_shell`, command minimization, pipe taps, cancellation, and process plumbing; traversal and injectable filesystem primitives live in `pi-walker` and `pi-vfs`.                                                                                                                                                                                                                                                                                                                    |
+| `pi-voice`    | [`crates/pi-voice`](../crates/pi-voice)       | Cross-platform microphone/playback and Opus/WebRTC support used by the `AudioCapture`, `AudioPlayback`, and `LiveWebRtcPeer` bindings.                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `pi-ast`      | [`crates/pi-ast`](../crates/pi-ast)           | tree-sitter/ast-grep language registry, matching/editing, block analysis, and summarization. Common grammars are linked in; the rest load as WebAssembly modules the agent downloads on first use (`src/language/grammar.rs`). They are built and published by [stencil-hq/wasm-grammars](https://github.com/stencil-hq/wasm-grammars); `bun run gen:grammars` pins the latest release in `src/language/wasm_grammars.rs`.                                                                                                                      |
+| `pi-iso`      | [`crates/pi-iso`](../crates/pi-iso)           | Isolation backend implementations and diffing for APFS, btrfs, ZFS, Linux reflinks, overlayfs, Windows block clones, and ProjFS; fallback uses a Git worktree for Git repositories and recursive copy otherwise.                                                                                                                                                                                                                                                                                                                                |
+| `pi-walker`   | [`crates/pi-walker`](../crates/pi-walker)     | Parallel ignore-aware walker, per-directory listing cache, glob selection, and content search, all async over the caller's Tokio runtime (tasks are `tokio::spawn`ed per call, bounded by a permit semaphore; dropping a future cancels its work), shared by native scans and shell `rg`/`grep`/`fd`/`find`. Native reads use per-platform syscall fast paths; providers go through `pi-vfs` and are never cached.                                                                                                                                                                                                                                                       |
+| `pi-vcs`      | [`crates/pi-vcs`](../crates/pi-vcs)           | In-process version control: git on gitoxide (the git binary also handles credential-bound network transfers, reftable repos, and whole-worktree status/untracked walks) and Jujutsu on jj-lib; unified discovery and operations used by the `vcs*` native bindings.                                                                                                                                                                                                                                                                             |
 
-## What lives where
+## Vendored workspace crates
 
-- Native API surface and loader (`@oh-my-pi/pi-natives`):
-  [`natives-architecture.md`](./natives-architecture.md),
-  [`natives-addon-loader-runtime.md`](./natives-addon-loader-runtime.md),
-  [`natives-binding-contract.md`](./natives-binding-contract.md),
-  [`natives-build-release-debugging.md`](./natives-build-release-debugging.md),
-  [`natives-media-system-utils.md`](./natives-media-system-utils.md),
-  [`natives-rust-task-cancellation.md`](./natives-rust-task-cancellation.md),
-  [`natives-shell-pty-process.md`](./natives-shell-pty-process.md),
-  [`natives-text-search-pipeline.md`](./natives-text-search-pipeline.md).
-- Porting cross-references:
-  [`porting-from-pi-mono.md`](./porting-from-pi-mono.md),
-  [`porting-to-natives.md`](./porting-to-natives.md).
-- Filesystem scan cache contract that consumes `pi-walker`:
-  [`fs-scan-cache-architecture.md`](./fs-scan-cache-architecture.md).
+| Group                       | Paths                                                                                                                                                                         | Purpose                                                                                                                                                                                 |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Build/runtime compatibility | [`crates/vendor/cfg_aliases`](../crates/vendor/cfg_aliases), [`crates/vendor/grep-searcher`](../crates/vendor/grep-searcher), [`crates/vendor/napi`](../crates/vendor/napi), [`crates/vendor/tree-sitter-go`](../crates/vendor/tree-sitter-go) | Workspace patches fix macro compatibility, add a chunk-fed search (`Searcher::search_push`), fix N-API environment teardown, and fix Go grammar support respectively.                                                                             |
 
-## Policy
+`pi_builtins::extras::extras()` (defined in `src/extras.rs`) is the authoritative list of in-process extras; `pi-shell` (`src/extras.rs`) resolves a command name through the engine's builtins, pi's tools, then these extras, honoring the `PI_DISABLE_*` gates in the session environment `pi-shell` configures. A directory being a workspace member does not by itself mean that `pi-natives` exposes it as a JavaScript API.
 
-These crates are implementation details. End-user docs live with the consuming
-package (`@oh-my-pi/pi-natives`) and the architecture pages above. Promote a
-crate to a dedicated user-facing doc only when it grows a standalone CLI or
-public API consumed outside `packages/natives`.
+## Boundary map
+
+```text
+@oh-my-pi/pi-natives JS entrypoints
+  -> pi-natives (N-API conversion, platform bindings, task boundaries)
+       -> pi-ast / pi-diff / pi-edit / pi-iso / pi-predict / pi-vcs / pi-voice
+       -> pi-walker / pi-vfs
+       -> pi-shell
+            -> pi_shell::session / host / tools / extras (session driver, engine host, pi's commands)
+                 -> pi_shell::bash (engine: compiler, VM, bash builtins; bash::syntax, bash::pattern)
+                 -> pi_shell::sys (process spawner, OS files) / pi_shell::vfs (engine filesystem)
+            -> pi-builtins (in-process utilities + process builtins; host.rs: per-invocation I/O and cwd)
+            -> pi-vfs / pi-walker (filesystem provider and traversal)
+```
+
+For the loader and JS boundary, see:
+
+- [`natives-architecture.md`](./natives-architecture.md)
+- [`natives-addon-loader-runtime.md`](./natives-addon-loader-runtime.md)
+- [`natives-binding-contract.md`](./natives-binding-contract.md)
+
+Subsystem details live in:
+
+- [`natives-build-release-debugging.md`](./natives-build-release-debugging.md)
+- [`natives-media-system-utils.md`](./natives-media-system-utils.md)
+- [`natives-rust-task-cancellation.md`](./natives-rust-task-cancellation.md)
+- [`natives-shell-pty-process.md`](./natives-shell-pty-process.md)
+- [`natives-text-search-pipeline.md`](./natives-text-search-pipeline.md)
+- [`fs-scan-cache-architecture.md`](./fs-scan-cache-architecture.md)
+
+## Documentation policy
+
+These crates remain contributor-facing implementation details. Promote one to standalone user-facing documentation only when it gains a public API or executable consumed independently of `@oh-my-pi/pi-natives`; see [`user-facing-packages.md`](./user-facing-packages.md).

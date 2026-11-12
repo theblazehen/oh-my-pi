@@ -4,7 +4,7 @@
 //!
 //! - `iso_backend()` — kind enum of the platform-native backend.
 //! - `iso_resolve(preferred?)` — let the PAL pick the best backend (or honour a
-//!   hint) and report any fallback to the caller.
+//!   hint) and report any fallback to the caller; probes run off the JS thread.
 //! - `iso_probe(kind?)` — backend availability, with an optional explicit kind
 //!   override; falls back to the native backend when omitted.
 //! - `iso_start(kind?, lower, merged)` / `iso_stop(kind?, merged)` — sync
@@ -22,7 +22,10 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use pi_iso::{BackendKind, ChangeKind, Diff, FileChange, IsoError, IsolationBackend};
 
+use crate::{js, task};
+
 const ISO_UNAVAILABLE_PREFIX: &str = "ISO_UNAVAILABLE:";
+const ISO_UNAVAILABLE_WITH_LEADING_SPACE: &str = " ISO_UNAVAILABLE:";
 
 /// Isolation backend identifier. Numeric so the JS side can `switch` on
 /// the enum without string comparisons.
@@ -109,21 +112,26 @@ pub fn iso_probe(kind: Option<IsoBackendKind>) -> IsoProbeResult {
 	}
 }
 
-/// Pick the best backend available right now. `preferred` is treated as
-/// a hint — see [`pi_iso::resolve`] for the exact priority rules.
+/// Pick the best backend available right now.
+///
+/// `preferred` is treated as a hint — see [`pi_iso::resolve`] for the exact
+/// priority rules. Backend probes may spawn CLIs, so they run on the native
+/// blocking pool.
 #[napi]
-pub fn iso_resolve(preferred: Option<IsoBackendKind>) -> IsoResolveResult {
-	let resolution = pi_iso::resolve(preferred.map(from_napi_kind));
-	IsoResolveResult {
-		kind:       to_napi_kind(resolution.kind),
-		candidates: resolution
-			.candidates
-			.into_iter()
-			.map(to_napi_kind)
-			.collect(),
-		fell_back:  resolution.fell_back,
-		reason:     resolution.reason,
-	}
+pub fn iso_resolve(preferred: Option<IsoBackendKind>) -> task::Promise<IsoResolveResult> {
+	task::blocking("iso.resolve", (), move |_| {
+		let resolution = pi_iso::resolve(preferred.map(from_napi_kind));
+		Ok(IsoResolveResult {
+			kind:       to_napi_kind(resolution.kind),
+			candidates: resolution
+				.candidates
+				.into_iter()
+				.map(to_napi_kind)
+				.collect(),
+			fell_back:  resolution.fell_back,
+			reason:     resolution.reason,
+		})
+	})
 }
 
 /// Materialise `merged` as a writable view of `lower` using the requested
@@ -174,12 +182,13 @@ pub async fn iso_diff(lower: String, merged: String) -> Result<IsoDiff> {
 /// Use this to distinguish "this backend isn't installed" from a hard
 /// failure when handling caught errors on the JS side.
 #[napi]
-pub fn iso_is_unavailable_error(message: String) -> bool {
-	message.starts_with(ISO_UNAVAILABLE_PREFIX)
-		|| message.contains(&format!(" {ISO_UNAVAILABLE_PREFIX}"))
+pub fn iso_is_unavailable_error(message: napi::JsString) -> Result<bool> {
+	let message = js::utf8(message)?;
+	Ok(message.starts_with(ISO_UNAVAILABLE_PREFIX)
+		|| message.contains(ISO_UNAVAILABLE_WITH_LEADING_SPACE))
 }
 
-const fn to_napi_kind(kind: BackendKind) -> IsoBackendKind {
+pub(crate) const fn to_napi_kind(kind: BackendKind) -> IsoBackendKind {
 	match kind {
 		BackendKind::Apfs => IsoBackendKind::Apfs,
 		BackendKind::Btrfs => IsoBackendKind::Btrfs,
@@ -192,7 +201,7 @@ const fn to_napi_kind(kind: BackendKind) -> IsoBackendKind {
 	}
 }
 
-const fn from_napi_kind(kind: IsoBackendKind) -> BackendKind {
+pub(crate) const fn from_napi_kind(kind: IsoBackendKind) -> BackendKind {
 	match kind {
 		IsoBackendKind::Apfs => BackendKind::Apfs,
 		IsoBackendKind::Btrfs => BackendKind::Btrfs,

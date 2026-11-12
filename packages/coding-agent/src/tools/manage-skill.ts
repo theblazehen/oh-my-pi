@@ -1,6 +1,6 @@
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { type } from "arktype";
 import {
 	deleteManagedSkill,
 	getManagedSkillsDir,
@@ -10,6 +10,8 @@ import {
 import { isNameClaimedByAuthoredSkill } from "../extensibility/skills";
 import manageSkillDescription from "../prompts/tools/manage-skill.md" with { type: "text" };
 import type { ToolSession } from ".";
+
+import { cfgAutolearnEnabled } from "../autolearn/settings";
 
 const manageSkillSchema = type({
 	action: "'create' | 'update' | 'delete'",
@@ -48,7 +50,7 @@ export class ManageSkillTool implements AgentTool<typeof manageSkillSchema> {
 	constructor(private readonly refreshSkills?: () => Promise<void>) {}
 
 	static createIf(session: ToolSession): ManageSkillTool | null {
-		if (!session.settings.get("autolearn.enabled")) return null;
+		if (!cfgAutolearnEnabled.get(session.settings)) return null;
 		return new ManageSkillTool(session.refreshSkills);
 	}
 

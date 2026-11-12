@@ -14,7 +14,7 @@
  * — see `commands/complete.ts`. The flag→source mapping below is the only manual
  * knob and is keyed by flag name so it stays stable as flags are added.
  */
-import type { ArgDescriptor, CliConfig, CommandCtor, FlagDescriptor } from "@oh-my-pi/pi-utils/cli";
+import type { ArgDescriptor, CliConfig, CommandMetadata, FlagDescriptor } from "@oh-my-pi/pi-utils/cli";
 import { BUILTIN_TOOL_NAMES } from "../tools/builtin-names";
 
 export type Shell = "bash" | "zsh" | "fish";
@@ -67,7 +67,7 @@ export interface CompletionSpec {
 /** Single-value flags resolved against the live model catalog. */
 const MODEL_FLAGS: Record<string, true> = { model: true, smol: true, slow: true, plan: true };
 /** Single-value flags resolved against on-disk sessions. */
-const SESSION_FLAGS: Record<string, true> = { resume: true, fork: true, session: true };
+const SESSION_FLAGS: Record<string, true> = { resume: true, restore: true, fork: true, session: true };
 /** Flags whose value is a directory path. */
 const DIR_FLAGS: Record<string, true> = { "session-dir": true, "plugin-dir": true };
 
@@ -88,9 +88,9 @@ function argValue(desc: ArgDescriptor): ValueSource {
 	return { kind: "file" };
 }
 
-function buildFlags(Cmd: CommandCtor): CompletionFlag[] {
+function buildFlags(command: CommandMetadata): CompletionFlag[] {
 	const out: CompletionFlag[] = [];
-	const flags = Cmd.flags ?? {};
+	const flags = command.flags ?? {};
 	for (const name in flags) {
 		const desc = flags[name];
 		out.push({
@@ -104,9 +104,9 @@ function buildFlags(Cmd: CommandCtor): CompletionFlag[] {
 	return out;
 }
 
-function buildArgs(Cmd: CommandCtor): CompletionArg[] {
+function buildArgs(command: CommandMetadata): CompletionArg[] {
 	const out: CompletionArg[] = [];
-	const args = Cmd.args ?? {};
+	const args = command.args ?? {};
 	for (const name in args) {
 		const desc = args[name];
 		out.push({ name, description: desc.description ?? "", value: argValue(desc) });
@@ -374,7 +374,11 @@ function generateZsh(spec: CompletionSpec): string {
 
 	// Dynamic helpers (single source: `<bin> __complete <kind>` → value<TAB>desc).
 	parts.push(`_omp_call() {
-	local kind=$1
+	# zsh's _arguments invokes an action function with the compadd options it
+	# computed prepended ($subopts, then $expl — _arguments:465), so $1 is
+	# "-J" in a stock setup and the kind arrives last. Read it from the end:
+	# the prepended options can be either flags or option/value pairs.
+	local kind=\${argv[-1]}
 	local -a items
 	local line
 	for line in "\${(@f)$(command ${bin} __complete $kind -- "$PREFIX" 2>/dev/null)}"; do

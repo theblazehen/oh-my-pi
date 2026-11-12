@@ -1,12 +1,9 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { normalizeProfileName } from "@oh-my-pi/pi-utils/dirs";
+import { quotePosixArgument } from "../utils/shell-quote";
 
 export type ProfileAliasShell = "bash" | "zsh" | "fish" | "powershell" | "pwsh";
-
-function quoteForShell(pathValue: string): string {
-	return `'${pathValue.replace(/'/g, `'"'"'`)}'`;
-}
 
 function quoteForPowerShell(pathValue: string): string {
 	return `'${pathValue.replace(/'/g, `''`)}'`;
@@ -17,6 +14,13 @@ export interface ProfileAliasCommand {
 	posix: string;
 	fish: string;
 	powerShell: string;
+}
+
+/** Process inputs used to select the installed command or preserve a source invocation. */
+export interface ProfileAliasProcessOptions {
+	argv?: readonly string[];
+	cwd?: string;
+	compiled?: boolean;
 }
 
 const DEFAULT_ALIAS_COMMAND: ProfileAliasCommand = {
@@ -189,10 +193,14 @@ function normalizeShellName(
 	throw new Error(`Unsupported shell${shell ? ` "${shell}"` : ""}. Supported shells: bash, zsh, fish, PowerShell.`);
 }
 
-export function resolveProfileAliasCommandFromProcess(
-	argv: readonly string[] = process.argv,
-	cwd: string = process.cwd(),
-): ProfileAliasCommand {
+/** Resolve the command a generated profile alias should invoke. */
+export function resolveProfileAliasCommandFromProcess({
+	argv = process.argv,
+	cwd = process.cwd(),
+	compiled = process.env.PI_COMPILED === "true",
+}: ProfileAliasProcessOptions = {}): ProfileAliasCommand {
+	if (compiled) return DEFAULT_ALIAS_COMMAND;
+
 	const runtime = argv[0];
 	const script = argv[1];
 	if (!runtime || !script || !/\.[cm]?[jt]s$/.test(script)) return DEFAULT_ALIAS_COMMAND;
@@ -202,7 +210,7 @@ export function resolveProfileAliasCommandFromProcess(
 	// can't resolve backslash-separated paths, even on Windows (Git Bash, WSL).
 	const posixScriptPath = scriptPath.replace(/\\/g, "/");
 	const posixRuntime = runtime.replace(/\\/g, "/");
-	const posix = `${quoteForShell(posixRuntime)} ${quoteForShell(posixScriptPath)}`;
+	const posix = `${quotePosixArgument(posixRuntime)} ${quotePosixArgument(posixScriptPath)}`;
 	return {
 		display: `${posixRuntime} ${posixScriptPath}`,
 		posix,
@@ -361,9 +369,9 @@ export async function installProfileAlias(options: ProfileAliasInstallOptions): 
 		command,
 		reloadedWith:
 			shell === "fish"
-				? `source ${quoteForShell(configPath)}`
+				? `source ${quotePosixArgument(configPath)}`
 				: shell === "powershell" || shell === "pwsh"
 					? `. ${quoteForPowerShell(configPath)}`
-					: `. ${quoteForShell(configPath)}`,
+					: `. ${quotePosixArgument(configPath)}`,
 	};
 }
