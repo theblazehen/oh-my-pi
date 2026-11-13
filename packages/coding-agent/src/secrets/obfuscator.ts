@@ -1,8 +1,47 @@
-import * as crypto from "node:crypto";
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, Context, ImageContent, Message, TextContent } from "@oh-my-pi/pi-ai";
-import type { SessionContext } from "../session/session-context";
+import {
+	buildHashBase,
+	buildKeyedReplacementRun,
+	buildPlaceholder,
+	defaultPlaceholderKey,
+	inferCaseHint,
+	labelCollidesWithAnySecret,
+	lookupFriendlyPlaceholderAlias,
+	MIN_OBFUSCATE_SECRET_LEN,
+	PLACEHOLDER_RE,
+	placeholderWithoutFriendlyName,
+	type ReplaceRegexScan,
+	resumePlaceholderScanAfterRejectedCandidate,
+	SecretValueSet,
+	sanitizedLabelCollidesWithSecret,
+	sanitizeForCollisionCheck,
+	sanitizeSecretFriendlyName,
+} from "./placeholder";
+import {
+	buildReplaceRegexScan,
+	countOutsidePlaceholderRanges,
+	deepWalkStrings,
+	deobfuscateGeneratedPlaceholderRanges,
+	extendPastAdjacentPlaceholders,
+	firstOutsidePlaceholderRange,
+	mapReplaceRegexMatch,
+	outsidePlaceholderRangesAnyIndependentlyMatch,
+	placeholderInnerText,
+	redactWithFixedReplacementOutsidePlaceholders,
+	replaceRange,
+	textOutsidePlaceholderRanges,
+	trailingOutsidePreservedPlaceholderChunk,
+	transformOutsidePlaceholdersTracked,
+} from "./placeholder-scan";
 import { compileSecretRegex } from "./regex";
+import { RegistryRevision, TrackedMap, TrackedSet } from "./registry-revision";
+import {
+	ensureDistinctReplacement,
+	findNonMatchingReplacement,
+	generateDeterministicReplacement,
+	type RegexMatchContext,
+	regexHasUnresolvableShortMatchFallback,
+	regexRematchesInContext,
+} from "./replacement";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
@@ -15,560 +54,118 @@ export interface SecretEntry {
 	replacement?: string;
 	flags?: string;
 	friendlyName?: string;
+	/**
+	 * Regex entries only: literal substrings at least one of which every match
+	 * contains. Text containing none is skipped without running the regex.
+	 * Fail-safe: omitted means the regex always runs. Must be exhaustive for
+	 * the pattern; a wrong list here lets a secret through.
+	 */
+	literalPrefixes?: readonly string[];
+}
+
+interface CompiledRegexEntry {
+	regex: RegExp;
+	mode: "obfuscate" | "replace";
+	replacement?: string;
+	friendlyName?: string;
+	/** Pre-folded probes (lower-cased when the regex is case-insensitive); null = always scan. */
+	probes: readonly string[] | null;
+	ignoreCase: boolean;
+}
+
+/** One regex-entry match: the entry's index and the match's range. */
+interface RegexMatchSpan {
+	entry: number;
+	start: number;
+	end: number;
 }
 
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue | undefined };
 export type JsonRecord = { [key: string]: JsonValue | undefined };
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Deterministic replacement generation
-// ═══════════════════════════════════════════════════════════════════════════
+const EMPTY_SECRET_VALUES: ReadonlySet<string> = new Set();
+const NO_VALUES: readonly string[] = [];
+const NON_ASCII_RE = /[^\x00-\x7F]/;
 
-const REPLACEMENT_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-const NONMATCHING_REPLACEMENT_CHARS = `${REPLACEMENT_CHARS}!#$%&()*+,-./:;<=>?@[]^_{|}~`;
-// Whitespace bytes used to build last-resort redactions for a default replace
-// regex that matches every non-whitespace candidate (e.g. `\S{n}`). Only
-// `space`/`tab` are used — never a line terminator — so a `.`-style
-// match-everything regex (which matches space and tab but not `\n`) still
-// exhausts to the sentinel instead of redacting to a newline run.
-const WHITESPACE_REPLACEMENT_CHARS = " \t";
+/** Distinct placeholder prefixes whose regex verdict is memoized; forged prefixes beyond this are just re-tested. */
+const MAX_PREFIX_REGEX_MEMO = 4096;
 
-/** Generate a deterministic same-length replacement string from a secret value. */
-function generateDeterministicReplacement(secret: string): string {
-	if (secret.length === 0) return "";
-	// Prefix generated chunks with a fixed `ZZ` so re-redacting an already-emitted
-	// 1–2 char chunk is a fixed point (the deterministic replacement of a <=2-char
-	// value is itself `Z`/`ZZ`), keeping short default-replacement remainders next
-	// to a reversible placeholder stable across an obfuscator restart.
-	const hash = BigInt(Bun.hash(secret));
-	const chars = secret.length === 1 ? ["Z"] : ["Z", "Z"];
-	let h = hash;
-	for (let i = chars.length; i < secret.length; i++) {
-		h = h ^ (BigInt(i + 1) * 0x9e3779b97f4a7c15n);
-		const idx = Number((h < 0n ? -h : h) % BigInt(REPLACEMENT_CHARS.length));
-		chars.push(REPLACEMENT_CHARS[idx]);
-	}
-	return chars.join("");
+/** Per-string results reused within one {@link SecretObfuscator.batch}. */
+interface TextScan {
+	/** Registry revision the entry was computed under; stale entries are recomputed. */
+	revision: number;
+	/** Regex values in the raw text (a pure function of the text: regex entries never change). */
+	initialValues: readonly string[];
+	/** No configured literal and no `$$` occurs (depends on the literal mappings). */
+	literalFree: boolean;
+	/** Standalone collection result, i.e. after replace simulation; filled on first use. */
+	collectedValues: readonly string[] | undefined;
 }
 
-/**
- * Force a length-preserving deterministic replacement to differ from the secret
- * it stands in for. `generateDeterministicReplacement` seeds its first 1–2 chars
- * with the `Z`/`ZZ` sentinel, so a whole configured value that is exactly `Z` or
- * `ZZ` (or an astronomically unlikely longer hash collision) would otherwise be
- * emitted unchanged and ship the raw secret to the provider. Flip the first char
- * to a fixed different glyph: same length, still deterministic, guaranteed != the
- * secret. Only safe for a whole CONFIGURED value (a plain secret matches its own
- * literal, so the perturbed output is no longer matched and stays a fixed point);
- * per-chunk remainders must keep the sentinel to remain idempotent across restart.
- */
-function ensureDistinctReplacement(replacement: string, secret: string): string {
-	if (replacement.length === 0 || replacement !== secret) return replacement;
-	const alt = replacement[0] === REPLACEMENT_CHARS[0] ? REPLACEMENT_CHARS[1] : REPLACEMENT_CHARS[0];
-	return alt + replacement.slice(1);
-}
-
-// How far left of the matched span the re-match scan begins looking for a match
-// that overlaps the candidate. This bounds ONLY the match-start search position,
-// never the lookbehind/lookahead context: the probe below substitutes the
-// candidate into the FULL text, so a regex's lookbehind/lookahead assertions
-// always evaluate against complete context regardless of width. The single
-// re-match this misses is one that begins more than this many bytes before the
-// span and extends into it (a single match longer than the window) — that only
-// churns the chosen redaction marker between candidates, never back to the raw
-// matched value, so it cannot leak a secret.
-const REGEX_REMATCH_BACKSCAN = 512;
-
-interface RegexMatchContext {
-	/** Full text the match was found in (positions are offsets into it). */
+interface RegexScanMemo {
 	text: string;
-	/** Start/end of the matched span being replaced. */
-	start: number;
-	end: number;
+	revision: number;
+	current: ReadonlySet<string>;
+	currentSize: number;
+	shared: ReadonlySet<string>;
+	sharedSize: number;
+	ranges: Array<{ start: number; end: number }>;
+	scan: ReplaceRegexScan;
 }
 
 /**
- * Whether `candidate`, substituted for the matched span in its surrounding text,
- * is re-matched by `regex` at its own position. A replace-mode regex that depends
- * on context (lookbehind/lookahead/`\b`) can match a candidate that does NOT match
- * in isolation: e.g. `(?<=api=)[AZ]` never matches a bare `A`, but `api=A` does, so
- * a candidate `A` chosen by an isolation test is re-redacted on the next obfuscate()
- * pass and can oscillate back to the raw matched value. The probe substitutes the
- * candidate into the FULL text — not a truncated window — so a wide lookbehind or
- * lookahead (e.g. `(?<=A{600})`) still evaluates against the context that makes it
- * match. Truncating that context dropped the assertion's reach and falsely
- * accepted an oscillating, leaky candidate. The scan starts a bounded distance
- * left of the span and stops once a match begins at/after the span's end (matches
- * arrive in order), keeping per-candidate cost independent of total text length.
+ * One non-global regex matching any of `literals` anywhere: `test()` is true
+ * exactly when some literal occurs, in a single scan instead of one
+ * `includes` per literal. Undefined when there is nothing to detect.
  */
-function regexRematchesInContext(candidate: string, regex: RegExp, ctx: RegexMatchContext): boolean {
-	const probe = ctx.text.slice(0, ctx.start) + candidate + ctx.text.slice(ctx.end);
-	const spanStart = ctx.start;
-	const spanEnd = spanStart + candidate.length;
-	regex.lastIndex = Math.max(0, spanStart - REGEX_REMATCH_BACKSCAN);
-	for (let m = regex.exec(probe); m !== null; m = regex.exec(probe)) {
-		const matchStart = m.index;
-		const matchEnd = m.index + m[0].length;
-		// Matches arrive in increasing position; once one starts at or past the
-		// span's end it cannot cover the candidate, and neither can any later one.
-		if (matchStart >= spanEnd) break;
-		// A match overlapping the candidate's own bytes means those bytes get
-		// re-redacted on a later pass — not a fixed point.
-		if (matchEnd > spanStart) return true;
-		// Zero-width matches do not advance lastIndex; step past to avoid a loop.
-		if (m[0].length === 0) regex.lastIndex++;
-	}
-	return false;
-}
-
-/**
- * Search same-length replacements for one the regex does NOT match, so a default
- * regex secret whose deterministic replacement collides with its own value (the
- * `Z`/`ZZ` sentinel, or an astronomical hash collision) is still redacted to a
- * STABLE nonmatching value instead of shipping the raw secret. A nonmatching
- * candidate is a fixed point under re-obfuscation — the regex never re-matches it,
- * so it cannot re-leak on a later pass. The search stays bounded to O(length *
- * alphabet) regardless of value length: first exhaust every single-position
- * substitution against a deterministic baseline (`AAAA…`, then `!AAA…`, `A!AA…`,
- * …) so any regex that only needs one out-of-class byte — regardless of position —
- * is found in a handful of probes rather than enumerating every combination (which
- * for a 3-byte match-everything config, e.g. `[\s\S]{3}`, would otherwise run
- * 90**3 = 729000 candidates through the regex on every single match, stalling
- * provider requests). Candidates are enumerated deterministically over a stable
- * ASCII alphabet: alphanumerics first (usually enough), then punctuation fallback
- * bytes when the regex covers every alphanumeric candidate. When the regex still
- * matches around a lone perturbed byte (for example `[A-Za-z0-9].*` matching the
- * unperturbed tail), full-width same-byte candidates (`!!!!!`, `_____`, …) are
- * tried next. When the regex covers every non-whitespace candidate (e.g. `\S{n}`),
- * whitespace markers (a full space/tab run, then a single whitespace byte among
- * non-whitespace filler) are tried as a last resort. A genuine match-everything
- * regex (`.`/`[\s\S]`, which also matches space and tab) still exhausts this bounded
- * sweep and returns undefined, letting the caller keep its own fixed-point fallback
- * — bounded search can in principle miss an escape that depends jointly on
- * multiple positions in a way no single-position swap reaches, but no realistic
- * secret-redaction regex (character classes, literal matches, anchored/bounded
- * repeats) has that shape.
- */
-function findNonMatchingReplacement(value: string, regex: RegExp, context: RegexMatchContext): string | undefined {
-	const len = value.length;
-	if (len === 0) return undefined;
-	// Exhaust every single-position substitution against the deterministic baseline
-	// first (covers the common case cheaply), then fall back to full-width same-byte
-	// candidates for a regex that only rejects a lone perturbed byte in context.
-	const baseline = NONMATCHING_REPLACEMENT_CHARS[0].repeat(len);
-	for (let position = 0; position < len; position++) {
-		for (const ch of NONMATCHING_REPLACEMENT_CHARS) {
-			const candidate = `${baseline.slice(0, position)}${ch}${baseline.slice(position + 1)}`;
-			if (candidate === value) continue;
-			if (!regexRematchesInContext(candidate, regex, context)) return candidate;
-		}
-	}
-	// If the regex can still match around a lone punctuation byte (for example
-	// `[A-Za-z0-9].*` matching the `AAAA` tail of `!AAAA`), try full-width
-	// same-byte fallbacks like `!!!!!`, `_____`, etc. before giving up.
-	for (const ch of NONMATCHING_REPLACEMENT_CHARS) {
-		const candidate = ch.repeat(len);
-		if (candidate === value) continue;
-		if (!regexRematchesInContext(candidate, regex, context)) return candidate;
-	}
-	return findWhitespaceFallbackReplacement(value, regex, context);
-}
-
-/**
- * Last-resort fallback for a default replace regex that matches every
- * non-whitespace candidate. Builds same-length whitespace markers the regex
- * cannot match: first a full space/tab run (handles `\S`-class patterns), then a
- * single whitespace byte among non-whitespace filler (` AAAA`, `A AAA`, …). The
- * mixed marker defeats regexes that ALSO match all-space/all-tab runs, e.g.
- * `(?:\S{n}| {n}|\t{n})`, because the lone whitespace byte breaks every
- * fixed-length run. A genuine match-everything regex (`.`/`[\s\S]`) matches the
- * filler and the whitespace alike, so this still returns undefined there, keeping
- * the caller's sentinel as the sole fixed point.
- */
-function findWhitespaceFallbackReplacement(
-	value: string,
-	regex: RegExp,
-	context: RegexMatchContext,
-): string | undefined {
-	const len = value.length;
-	const filler = NONMATCHING_REPLACEMENT_CHARS[0];
-	for (const ws of WHITESPACE_REPLACEMENT_CHARS) {
-		const full = ws.repeat(len);
-		if (full !== value) {
-			if (!regexRematchesInContext(full, regex, context)) return full;
-		}
-		for (let pos = 0; pos < len; pos++) {
-			const candidate = `${filler.repeat(pos)}${ws}${filler.repeat(len - pos - 1)}`;
-			if (candidate === value) continue;
-			if (!regexRematchesInContext(candidate, regex, context)) return candidate;
-		}
-	}
-	return undefined;
-}
-
-/**
- * Whether a default (no custom `replacement`) replace-mode regex can never
- * safely redact a 1-2 char match: `findNonMatchingReplacement`'s bounded
- * search — the same search `#generateRegexReplacement` runs at match time —
- * finds no candidate the regex fails to re-match. This holds independent of
- * any actual per-install key: the search already exhausts every character in
- * `REPLACEMENT_CHARS` (the alphabet `buildKeyedReplacementRun` draws its
- * fallback marker from) plus punctuation and whitespace, so if none of those
- * escape the regex, no key-derived marker drawn from the same alphabet can
- * either — the marker is guaranteed to re-match too, making every such match
- * unresolvable: the fallback could only ever emit the raw matched text
- * unchanged. Probed with a value (`"\0".repeat(length)`) the bounded search
- * never treats as a real candidate, so the result depends only on the
- * regex's own matching behavior, not on this specific probe.
- */
-export function regexHasUnresolvableShortMatchFallback(regex: RegExp): boolean {
-	return ([1, 2] as const).some(length => {
-		const probe = "\u0000".repeat(length);
-		const savedLastIndex = regex.lastIndex;
-		try {
-			return findNonMatchingReplacement(probe, regex, { text: probe, start: 0, end: length }) === undefined;
-		} finally {
-			regex.lastIndex = savedLastIndex;
-		}
-	});
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Placeholder format
-// ═══════════════════════════════════════════════════════════════════════════
-
-const HASH_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-// Base length is sized for ~62 bits of entropy (64 bits of a keyed digest
-// rendered as 12 base36 chars) so unrelated secrets do not collide on a shared
-// base. A collision would let a persisted placeholder deobfuscate to the wrong
-// secret when the configured secret set or its ordering changes across sessions.
-const HASH_LEN = 12;
-const MAX_FRIENDLY_NAME_LEN = 32;
-// Plain/regex obfuscate matches shorter than this are toned down (never placed
-// behind a reversible placeholder) to avoid redacting small words/fragments.
-export const MIN_OBFUSCATE_SECRET_LEN = 8;
-
-// Per-process fallback key used when a caller does not supply a persisted
-// per-install key. It is random (never shipped in source), so model-visible
-// placeholders cannot be reversed by dictionary-hashing candidate secrets; it
-// only forgoes cross-session token stability, which the persisted key provides.
-let ephemeralPlaceholderKey: string | undefined;
-function defaultPlaceholderKey(): string {
-	ephemeralPlaceholderKey ??= crypto.randomBytes(32).toString("base64url");
-	return ephemeralPlaceholderKey;
-}
-
-type PlaceholderCaseHint = "U" | "L" | "C" | "M";
-
-/** Normalize a friendly name into the model-visible placeholder prefix. */
-export function sanitizeSecretFriendlyName(name: string): string | undefined {
-	const sanitized = name
-		.replace(/[^A-Za-z0-9]/g, "")
-		.toUpperCase()
-		.slice(0, MAX_FRIENDLY_NAME_LEN);
-	return sanitized.length > 0 ? sanitized : undefined;
-}
-
-/**
- * Normalize a secret value into the same alnum-only, uppercased shape a
- * friendly-name label or placeholder prefix is sanitized into, so comparing a
- * raw (possibly lowercase/punctuated) secret value against already-sanitized,
- * model-visible text does not miss a case- or separator-only variant. Unlike
- * `sanitizeSecretFriendlyName` this never truncates and never signals "empty"
- * via `undefined` — callers already guard on `.length > 0` before comparing.
- */
-function sanitizeForCollisionCheck(value: string): string {
-	return value.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-}
-
-// A label leaks a secret either by containing the whole normalized secret or,
-// once it reaches the public display cap, by being the secret's visible prefix.
-// Shorter names like "TOKEN" can still be intentional generic labels.
-function sanitizedLabelCollidesWithSecret(sanitizedLabel: string, sanitizedSecret: string): boolean {
-	if (sanitizedSecret.length === 0) return false;
-	if (sanitizedLabel.includes(sanitizedSecret)) return true;
-	return sanitizedLabel.length >= MAX_FRIENDLY_NAME_LEN && sanitizedSecret.startsWith(sanitizedLabel);
-}
-
-/**
- * Whether an entry needs the persisted placeholder key: either because it can
- * produce a reversible (keyed) obfuscate-mode placeholder, or because a default
- * (no custom `replacement`) replace-mode regex can reach
- * `#generateRegexReplacement`'s key-derived idempotent fallback marker (see
- * `#generateReplacement`) when every same-length candidate re-matches a
- * pathological match-everything config (e.g. `[\s\S]{8}`). That fallback depends
- * on the persisted per-install key — not just length — to stay a fixed point
- * across a process restart; without a persisted key, a fresh install falls back
- * to a process-random key (`defaultPlaceholderKey()`), so the fallback marker
- * would churn across restarts even though the algorithm itself is stable. A
- * regex WITH a custom `replacement` never reaches that fallback (it always emits
- * the literal configured string), and a plain replace secret's replacement is
- * pure content-hash (`#generateSecretReplacement`), so neither needs the key.
- * Short plain obfuscate entries are toned down (never placeheld), so they must
- * NOT force key creation: otherwise a `secret-placeholder.key` file is written
- * and persisted for a config that ends up with no active secrets, leaving the
- * key readable via a tool and reusable for later placeholders.
- */
-export function secretEntryNeedsPlaceholderKey(entry: SecretEntry): boolean {
-	if ((entry.mode ?? "obfuscate") === "obfuscate") {
-		if (entry.type === "regex") return true;
-		return entry.content.length >= MIN_OBFUSCATE_SECRET_LEN;
-	}
-	return entry.type === "regex" && entry.replacement === undefined;
-}
-
-/**
- * Whether a plain replace-mode replacement string can contribute a fragment that
- * helps the replace phase reconstruct an obfuscate `content`. During obfuscate()'s
- * replace phase the output is a tiling of passthrough bytes (adversary-controlled
- * provider text) and whole replacement outputs; any contiguous occurrence of
- * `content` in that output is covered by interior replacement tiles (each a
- * substring of `content`) bordered by passthrough at the ends, where the border
- * tile may be a suffix of a replacement (forming `content`'s prefix) or a prefix
- * of a replacement (forming `content`'s suffix). An EMPTY replacement deletes its
- * trigger entirely, joining the passthrough on both sides; with adversary-chosen
- * surrounding bytes that can form any non-empty `content` across the deleted gap.
- * So a replacement can help iff it is empty, is a substring of `content`,
- * contains `content`, or shares such a border overlap.
- */
-function replacementCanFormContent(replacement: string, content: string): boolean {
-	if (replacement.length === 0) return content.length > 0;
-	if (content.includes(replacement) || replacement.includes(content)) return true;
-	const maxOverlap = Math.min(replacement.length, content.length);
-	for (let k = 1; k <= maxOverlap; k++) {
-		// A suffix of the replacement forms the prefix of the content (left border),
-		// or a prefix of the replacement forms the suffix of the content (right border).
-		if (content.startsWith(replacement.slice(replacement.length - k)) || content.endsWith(replacement.slice(0, k))) {
-			return true;
-		}
-	}
-	return false;
-}
-
-/**
- * Whether a SET of entries needs the persisted placeholder key. `obfuscate()`
- * applies plain replace-mode mappings before the plain-obfuscate pass, so a plain
- * obfuscate entry only emits a reversible (keyed) placeholder when its content can
- * still appear AFTER the replace phase. When no obfuscate entry can ever produce a
- * placeholder, the persisted key must NOT be required/created — otherwise an
- * effectively replace-only secret set still writes `secret-placeholder.key` and
- * fails startup when the agent config dir is unwritable.
- *
- * The decision models the replace phase as the obfuscator actually runs it:
- * replace mappings are content-keyed (later duplicate wins) and applied in
- * descending content-length order; for a fresh probe (no prior placeholders) that
- * phase is plain sequential substring replacement. A plain obfuscate entry needs
- * the key when its content survives that simulated phase (direct typing) OR when
- * any effective replacement can form the content via tiling — a substring,
- * wholesale superstring, or prefix/suffix border that joins with surrounding
- * passthrough bytes (see `replacementCanFormContent`). This covers direct
- * shadowing (`SECRET -> safe`), reintroduction, duplicate ordering, transitive
- * chains, and context-joined fragments uniformly. Default (omitted) replacements
- * are deterministic, length-preserving, and distinct, so a same-content shadow
- * with no other interacting replacement stays key-free.
- * Replacement outputs are themselves rewritten by every later (shorter-content)
- * replacement before the plain-obfuscate pass sees them, so a fragment that a
- * subsequent replacement erases (`AA -> SEC` then `S -> X` turns every `SEC` into
- * `XEC`) no longer forces the key. Surrounding bytes stay modeled as arbitrary
- * passthrough, so testing the surviving fragment only drops false positives and
- * never under-approximates a real key need.
- */
-export function secretEntriesNeedPlaceholderKey(entries: SecretEntry[]): boolean {
-	const replaceMap = new Map<string, string>();
-	for (const entry of entries) {
-		if (entry.type !== "plain" || (entry.mode ?? "obfuscate") !== "replace") continue;
-		replaceMap.set(
-			entry.content,
-			entry.replacement ?? ensureDistinctReplacement(generateDeterministicReplacement(entry.content), entry.content),
-		);
-	}
-	const replacePhase = [...replaceMap].sort((a, b) => b[0].length - a[0].length);
-	// Apply the replace phase from `start` onward. The phase runs in descending
-	// content-length order, so a replacement output emitted at index i is rewritten
-	// only by the later (shorter-content) replacements at i+1…; `start` 0 models a
-	// value typed directly into the input.
-	const applyReplacePhaseFrom = (text: string, start: number): string => {
-		let result = text;
-		for (let i = start; i < replacePhase.length; i++) {
-			result = result.split(replacePhase[i][0]).join(replacePhase[i][1]);
-		}
-		return result;
-	};
-	return entries.some(entry => {
-		if (!secretEntryNeedsPlaceholderKey(entry)) return false;
-		// Regex obfuscate entries match dynamically; conservatively require the key.
-		if (entry.type !== "plain") return true;
-		const content = entry.content;
-		if (applyReplacePhaseFrom(content, 0).includes(content)) return true;
-		// Test each replacement output in the form it SURVIVES the rest of the phase,
-		// so a fragment a later replacement erases no longer forces the key. The
-		// content it tiles into must also survive those later replacements: if a
-		// shorter-content replacement rewrites the surrounding passthrough bytes
-		// (e.g. `AA -> SEC` forms `SEC`+`RET12`, then `R -> X` turns the freshly
-		// formed `SECRET12` into `SECXET12`), the content can never reach the
-		// obfuscate pass, so the key is not needed. Requiring content stability only
-		// drops such false positives — a formation that genuinely survives is still
-		// caught at the replacement index that produces it.
-		return replacePhase.some(
-			([, replacement], i) =>
-				applyReplacePhaseFrom(content, i + 1) === content &&
-				replacementCanFormContent(applyReplacePhaseFrom(replacement, i + 1), content),
-		);
-	});
-}
-
-// Derive the model-visible base from a KEYED digest of the secret. xxHash is
-// fast and unkeyed, so a fixed-seed content hash of a low-entropy secret could
-// be dictionaried from the transcript; HMAC-SHA256 under a private per-install
-// key cannot, since the attacker lacks the key.
-function buildHashBase(key: string, value: string): string {
-	const digest = new Bun.CryptoHasher("sha256", key).update(value).digest();
-	let v = 0n;
-	for (let i = 0; i < 8; i++) v = (v << 8n) | BigInt(digest[i]);
-	const radix = BigInt(HASH_CHARS.length);
-	let tag = "";
-	for (let i = 0; i < HASH_LEN; i++) {
-		tag += HASH_CHARS[Number(v % radix)];
-		v /= radix;
-	}
-	return tag;
-}
-
-// Build a deterministic, key-derived run of REPLACEMENT_CHARS of the given
-// length. Used to redact a per-chunk replace remainder to a marker that depends
-// only on the per-install key and the remainder length, so a fresh obfuscator
-// reproduces the identical marker (idempotent redaction across restarts) while
-// the run stays unpredictable without the key (raw sentinel-shaped bytes cannot
-// equal the marker, so they are still redacted rather than passed through).
-function buildKeyedReplacementRun(key: string, length: number): string {
-	if (length <= 0) return "";
-	const radix = REPLACEMENT_CHARS.length;
-	let out = "";
-	for (let block = 0; out.length < length; block++) {
-		const digest = new Bun.CryptoHasher("sha256", key).update(`replace-chunk\0${length}\0${block}`).digest();
-		for (let i = 0; i < digest.length && out.length < length; i++) {
-			out += REPLACEMENT_CHARS[digest[i] % radix];
-		}
-	}
-	return out;
-}
-
-function inferCaseHint(secret: string): PlaceholderCaseHint | undefined {
-	let hasCased = false;
-	let hasUpper = false;
-	let hasLower = false;
-	let capitalized = true;
-	let seenFirstCased = false;
-
-	for (let i = 0; i < secret.length; i++) {
-		const code = secret.charCodeAt(i);
-		const isUpper = code >= 65 && code <= 90;
-		const isLower = code >= 97 && code <= 122;
-		if (!isUpper && !isLower) continue;
-
-		hasCased = true;
-		if (isUpper) {
-			hasUpper = true;
-			if (seenFirstCased) capitalized = false;
-		} else {
-			hasLower = true;
-			if (!seenFirstCased) capitalized = false;
-		}
-		seenFirstCased = true;
-	}
-
-	if (!hasCased) return undefined;
-	if (hasUpper && !hasLower) return "U";
-	if (hasLower && !hasUpper) return "L";
-	if (capitalized) return "C";
-	return "M";
-}
-
-function buildPlaceholder(hint: PlaceholderCaseHint | undefined, base: string, friendlyName?: string): string {
-	const prefix = friendlyName ? `${friendlyName}_` : "";
-	return hint ? `$$${prefix}${base}:${hint}$$` : `$$${prefix}${base}$$`;
-}
-
-/** Regex matching `$$HASH$$`, `$$HASH:U$$`, and `$$FRIENDLY_HASH(:hint)$$` placeholders. */
-const PLACEHOLDER_RE = /\$\$(?:[A-Z0-9]+_)?[A-Z0-9]{4,}(?::[ULCM])?\$\$/g;
-
-function resumePlaceholderScanAfterRejectedCandidate(match: RegExpExecArray): void {
-	// RegExp#exec does not find overlapping matches. Restart at the rejected
-	// candidate's closing delimiter, which can open an immediately adjacent placeholder.
-	PLACEHOLDER_RE.lastIndex = match.index + match[0].length - 2;
-}
-
-function placeholderWithoutFriendlyName(placeholder: string): string | undefined {
-	const match = /^\$\$[A-Z0-9]+_([A-Z0-9]{4,}(?::[ULCM])?)\$\$$/.exec(placeholder);
-	return match ? `$$${match[1]}$$` : undefined;
-}
-
-function lookupFriendlyPlaceholderAlias(
-	deobfuscateMap: ReadonlyMap<string, { secret: string; recursive: boolean }>,
-	placeholder: string,
-): { secret: string; recursive: boolean } | undefined {
-	const direct = deobfuscateMap.get(placeholder);
-	if (direct !== undefined) return direct;
-	const unprefixed = placeholderWithoutFriendlyName(placeholder);
-	return unprefixed !== undefined ? deobfuscateMap.get(unprefixed) : undefined;
-}
-
-const PENDING_PLACEHOLDER_SUFFIX_RE = /(?:\$\$(?:[A-Z0-9]+_)?[A-Z0-9]*(?::[ULCM]?)?|\$)$/;
-
-// Withhold a trailing run that could be the start of a placeholder from streamed
-// deltas, so a partial token is never emitted before deobfuscation can replace
-// it. A lone trailing delimiter character is always buffered because it can open
-// a placeholder; the final non-streamed flush re-emits it when no token follows.
-export function stripPendingSecretPlaceholderSuffix(text: string): string {
-	const pendingPlaceholderStart = text.match(PENDING_PLACEHOLDER_SUFFIX_RE);
-	if (pendingPlaceholderStart?.index === undefined) return text;
-	return text.slice(0, pendingPlaceholderStart.index);
-}
-
-interface RegexScanSegment {
-	scanStart: number;
-	scanEnd: number;
-	textStart: number;
-	textEnd: number;
-	generatedPlaceholder: boolean;
-	recursive: boolean;
-}
-
-interface ReplaceRegexScan {
-	text: string;
-	segments: RegexScanSegment[];
+function buildLiteralDetector(literals: readonly string[], flags?: string): RegExp | undefined {
+	if (literals.length === 0) return undefined;
+	const sorted = [...new Set(literals)].sort((a, b) => b.length - a.length);
+	return new RegExp(sorted.map(literal => RegExp.escape(literal)).join("|"), flags);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SecretObfuscator
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * Invariant: every piece of state redaction reads either never changes after
+ * construction (regex entries, a readonly field of a readonly array) or lives
+ * in a collection bound to `#revision` (`TrackedMap`, `TrackedSet`,
+ * `SecretValueSet` with a revision), whose writes bump it. The short-lived
+ * reuse inside one batch or call (per-string scans, the regex scan memo,
+ * sorted literal caches) is keyed by `#revision.value`, so a mint partway
+ * through can never leave a stale result in use. No redaction result is kept
+ * across batches.
+ */
 export class SecretObfuscator {
-	/** Plain secrets: secret → index (known at construction) */
-	#plainMappings = new Map<string, number>();
+	/** Registry version; see the class invariant. Declared first: the tracked fields below bind to it. */
+	readonly #revision = new RegistryRevision();
 
-	/** Regex entries (patterns compiled at construction) */
-	#regexEntries: Array<{ regex: RegExp; mode: "obfuscate" | "replace"; replacement?: string; friendlyName?: string }> =
-		[];
+	/** Plain secrets: secret → index (known at construction) */
+	#plainMappings = new TrackedMap<string, number>(this.#revision);
+
+	/** Regex entries (compiled at construction; not frozen at runtime, frozen arrays iterate measurably slower) */
+	readonly #regexEntries: readonly CompiledRegexEntry[];
 
 	/** All obfuscate-mode mappings: index → { secret, placeholder } */
-	#obfuscateMappings = new Map<number, { secret: string; placeholder: string }>();
+	#obfuscateMappings = new TrackedMap<number, { secret: string; placeholder: string }>(this.#revision);
 
 	/** Replace-mode plain mappings: secret → replacement */
-	#replaceMappings = new Map<string, string>();
+	#replaceMappings = new TrackedMap<string, string>(this.#revision);
 
 	/** Reverse lookup for LIVE deobfuscation (provider output, tool-call args):
 	 *  keyed placeholder → secret plus recursion policy. Only placeholders this
 	 *  obfuscator generated under the per-install key (and their friendly-name-
 	 *  independent aliases) live here, so a prompt-injected model cannot synthesize
 	 *  one without the key. */
-	#deobfuscateMap = new Map<string, { secret: string; recursive: boolean }>();
+	#deobfuscateMap = new TrackedMap<string, { secret: string; recursive: boolean }>(this.#revision);
 
 	/** Exact placeholder tokens generated by this obfuscator revision (no aliases). */
-	#generatedPlaceholders = new Set<string>();
+	#generatedPlaceholders = new TrackedSet<string>(this.#revision);
 
 	/** Deterministic replace chunks emitted by this obfuscator, used to keep re-obfuscation idempotent. */
-	#generatedReplaceChunks = new Set<string>();
+	#generatedReplaceChunks = new TrackedSet<string>(this.#revision);
 
 	/** Every configured plain-secret literal value (both obfuscate and replace
 	 *  mode), collected before any placeholder is minted. A generated placeholder
@@ -577,22 +174,62 @@ export class SecretObfuscator {
 	 *  indistinguishable from that placeholder on the NEXT obfuscate() pass (its
 	 *  own plain-secret redaction already ran, sorted by length, before the
 	 *  placeholder existed) and would survive verbatim in provider-visible text. */
-	#configuredSecretValues = new Set<string>();
+	#configuredSecretValues = new SecretValueSet(undefined, this.#revision);
+
+	/** Every secret value with an obfuscate-mode mapping (mirrors `#obfuscateMappings`). */
+	#mintedSecretValues = new SecretValueSet(undefined, this.#revision);
+
+	/** First obfuscate index minted for each secret value (`#findObfuscateIndex` without a scan). */
+	#obfuscateIndexBySecret = new TrackedMap<string, number>(this.#revision);
 
 	/** Regex values seen in the current obfuscate input, used to keep friendly labels from exposing normalized matches that are discovered later in the same pass. */
-	#currentRegexSecretValues = new Set<string>();
+	#currentRegexSecretValues = new SecretValueSet();
+
+	/** Batch-wide regex values supplied by the caller for the call in progress; checked beside the current values, never copied. */
+	#sharedRegexSecretValues: ReadonlySet<string> = EMPTY_SECRET_VALUES;
+
+	/** Placeholder prefix → whether a configured regex matches it. Regex entries are fixed after construction. */
+	#prefixRegexMatches = new Map<string, boolean>();
+
+	/** Literal-derived data (sorted mappings and detectors), valid for the recorded mapping versions. */
+	#sortedReplaceEntries: [string, string][] | undefined;
+	#sortedPlainEntries: [string, number][] | undefined;
+	#literalDetector: RegExp | undefined;
+	/** Literals, `$$` and case-sensitive probes in one regex; see {@link #mayNeedRedaction}. */
+	#cleanDetector: RegExp | undefined;
+	/** Configured literals only (no `$$`); `null` when there are none. See {@link #isRedactionIdentity}. */
+	#configuredLiteralDetector: RegExp | null | undefined;
+	#literalCachePlainVersion = -1;
+	#literalCacheReplaceVersion = -1;
+
+	/** Probes of case-sensitive probed regex entries. */
+	readonly #rawProbes: readonly string[];
+	/** Matches any probe of a case-sensitive / case-insensitive (folded) probed regex entry; undefined when there are none. */
+	#rawProbeDetector: RegExp | undefined;
+	#foldedProbeDetector: RegExp | undefined;
+	/** `i`-flag form of the folded probes, set only when every folded probe is ASCII; see {@link #foldedProbeHit}. */
+	#asciiFoldedProbeDetector: RegExp | undefined;
+
+	/** Per-string scan results of the {@link batch} in progress, if any; dropped when it ends. */
+	#batchScans: Map<string, TextScan> | undefined;
+
+	/** Placeholder ranges and expanded scan view of the last text `#collectRegexMatches` scanned. */
+	#lastRegexScan: RegexScanMemo | undefined;
 
 	/** Placeholder base-key (exact value for :M, case-folded otherwise) → base hash. */
-	#placeholderBaseByKey = new Map<string, string>();
+	#placeholderBaseByKey = new TrackedMap<string, string>(this.#revision);
 
 	/** Placeholder base hash → owner key, used to avoid ambiguous placeholders. */
-	#placeholderBaseOwners = new Map<string, string>();
+	#placeholderBaseOwners = new TrackedMap<string, string>(this.#revision);
 
 	/** Next available index for regex match discoveries */
 	#nextIndex: number;
 
 	/** Whether any secrets were configured */
 	#hasAny: boolean;
+
+	/** Outbound obfuscation switch (`secrets.enabled`); deobfuscation stays active either way. */
+	#obfuscating = true;
 
 	/**
 	 * Private per-install (or per-process) key for the keyed placeholder digest.
@@ -610,6 +247,7 @@ export class SecretObfuscator {
 		} else {
 			this.#setPlaceholderKey(key);
 		}
+		const regexEntries: CompiledRegexEntry[] = [];
 		// Collect every configured plain-secret literal AND compile every regex
 		// entry BEFORE minting any placeholder below, so a placeholder's friendly
 		// name (checked against both in `#createPlaceholder`) can never embed a
@@ -637,18 +275,35 @@ export class SecretObfuscator {
 				) {
 					continue;
 				}
-				this.#regexEntries.push({
+				const ignoreCase = regex.ignoreCase;
+				const prefixes = entry.literalPrefixes;
+				// An empty list would skip everything; treat it like "no metadata".
+				const probes =
+					prefixes !== undefined && prefixes.length > 0 && prefixes.every(prefix => prefix.length > 0)
+						? prefixes.map(prefix => (ignoreCase ? prefix.toLowerCase() : prefix))
+						: null;
+				regexEntries.push({
 					regex,
 					mode,
 					replacement: entry.replacement,
 					friendlyName: entry.friendlyName,
+					probes,
+					ignoreCase,
 				});
 			} catch {
 				// Invalid regex — skip silently (validation happens at load time)
 			}
 		}
+		this.#regexEntries = regexEntries;
+		this.#rawProbes = regexEntries.flatMap(entry => (entry.ignoreCase ? [] : (entry.probes ?? [])));
+		this.#rawProbeDetector = buildLiteralDetector(this.#rawProbes);
+		const foldedProbes = regexEntries.flatMap(entry => (entry.ignoreCase ? (entry.probes ?? []) : []));
+		this.#foldedProbeDetector = buildLiteralDetector(foldedProbes);
+		if (!foldedProbes.some(probe => NON_ASCII_RE.test(probe))) {
+			this.#asciiFoldedProbeDetector = buildLiteralDetector(foldedProbes, "i");
+		}
 		let index = 0;
-		let hasRealSec = this.#regexEntries.length > 0;
+		let hasRealSec = regexEntries.length > 0;
 		for (const entry of entries) {
 			if (entry.type !== "plain") continue;
 			const mode = entry.mode ?? "obfuscate";
@@ -659,8 +314,7 @@ export class SecretObfuscator {
 				}
 				const placeholder = this.#createPlaceholder(entry.content, entry.friendlyName);
 				this.#plainMappings.set(entry.content, index);
-				this.#obfuscateMappings.set(index, { secret: entry.content, placeholder });
-				this.#generatedPlaceholders.add(placeholder);
+				this.#registerObfuscateMapping(index, entry.content, placeholder);
 				index++;
 				hasRealSec = true;
 			} else {
@@ -699,15 +353,94 @@ export class SecretObfuscator {
 		return key;
 	}
 
+	/** Single write path for obfuscate mappings so every derived index stays in step. */
+	#registerObfuscateMapping(index: number, secret: string, placeholder: string): void {
+		this.#obfuscateMappings.set(index, { secret, placeholder });
+		this.#generatedPlaceholders.add(placeholder);
+		this.#mintedSecretValues.add(secret);
+		if (!this.#obfuscateIndexBySecret.has(secret)) this.#obfuscateIndexBySecret.set(secret, index);
+	}
+
+	/** Drop literal-derived caches built for older literal mappings. */
+	#syncLiteralCaches(): void {
+		const plainVersion = this.#plainMappings.version;
+		const replaceVersion = this.#replaceMappings.version;
+		if (this.#literalCachePlainVersion === plainVersion && this.#literalCacheReplaceVersion === replaceVersion)
+			return;
+		this.#sortedReplaceEntries = undefined;
+		this.#sortedPlainEntries = undefined;
+		this.#literalDetector = undefined;
+		this.#cleanDetector = undefined;
+		this.#configuredLiteralDetector = undefined;
+		this.#literalCachePlainVersion = plainVersion;
+		this.#literalCacheReplaceVersion = replaceVersion;
+	}
+
+	get #configuredLiterals(): string[] {
+		return [...[...this.#replaceMappings.keys()].filter(secret => secret.length > 0), ...this.#plainMappings.keys()];
+	}
+
+	get #replaceEntries(): [string, string][] {
+		this.#syncLiteralCaches();
+		this.#sortedReplaceEntries ??= [...this.#replaceMappings].sort((a, b) => b[0].length - a[0].length);
+		return this.#sortedReplaceEntries;
+	}
+
+	get #plainEntries(): [string, number][] {
+		this.#syncLiteralCaches();
+		this.#sortedPlainEntries ??= [...this.#plainMappings].sort((a, b) => b[0].length - a[0].length);
+		return this.#sortedPlainEntries;
+	}
+
+	/**
+	 * Whether `text` contains nothing the literal phases act on: no configured
+	 * plain/replace secret (including a resolved key) and no `$$` placeholder
+	 * candidate. Together with an empty regex scan this proves obfuscation is
+	 * the identity on `text`.
+	 */
+	#isLiteralFree(text: string): boolean {
+		this.#syncLiteralCaches();
+		this.#literalDetector ??= buildLiteralDetector(["$$", ...this.#configuredLiterals])!;
+		return !this.#literalDetector.test(text);
+	}
+
+	/**
+	 * One pass ruling out, at once, every configured literal, `$$`, and every
+	 * case-sensitive regex probe. `false` means the text is literal-free and no
+	 * case-sensitive probed entry can match; only on a hit do the separate
+	 * detectors say which.
+	 */
+	#mayNeedRedaction(text: string): boolean {
+		this.#syncLiteralCaches();
+		this.#cleanDetector ??= buildLiteralDetector(["$$", ...this.#configuredLiterals, ...this.#rawProbes])!;
+		return this.#cleanDetector.test(text);
+	}
+
+	/**
+	 * Whether any case-insensitive probe occurs in the lower-cased text. On
+	 * ASCII text with ASCII probes an `i`-flag regex gives the same answer
+	 * without copying the text; anything else (where `toLowerCase` and regex
+	 * case-insensitivity can disagree, e.g. `K` U+212A) folds as before.
+	 */
+	#foldedProbeHit(text: string, folded: () => string): boolean {
+		if (this.#foldedProbeDetector === undefined) return false;
+		if (this.#asciiFoldedProbeDetector !== undefined && !NON_ASCII_RE.test(text)) {
+			return this.#asciiFoldedProbeDetector.test(text);
+		}
+		return this.#foldedProbeDetector.test(folded());
+	}
+
 	/** Whether this pass will mint a keyed placeholder from a regex match. */
-	#willMintRegexPlaceholder(secretValues: ReadonlySet<string>): boolean {
+	#willMintRegexPlaceholder(...valueSets: ReadonlySet<string>[]): boolean {
 		for (const entry of this.#regexEntries) {
 			if (entry.mode !== "obfuscate") continue;
-			for (const value of secretValues) {
-				entry.regex.lastIndex = 0;
-				const matches = entry.regex.test(value);
-				entry.regex.lastIndex = 0;
-				if (matches) return true;
+			for (const secretValues of valueSets) {
+				for (const value of secretValues) {
+					entry.regex.lastIndex = 0;
+					const matches = entry.regex.test(value);
+					entry.regex.lastIndex = 0;
+					if (matches) return true;
+				}
 			}
 		}
 		return false;
@@ -717,20 +450,223 @@ export class SecretObfuscator {
 		return this.#hasAny;
 	}
 
+	/** Whether outbound text is currently obfuscated: secrets exist and obfuscation is switched on. */
+	obfuscates(): boolean {
+		return this.#hasAny && this.#obfuscating;
+	}
+
+	/**
+	 * Toggle outbound obfuscation. When off, {@link obfuscate} is identity, while
+	 * placeholders minted earlier keep deobfuscating so prior turns stay readable.
+	 */
+	setObfuscating(enabled: boolean): void {
+		this.#obfuscating = enabled;
+	}
+
+	/**
+	 * A clean cut point at or after `limit`: the length of the shortest prefix
+	 * of `text` that {@link obfuscate} redacts exactly as it redacts that part
+	 * of the whole text. No secret occurrence in the whole text (configured
+	 * literal, `sharedRegexSecretValues` value, regex match) straddles the cut,
+	 * and every regex entry finds the same matches in the prefix as in the
+	 * whole text before it, so lookahead and other trailing context survive.
+	 * A caller may therefore show any part of the redacted prefix, however much
+	 * replacements shrink it. Text past the cut stays unredacted and mints
+	 * nothing; the answer is `text.length` when no shorter prefix qualifies.
+	 * Mints no placeholders.
+	 */
+	redactionPrefixEnd(text: string, limit: number, sharedRegexSecretValues?: ReadonlySet<string>): number {
+		if (!this.obfuscates() || text.length <= limit) return text.length;
+		const fullMatches = this.#regexMatches(text);
+		const spans = fullMatches.map((match): [number, number] => [match.start, match.end]);
+		const addOccurrences = (literal: string): void => {
+			if (literal.length === 0) return;
+			for (let at = text.indexOf(literal); at !== -1; at = text.indexOf(literal, at + 1)) {
+				spans.push([at, at + literal.length]);
+			}
+		};
+		this.#syncLiteralCaches();
+		for (const literal of this.#configuredLiterals) addOccurrences(literal);
+		for (const value of sharedRegexSecretValues ?? EMPTY_SECRET_VALUES) addOccurrences(value);
+		const matchKey = (matches: readonly RegexMatchSpan[], before: number): string =>
+			matches
+				.filter(match => match.start < before)
+				.map(match => `${match.entry}:${match.start}:${match.end}`)
+				.join(",");
+		let end = limit;
+		for (;;) {
+			// Step past every secret the cut would sever, until none straddles it.
+			for (let moved = true; moved;) {
+				moved = false;
+				for (const [start, spanEnd] of spans) {
+					if (start < end && end < spanEnd) {
+						end = spanEnd;
+						moved = true;
+					}
+				}
+			}
+			if (end >= text.length) return text.length;
+			// A match can depend on context past its own end (lookahead, `\b`, `$`):
+			// the prefix must reproduce the whole text's matches exactly.
+			if (matchKey(this.#regexMatches(text.slice(0, end)), end) === matchKey(fullMatches, end)) return end;
+			end = Math.min(text.length, end * 2);
+		}
+	}
+
+	/** Every non-empty regex-entry match in `text`, in entry order. */
+	#regexMatches(text: string): RegexMatchSpan[] {
+		const matches: RegexMatchSpan[] = [];
+		for (const [entry, { regex }] of this.#regexEntries.entries()) {
+			regex.lastIndex = 0;
+			for (;;) {
+				const match = regex.exec(text);
+				if (match === null) break;
+				if (match[0].length === 0) {
+					regex.lastIndex++;
+					continue;
+				}
+				matches.push({ entry, start: match.index, end: match.index + match[0].length });
+			}
+			regex.lastIndex = 0;
+		}
+		return matches;
+	}
+
 	/** Obfuscate all secrets in text. Bidirectional placeholders for obfuscate mode, one-way for replace. */
 	obfuscate(text: string, sharedRegexSecretValues?: ReadonlySet<string>): string {
-		if (!this.#hasAny) return text;
-		this.#currentRegexSecretValues = this.collectRegexSecretValuesForObfuscation(text);
-		for (const secretValue of sharedRegexSecretValues ?? []) {
-			this.#currentRegexSecretValues.add(secretValue);
-		}
+		if (!this.obfuscates()) return text;
+		const sharedValues = sharedRegexSecretValues ?? EMPTY_SECRET_VALUES;
+		const { values: currentValues, literalFree } = this.#collectStandalone(text);
+		// Clean (no regex value, no literal, no placeholder candidate) text came
+		// back from collection as the empty raw scan.
+		let clean = currentValues.size === 0 && literalFree;
 		// Resolve a lazy key before the replace phase whenever this pass will mint
 		// a regex placeholder. The key registers itself as a replace-mode secret;
 		// resolving it later, while processing the regex match, would expose key
 		// bytes already present in this same provider-visible input.
-		if (this.#keyProvider !== undefined && this.#willMintRegexPlaceholder(this.#currentRegexSecretValues)) {
+		if (this.#keyProvider !== undefined && this.#willMintRegexPlaceholder(currentValues, sharedValues)) {
 			this.#getKey();
+			clean &&= this.#isLiteralFree(text);
 		}
+		// Every phase below is the identity on clean text, so skip building origin/scan state.
+		if (clean) return text;
+		const previousCurrent = this.#currentRegexSecretValues;
+		const previousShared = this.#sharedRegexSecretValues;
+		this.#currentRegexSecretValues = new SecretValueSet(currentValues);
+		this.#sharedRegexSecretValues = sharedValues;
+		try {
+			if (this.#isRedactionIdentity(text)) return text;
+			return this.#obfuscateDirtyText(text);
+		} finally {
+			this.#currentRegexSecretValues = previousCurrent;
+			this.#sharedRegexSecretValues = previousShared;
+		}
+	}
+
+	/**
+	 * Whether `#obfuscateDirtyText(text)` would return `text` unchanged, decided
+	 * without running it. This is the common shape of already-redacted history:
+	 * text whose only redaction-relevant content is placeholders. Must run with
+	 * the same current/shared values `#obfuscateDirtyText` would see. It holds
+	 * exactly when:
+	 * 1. no configured literal occurs, so both literal phases are no-ops and
+	 *    the text and its all-"I" origin reach the regex phase unchanged;
+	 * 2. no placeholder candidate, at any start position, carries a friendly
+	 *    prefix that is secret-shaped now. Prefix stripping is then a no-op,
+	 *    and since that check is monotone in the known values, placeholder
+	 *    recognition is the same in every context the dirty path scans with —
+	 *    so the values it would collect are the ones already collected; and
+	 * 3. every regex entry that passes its probe gate finds no match to act
+	 *    on (`#collectRegexMatches` is empty), so the regex phase and the
+	 *    replace-spillover stabilization rewrite nothing.
+	 */
+	#isRedactionIdentity(text: string): boolean {
+		this.#syncLiteralCaches();
+		// `null`: no configured literals at all.
+		this.#configuredLiteralDetector ??= buildLiteralDetector(this.#configuredLiterals) ?? null;
+		if (this.#configuredLiteralDetector?.test(text)) return false;
+
+		PLACEHOLDER_RE.lastIndex = 0;
+		for (;;) {
+			const match = PLACEHOLDER_RE.exec(text);
+			if (match === null) break;
+			// Every start position, so this covers whichever candidates the
+			// strip and recognition scans (each with its own resume rule) visit.
+			PLACEHOLDER_RE.lastIndex = match.index + 1;
+			if (placeholderWithoutFriendlyName(match[0]) === undefined) continue;
+			const prefix = /^([A-Z0-9]+)_/.exec(match[0].slice(2, -2))?.[1];
+			if (prefix !== undefined && this.#prefixIsSecretShaped(prefix)) {
+				PLACEHOLDER_RE.lastIndex = 0;
+				return false;
+			}
+		}
+		PLACEHOLDER_RE.lastIndex = 0;
+
+		const folded = this.#foldedOnce(text);
+		let origin: string | undefined;
+		for (const entry of this.#regexEntries) {
+			if (!this.#entryMayMatch(entry, text, folded)) continue;
+			origin ??= "I".repeat(text.length);
+			entry.regex.lastIndex = 0;
+			const matches = this.#collectRegexMatches(text, entry.regex, entry.mode, origin, entry.replacement);
+			entry.regex.lastIndex = 0;
+			if (matches.length > 0) return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Run `run` as one outbound batch (collect, then redact, over one message
+	 * list) so each string is scanned once for both. Nothing outlives the batch.
+	 * Nested calls join the outer batch.
+	 */
+	batch<T>(run: () => T): T {
+		if (this.#batchScans !== undefined) return run();
+		this.#batchScans = new Map();
+		try {
+			return run();
+		} finally {
+			this.#batchScans = undefined;
+		}
+	}
+
+	/**
+	 * Placeholder ranges and the expanded scan view of `text`. Consecutive regex
+	 * entries usually scan the same unchanged text, so the last result is reused
+	 * while every input it depends on (registry, current and shared values) is
+	 * unchanged.
+	 */
+	#regexScanFor(text: string): RegexScanMemo {
+		const memo = this.#lastRegexScan;
+		const current = this.#currentRegexSecretValues;
+		const shared = this.#sharedRegexSecretValues;
+		if (
+			memo !== undefined &&
+			memo.text === text &&
+			memo.revision === this.#revision.value &&
+			memo.current === current &&
+			memo.currentSize === current.size &&
+			memo.shared === shared &&
+			memo.sharedSize === shared.size
+		) {
+			return memo;
+		}
+		const ranges = this.#knownPlaceholderRanges(text);
+		const scan = buildReplaceRegexScan(text, ranges, this.#deobfuscateMap);
+		this.#lastRegexScan = {
+			text,
+			revision: this.#revision.value,
+			current,
+			currentSize: current.size,
+			shared,
+			sharedSize: shared.size,
+			ranges,
+			scan,
+		};
+		return this.#lastRegexScan;
+	}
+
+	#obfuscateDirtyText(text: string): string {
 		let result = text;
 		// `origin` runs parallel to `result` (one tag char per result char): "I" for
 		// bytes carried from the INPUT (placeholders from a PRIOR obfuscate() call)
@@ -743,7 +679,7 @@ export class SecretObfuscator {
 		// to equal a prior one (same secret seen raw again) eligible for cross-match.
 		let origin = "I".repeat(text.length);
 		// 1. Process replace-mode plain secrets
-		for (const [secret, replacement] of [...this.#replaceMappings].sort((a, b) => b[0].length - a[0].length)) {
+		for (const [secret, replacement] of this.#replaceEntries) {
 			({ text: result, origin } = this.#replaceOutsidePlaceholdersTracked(result, origin, secret, replacement, "I"));
 		}
 		for (const secretValue of this.#collectRegexSecretValues(result)) {
@@ -752,13 +688,10 @@ export class SecretObfuscator {
 		for (const secretValue of this.#collectRegexSecretValuesAfterRegexReplacements(result, origin)) {
 			this.#currentRegexSecretValues.add(secretValue);
 		}
-		for (const secretValue of sharedRegexSecretValues ?? []) {
-			this.#currentRegexSecretValues.add(secretValue);
-		}
 		({ text: result, origin } = this.#stripUnsafeFriendlyPrefixes(result, origin));
 
 		// 2. Process obfuscate-mode plain secrets
-		for (const [secret, index] of [...this.#plainMappings].sort((a, b) => b[0].length - a[0].length)) {
+		for (const [secret, index] of this.#plainEntries) {
 			const mapping = this.#obfuscateMappings.get(index)!;
 			({ text: result, origin } = this.#replaceOutsidePlaceholdersTracked(
 				result,
@@ -770,7 +703,9 @@ export class SecretObfuscator {
 		}
 
 		// 3. Process regex entries — discover new matches
+		const foldedResult = this.#foldedOnce(result);
 		for (const entry of this.#regexEntries) {
+			if (!this.#entryMayMatch(entry, result, foldedResult)) continue;
 			entry.regex.lastIndex = 0;
 			const matches = this.#collectRegexMatches(result, entry.regex, entry.mode, origin, entry.replacement);
 
@@ -896,8 +831,7 @@ export class SecretObfuscator {
 							entry.friendlyName,
 							match.recursive,
 						);
-						this.#obfuscateMappings.set(index, { secret: match.canonicalValue, placeholder });
-						this.#generatedPlaceholders.add(placeholder);
+						this.#registerObfuscateMapping(index, match.canonicalValue, placeholder);
 					}
 					const mapping = this.#obfuscateMappings.get(index)!;
 					const placeholder = this.#placeholderForCurrentInput(mapping.placeholder);
@@ -913,7 +847,6 @@ export class SecretObfuscator {
 		}
 		({ text: result, origin } = this.#stabilizeReplaceRegexPlaceholderSpillover(result, origin));
 
-		this.#currentRegexSecretValues = new Set();
 		return result;
 	}
 
@@ -1130,6 +1063,7 @@ export class SecretObfuscator {
 		let currentOrigin = origin;
 		for (const entry of this.#regexEntries) {
 			if (entry.mode !== "replace" || entry.replacement !== undefined) continue;
+			if (!this.#entryMayMatch(entry, result, this.#foldedOnce(result))) continue;
 			entry.regex.lastIndex = 0;
 			const matches = this.#collectRegexMatches(result, entry.regex, entry.mode, currentOrigin, entry.replacement);
 			entry.regex.lastIndex = 0;
@@ -1169,17 +1103,30 @@ export class SecretObfuscator {
 		return { text: result, origin: currentOrigin };
 	}
 
+	/**
+	 * Cheap literal gate before a regex scan: with prefix metadata, a text
+	 * containing none of the prefixes cannot match, and `includes` costs a
+	 * fraction of a lookbehind regex over the whole provider context. Without
+	 * metadata the regex always runs. `folded` is the caller's lower-cased
+	 * copy for case-insensitive entries, computed once per text.
+	 */
+	#entryMayMatch(entry: CompiledRegexEntry, text: string, folded: () => string): boolean {
+		if (entry.probes === null) return true;
+		const haystack = entry.ignoreCase ? folded() : text;
+		for (const probe of entry.probes) {
+			if (haystack.includes(probe)) return true;
+		}
+		return false;
+	}
+
+	#foldedOnce(text: string): () => string {
+		let folded: string | undefined;
+		return () => (folded ??= text.toLowerCase());
+	}
+
 	/** Find the obfuscate index for a known secret value. */
 	#findObfuscateIndex(secret: string): number | undefined {
-		// Check plain mappings first
-		const plainIndex = this.#plainMappings.get(secret);
-		if (plainIndex !== undefined) return plainIndex;
-
-		// Check regex-discovered mappings
-		for (const [index, mapping] of this.#obfuscateMappings) {
-			if (mapping.secret === secret) return index;
-		}
-		return undefined;
+		return this.#plainMappings.get(secret) ?? this.#obfuscateIndexBySecret.get(secret);
 	}
 
 	#createPlaceholder(secret: string, friendlyName?: string, recursive: boolean = false): string {
@@ -1299,9 +1246,17 @@ export class SecretObfuscator {
 	// `"TOKABC123"` could never match against that same case-sensitive
 	// pattern). Any of these means the text is meant to be redacted, not
 	// stamped unredacted onto every use of this secret.
-	#collectRegexSecretValues(text: string): Set<string> {
+	/** `rawProbeHit`, when the caller already knows no case-sensitive probe occurs, skips that detector. */
+	#collectRegexSecretValues(text: string, rawProbeHit?: boolean): Set<string> {
 		const values = new Set<string>();
+		const folded = this.#foldedOnce(text);
+		// One combined scan per haystack rules out every probed entry at once;
+		// only when some probe occurs do entries check their own probes.
+		const rawHit = rawProbeHit ?? this.#rawProbeDetector?.test(text) ?? false;
+		const foldedProbeHit = this.#foldedProbeHit(text, folded);
 		for (const entry of this.#regexEntries) {
+			if (entry.probes !== null && !(entry.ignoreCase ? foldedProbeHit : rawHit)) continue;
+			if (!this.#entryMayMatch(entry, text, folded)) continue;
 			entry.regex.lastIndex = 0;
 			for (;;) {
 				const match = entry.regex.exec(text);
@@ -1317,11 +1272,62 @@ export class SecretObfuscator {
 		return values;
 	}
 
-	collectRegexSecretValuesForObfuscation(text: string): Set<string> {
-		const values = this.#collectRegexSecretValues(text);
+	collectRegexSecretValuesForObfuscation(text: string): ReadonlySet<string> {
+		return this.#collectStandalone(text).values;
+	}
+
+	/**
+	 * Raw regex scan and literal check for `text`, shared by every collection
+	 * and redaction of the same string within a {@link batch}.
+	 */
+	#scanText(text: string): TextScan {
+		const scans = this.#batchScans;
+		const cached = scans?.get(text);
+		if (cached !== undefined && cached.revision === this.#revision.value) return cached;
+		// Clean text (the common case) is ruled out in one combined pass.
+		const mayNeedRedaction = this.#mayNeedRedaction(text);
+		const rawValues = this.#collectRegexSecretValues(text, mayNeedRedaction ? undefined : false);
+		const scan: TextScan = {
+			revision: this.#revision.value,
+			initialValues: rawValues.size === 0 ? NO_VALUES : [...rawValues],
+			literalFree: !mayNeedRedaction || this.#isLiteralFree(text),
+			collectedValues: undefined,
+		};
+		scans?.set(text, scan);
+		return scan;
+	}
+
+	/**
+	 * Standalone collection (no current/shared values in play): the raw scan
+	 * plus replace simulation. Within a batch the result is computed once per
+	 * string and registry revision; the simulation can mint (e.g. resolve the
+	 * key), in which case it is not reused.
+	 */
+	#collectStandalone(text: string): { values: ReadonlySet<string>; literalFree: boolean } {
+		const scan = this.#scanText(text);
+		if (scan.initialValues.length === 0 && scan.literalFree)
+			return { values: EMPTY_SECRET_VALUES, literalFree: true };
+		const values = new Set(scan.initialValues);
+		const reusable =
+			this.#batchScans !== undefined &&
+			this.#currentRegexSecretValues.size === 0 &&
+			this.#sharedRegexSecretValues.size === 0;
+		if (reusable && scan.collectedValues !== undefined && scan.revision === this.#revision.value) {
+			return { values: new Set(scan.collectedValues), literalFree: scan.literalFree };
+		}
+		const revision = this.#revision.value;
+		const collected = this.#collectAfterReplaceSimulation(text, values);
+		if (reusable && scan.revision === revision && this.#revision.value === revision) {
+			scan.collectedValues = [...collected];
+		}
+		return { values: collected, literalFree: scan.literalFree };
+	}
+
+	/** Add regex values that only appear once replace-mode literals and regexes are applied. */
+	#collectAfterReplaceSimulation(text: string, values: Set<string>): Set<string> {
 		let result = text;
 		let origin = "I".repeat(text.length);
-		for (const [secret, replacement] of [...this.#replaceMappings].sort((a, b) => b[0].length - a[0].length)) {
+		for (const [secret, replacement] of this.#replaceEntries) {
 			({ text: result, origin } = this.#replaceOutsidePlaceholdersTracked(result, origin, secret, replacement, "I"));
 		}
 		for (const secretValue of this.#collectRegexSecretValues(result)) {
@@ -1339,6 +1345,7 @@ export class SecretObfuscator {
 		let simulatedOrigin = origin;
 		for (const entry of this.#regexEntries) {
 			if (entry.mode !== "replace") continue;
+			if (!this.#entryMayMatch(entry, simulated, this.#foldedOnce(simulated))) continue;
 			entry.regex.lastIndex = 0;
 			const matches = this.#collectRegexMatches(
 				simulated,
@@ -1413,12 +1420,16 @@ export class SecretObfuscator {
 	}
 
 	stripUnsafeFriendlyPlaceholderPrefixes(text: string, sharedRegexSecretValues: ReadonlySet<string>): string {
-		const previousRegexSecretValues = this.#currentRegexSecretValues;
-		this.#currentRegexSecretValues = new Set(sharedRegexSecretValues);
+		if (!text.includes("$$")) return text;
+		const previousCurrent = this.#currentRegexSecretValues;
+		const previousShared = this.#sharedRegexSecretValues;
+		this.#currentRegexSecretValues = new SecretValueSet();
+		this.#sharedRegexSecretValues = sharedRegexSecretValues;
 		try {
 			return this.#stripUnsafeFriendlyPrefixes(text, "I".repeat(text.length)).text;
 		} finally {
-			this.#currentRegexSecretValues = previousRegexSecretValues;
+			this.#currentRegexSecretValues = previousCurrent;
+			this.#sharedRegexSecretValues = previousShared;
 		}
 	}
 
@@ -1447,25 +1458,25 @@ export class SecretObfuscator {
 	// alias keyed only by the hash suffix, so both need the same defense
 	// against a forged/attacker-chosen prefix.
 	#prefixIsSecretShaped(prefix: string): boolean {
-		for (const secretValue of this.#configuredSecretValues) {
-			const sanitizedSecret = sanitizeForCollisionCheck(secretValue);
-			if (sanitizedLabelCollidesWithSecret(prefix, sanitizedSecret)) return true;
+		if (this.#configuredSecretValues.collidesWithLabel(prefix)) return true;
+		if (this.#currentRegexSecretValues.collidesWithLabel(prefix)) return true;
+		if (labelCollidesWithAnySecret(prefix, this.#sharedRegexSecretValues)) return true;
+		if (this.#mintedSecretValues.collidesWithLabel(prefix)) return true;
+		let regexMatches = this.#prefixRegexMatches.get(prefix);
+		if (regexMatches === undefined) {
+			regexMatches = false;
+			for (const entry of this.#regexEntries) {
+				entry.regex.lastIndex = 0;
+				const matches = entry.regex.test(prefix);
+				entry.regex.lastIndex = 0;
+				if (matches) {
+					regexMatches = true;
+					break;
+				}
+			}
+			if (this.#prefixRegexMatches.size < MAX_PREFIX_REGEX_MEMO) this.#prefixRegexMatches.set(prefix, regexMatches);
 		}
-		for (const secretValue of this.#currentRegexSecretValues) {
-			const sanitizedSecret = sanitizeForCollisionCheck(secretValue);
-			if (sanitizedLabelCollidesWithSecret(prefix, sanitizedSecret)) return true;
-		}
-		for (const { secret } of this.#obfuscateMappings.values()) {
-			const sanitizedSecret = sanitizeForCollisionCheck(secret);
-			if (sanitizedLabelCollidesWithSecret(prefix, sanitizedSecret)) return true;
-		}
-		for (const entry of this.#regexEntries) {
-			entry.regex.lastIndex = 0;
-			const matches = entry.regex.test(prefix);
-			entry.regex.lastIndex = 0;
-			if (matches) return true;
-		}
-		return false;
+		return regexMatches;
 	}
 
 	// A placeholder is an exact match, or the friendly-name-independent bare
@@ -1501,7 +1512,8 @@ export class SecretObfuscator {
 		replacement: string,
 		tag: string,
 	): { text: string; origin: string } {
-		if (search.length === 0) return { text, origin };
+		// No occurrence: the rebuild below would reproduce both strings verbatim.
+		if (search.length === 0 || !text.includes(search)) return { text, origin };
 		PLACEHOLDER_RE.lastIndex = 0;
 		let outText = "";
 		let outOrigin = "";
@@ -1539,8 +1551,7 @@ export class SecretObfuscator {
 		if (index === undefined) {
 			index = this.#nextIndex++;
 			const placeholder = this.#createPlaceholder(secret, friendlyName);
-			this.#obfuscateMappings.set(index, { secret, placeholder });
-			this.#generatedPlaceholders.add(placeholder);
+			this.#registerObfuscateMapping(index, secret, placeholder);
 		}
 		return this.#placeholderForCurrentInput(this.#obfuscateMappings.get(index)!.placeholder);
 	}
@@ -1614,8 +1625,7 @@ export class SecretObfuscator {
 		defaultReplacement: string | undefined;
 		scanContext: RegexMatchContext;
 	}> {
-		const knownPlaceholderRanges = this.#knownPlaceholderRanges(text);
-		const regexScan = buildReplaceRegexScan(text, knownPlaceholderRanges, this.#deobfuscateMap);
+		const { ranges: knownPlaceholderRanges, scan: regexScan } = this.#regexScanFor(text);
 		const scanText = regexScan.text;
 		regex.lastIndex = 0;
 		const matches: Array<{
@@ -1846,784 +1856,4 @@ export class SecretObfuscator {
 		}
 		return matches.reverse();
 	}
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Display restore (inbound, persisted/provider → local display)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Restore secret placeholders for local display. Only message kinds the model
- * itself authored from obfuscated context carry placeholders — assistant
- * content and the LLM-written branch/compaction summaries. User, developer, and
- * tool-result messages are persisted with their literal text, so operator-authored
- * placeholder-shaped text must survive untouched; those roles are never walked.
- */
-export function deobfuscateSessionContext(
-	sessionContext: SessionContext,
-	obfuscator: SecretObfuscator | undefined,
-): SessionContext {
-	if (!obfuscator?.hasSecrets()) return sessionContext;
-	const messages = deobfuscateAgentMessages(obfuscator, sessionContext.messages);
-	return messages === sessionContext.messages ? sessionContext : { ...sessionContext, messages };
-}
-
-export function deobfuscateAgentMessages(obfuscator: SecretObfuscator, messages: AgentMessage[]): AgentMessage[] {
-	const deob = (text: string): string => obfuscator.deobfuscate(text);
-	let changed = false;
-	const result = messages.map((message): AgentMessage => {
-		switch (message.role) {
-			case "assistant": {
-				const content = deobfuscateAssistantContent(obfuscator, message.content);
-				if (content === message.content) return message;
-				changed = true;
-				return { ...message, content };
-			}
-			case "branchSummary": {
-				const summary = deob(message.summary);
-				if (summary === message.summary) return message;
-				changed = true;
-				return { ...message, summary };
-			}
-			case "compactionSummary": {
-				const summary = deob(message.summary);
-				const shortSummary = message.shortSummary === undefined ? undefined : deob(message.shortSummary);
-				const blocks = message.blocks === undefined ? undefined : deobfuscateTextBlocks(obfuscator, message.blocks);
-				if (summary === message.summary && shortSummary === message.shortSummary && blocks === message.blocks) {
-					return message;
-				}
-				changed = true;
-				return { ...message, summary, shortSummary, blocks };
-			}
-			default:
-				return message;
-		}
-	});
-	return changed ? result : messages;
-}
-
-/**
- * Restore placeholders in assistant content: visible text and tool-call
- * arguments/intent/rawBlock. Thinking and signatures are opaque
- * provider-replay/hidden-reasoning data and pass through byte-identical.
- */
-export function deobfuscateAssistantContent(
-	obfuscator: SecretObfuscator,
-	content: AssistantMessage["content"],
-): AssistantMessage["content"] {
-	if (!obfuscator.hasSecrets()) return content;
-	const deob = (text: string): string => obfuscator.deobfuscate(text);
-	let changed = false;
-	const result = content.map((block): AssistantMessage["content"][number] => {
-		if (block.type === "text") {
-			const text = deob(block.text);
-			if (text === block.text) return block;
-			changed = true;
-			return { ...block, text };
-		}
-
-		if (block.type === "toolCall") {
-			const args = deobfuscateToolArguments(obfuscator, block.arguments);
-			const intent = block.intent === undefined ? undefined : deob(block.intent);
-			const rawBlock = block.rawBlock === undefined ? undefined : deob(block.rawBlock);
-			if (args === block.arguments && intent === block.intent && rawBlock === block.rawBlock) return block;
-			changed = true;
-			return { ...block, arguments: args, intent, rawBlock };
-		}
-		return block;
-	});
-	return changed ? result : content;
-}
-
-/**
- * Restore placeholders inside a tool call's arguments. Arguments are arbitrary
- * model-authored JSON, so tool-call arguments are the ONLY place a recursive
- * JSON walk runs.
- */
-export function deobfuscateToolArguments(
-	obfuscator: SecretObfuscator,
-	args: Record<string, unknown>,
-): Record<string, unknown> {
-	if (!obfuscator.hasSecrets()) return args;
-	return mapJsonStrings(args as JsonValue, s => obfuscator.deobfuscate(s)) as Record<string, unknown>;
-}
-
-/** Redact secrets inside a tool call's arguments (same JSON-walk exception as {@link deobfuscateToolArguments}). */
-export function obfuscateToolArguments(
-	obfuscator: SecretObfuscator,
-	args: Record<string, unknown>,
-	sharedRegexSecretValues?: ReadonlySet<string>,
-): Record<string, unknown> {
-	if (!obfuscator.hasSecrets()) return args;
-	const regexSecretValues = sharedRegexSecretValues ?? collectJsonRegexSecretValues(obfuscator, args as JsonValue);
-	return mapJsonStrings(args as JsonValue, s => obfuscator.obfuscate(s, regexSecretValues)) as Record<string, unknown>;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Outbound obfuscation (local → provider)
-// ═══════════════════════════════════════════════════════════════════════════
-
-type UserFacingMessage = Extract<Message, { role: "user" | "developer" | "toolResult" }>;
-
-/** Obfuscate `text` blocks of a content array; image and other blocks pass through. */
-function obfuscateTextBlocks(
-	obfuscator: SecretObfuscator,
-	content: (TextContent | ImageContent)[],
-	sharedRegexSecretValues?: ReadonlySet<string>,
-): (TextContent | ImageContent)[] {
-	let changed = false;
-	const result = content.map((block): TextContent | ImageContent => {
-		if (block.type !== "text") return block;
-		const text = obfuscator.obfuscate(block.text, sharedRegexSecretValues);
-		if (text === block.text) return block;
-		changed = true;
-		return { ...block, text };
-	});
-	return changed ? result : content;
-}
-
-/** Restore placeholders in `text` blocks of a content array; image and other blocks pass through. */
-function deobfuscateTextBlocks(
-	obfuscator: SecretObfuscator,
-	content: (TextContent | ImageContent)[],
-): (TextContent | ImageContent)[] {
-	let changed = false;
-	const result = content.map((block): TextContent | ImageContent => {
-		if (block.type !== "text") return block;
-		const text = obfuscator.deobfuscate(block.text);
-		if (text === block.text) return block;
-		changed = true;
-		return { ...block, text };
-	});
-	return changed ? result : content;
-}
-
-/**
- * Re-obfuscate assistant content before it returns to a provider after session
- * restoration, removing friendly prefixes made unsafe by this batch. A changed
- * thinking block loses its byte-bound replay signature.
- */
-function obfuscateAssistantContentForReplay(
-	obfuscator: SecretObfuscator,
-	content: AssistantMessage["content"],
-	sharedRegexSecretValues: ReadonlySet<string>,
-): AssistantMessage["content"] {
-	const obfuscate = (text: string): string =>
-		obfuscator.stripUnsafeFriendlyPlaceholderPrefixes(
-			obfuscator.obfuscate(text, sharedRegexSecretValues),
-			sharedRegexSecretValues,
-		);
-	let changed = false;
-	const result = content.map((block): AssistantMessage["content"][number] => {
-		if (block.type === "text") {
-			const text = obfuscate(block.text);
-			if (text === block.text) return block;
-			changed = true;
-			return { ...block, text };
-		}
-		if (block.type === "thinking") {
-			const thinking = obfuscate(block.thinking);
-			if (thinking === block.thinking) return block;
-			changed = true;
-			return { ...block, thinking, thinkingSignature: undefined };
-		}
-		if (block.type === "toolCall") {
-			const args = mapJsonStrings(block.arguments as JsonValue, obfuscate) as Record<string, unknown>;
-			const intent = block.intent === undefined ? undefined : obfuscate(block.intent);
-			const rawBlock = block.rawBlock === undefined ? undefined : obfuscate(block.rawBlock);
-			if (args === block.arguments && intent === block.intent && rawBlock === block.rawBlock) return block;
-			changed = true;
-			return { ...block, arguments: args, intent, rawBlock };
-		}
-		return block;
-	});
-	return changed ? result : content;
-}
-
-function collectMessageRegexSecretValues(obfuscator: SecretObfuscator, messages: Message[]): Set<string> {
-	const values = new Set<string>();
-	const addText = (text: string | undefined): void => {
-		if (text === undefined) return;
-		for (const value of obfuscator.collectRegexSecretValuesForObfuscation(text)) {
-			values.add(value);
-		}
-	};
-	for (const message of messages) {
-		if (message.role === "assistant") {
-			for (const block of message.content) {
-				if (block.type === "text") addText(block.text);
-				else if (block.type === "thinking") addText(block.thinking);
-				else if (block.type === "toolCall") {
-					for (const value of collectJsonRegexSecretValues(obfuscator, block.arguments as JsonValue)) {
-						values.add(value);
-					}
-					addText(block.intent);
-					addText(block.rawBlock);
-				}
-			}
-			continue;
-		}
-		if (
-			message.role !== "user" &&
-			message.role !== "toolResult" &&
-			!(message.role === "developer" && message.attribution === "user")
-		) {
-			continue;
-		}
-		const target = message as UserFacingMessage;
-		if (typeof target.content === "string") {
-			addText(target.content);
-			continue;
-		}
-		for (const block of target.content) {
-			if (block.type === "text") addText(block.text);
-		}
-	}
-	return values;
-}
-
-/**
- * Redact secrets from outbound messages. User messages, tool results, and
- * user-authored developer messages (e.g. `@file` mentions) are obfuscated.
- * Assistant replay content is re-obfuscated too, because session restoration
- * expands keyed placeholders locally before the next provider request. Inline
- * image bytes are never walked.
- */
-export function obfuscateMessages(obfuscator: SecretObfuscator, messages: Message[]): Message[] {
-	if (!obfuscator.hasSecrets()) return messages;
-	const sharedRegexSecretValues = collectMessageRegexSecretValues(obfuscator, messages);
-	let changed = false;
-	const result = messages.map((message): Message => {
-		if (
-			message.role !== "user" &&
-			message.role !== "toolResult" &&
-			!(message.role === "developer" && message.attribution === "user")
-		) {
-			if (message.role !== "assistant") return message;
-			const content = obfuscateAssistantContentForReplay(obfuscator, message.content, sharedRegexSecretValues);
-			if (content === message.content) return message;
-			changed = true;
-			return { ...message, content };
-		}
-		const target = message as UserFacingMessage;
-		if (typeof target.content === "string") {
-			const content = obfuscator.obfuscate(target.content, sharedRegexSecretValues);
-			if (content === target.content) return message;
-			changed = true;
-			return { ...target, content } as Message;
-		}
-		const content = obfuscateTextBlocks(obfuscator, target.content, sharedRegexSecretValues);
-		if (content === target.content) return message;
-		changed = true;
-		return { ...target, content } as Message;
-	});
-	return changed ? result : messages;
-}
-
-/**
- * Redact outbound provider context. Only conversation messages are rewritten;
- * the static system prompt and tool schemas pass through unchanged.
- */
-export function obfuscateProviderContext(obfuscator: SecretObfuscator | undefined, context: Context): Context {
-	if (!obfuscator?.hasSecrets()) return context;
-	const messages = obfuscateMessages(obfuscator, context.messages);
-	return messages === context.messages ? context : { ...context, messages };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Helpers
-// ═══════════════════════════════════════════════════════════════════════════
-
-// Like the untracked walk, but threads a parallel `origin` tag string through:
-// preserved placeholder spans keep their existing origin tag (so a
-// same-call-fresh "F" placeholder is never relabeled prior-call "I", and vice
-// versa), while `transform`'s output — always freshly generated or redacted
-// content in both callers below — is tagged "I" (it must not be re-matched as
-// though it arrived in the input, mirroring plain-secret replacement tagging).
-function transformOutsidePlaceholdersTracked(
-	text: string,
-	origin: string,
-	shouldSkipPlaceholder: (placeholder: string) => boolean,
-	transform: (chunk: string) => string,
-	preservePlaceholder?: (placeholder: string) => string,
-): { text: string; origin: string } {
-	PLACEHOLDER_RE.lastIndex = 0;
-	let result = "";
-	let resultOrigin = "";
-	let pendingIndex = 0;
-	for (;;) {
-		const match = PLACEHOLDER_RE.exec(text);
-		if (match === null) break;
-		if (!shouldSkipPlaceholder(match[0])) {
-			resumePlaceholderScanAfterRejectedCandidate(match);
-			continue;
-		}
-		const transformed = transform(text.slice(pendingIndex, match.index));
-		result += transformed;
-		resultOrigin += "I".repeat(transformed.length);
-		const preserved = preservePlaceholder ? preservePlaceholder(match[0]) : match[0];
-		result += preserved;
-		resultOrigin += origin.slice(match.index, match.index + match[0].length);
-		pendingIndex = match.index + match[0].length;
-	}
-	const trailing = transform(text.slice(pendingIndex));
-	result += trailing;
-	resultOrigin += "I".repeat(trailing.length);
-	return { text: result, origin: resultOrigin };
-}
-
-function trailingOutsidePreservedPlaceholderChunk(
-	text: string,
-	shouldPreservePlaceholder: (placeholder: string) => boolean,
-): string {
-	PLACEHOLDER_RE.lastIndex = 0;
-	let pendingIndex = 0;
-	let sawPlaceholder = false;
-	for (;;) {
-		const match = PLACEHOLDER_RE.exec(text);
-		if (match === null) break;
-		if (!shouldPreservePlaceholder(match[0])) {
-			resumePlaceholderScanAfterRejectedCandidate(match);
-			continue;
-		}
-		sawPlaceholder = true;
-		pendingIndex = match.index + match[0].length;
-	}
-	return sawPlaceholder ? text.slice(pendingIndex) : "";
-}
-
-function buildReplaceRegexScan(
-	text: string,
-	ranges: ReadonlyArray<{ start: number; end: number }>,
-	deobfuscateMap: ReadonlyMap<string, { secret: string; recursive: boolean }>,
-): ReplaceRegexScan {
-	let scanText = "";
-	let cursor = 0;
-	const segments: RegexScanSegment[] = [];
-	const appendSegment = (
-		value: string,
-		textStart: number,
-		textEnd: number,
-		generatedPlaceholder: boolean,
-		recursive: boolean,
-	) => {
-		if (value.length === 0) return;
-		const scanStart = scanText.length;
-		scanText += value;
-		segments.push({
-			scanStart,
-			scanEnd: scanStart + value.length,
-			textStart,
-			textEnd,
-			generatedPlaceholder,
-			recursive,
-		});
-	};
-
-	for (const range of ranges) {
-		appendSegment(text.slice(cursor, range.start), cursor, range.start, false, false);
-		const placeholder = text.slice(range.start, range.end);
-		const mapping = lookupFriendlyPlaceholderAlias(deobfuscateMap, placeholder);
-		appendSegment(mapping?.secret ?? placeholder, range.start, range.end, true, mapping?.recursive ?? false);
-		cursor = range.end;
-	}
-	appendSegment(text.slice(cursor), cursor, text.length, false, false);
-
-	return { text: scanText, segments };
-}
-
-function mapReplaceRegexMatch(
-	segments: ReadonlyArray<RegexScanSegment>,
-	scanStart: number,
-	scanEnd: number,
-): {
-	start: number;
-	end: number;
-	recursive: boolean;
-	preserveGeneratedPlaceholders: boolean;
-	partialPlaceholderCut: boolean;
-	cutResumeIndex: number;
-	firstPlaceholderScanStart: number;
-} {
-	const startSegment = findScanSegment(segments, scanStart);
-	const endSegment = findScanSegment(segments, scanEnd - 1);
-	const start = startSegment.generatedPlaceholder
-		? startSegment.textStart
-		: startSegment.textStart + (scanStart - startSegment.scanStart);
-	const end = endSegment.generatedPlaceholder
-		? endSegment.textEnd
-		: endSegment.textStart + (scanEnd - endSegment.scanStart);
-	// A match boundary that falls strictly inside a generated placeholder's
-	// expanded value cuts the underlying secret: the snap above pulls the span out
-	// to the whole `#…#` token, so the obfuscate path can leave it alone instead of
-	// consuming a partial placeholder expansion.
-	const partialPlaceholderCut =
-		(startSegment.generatedPlaceholder && scanStart > startSegment.scanStart) ||
-		(endSegment.generatedPlaceholder && scanEnd < endSegment.scanEnd);
-	let recursive = false;
-	let preserveGeneratedPlaceholders = false;
-	// When the match straddles a placeholder, resume scanning just past the last
-	// overlapping placeholder so trailing wholly-outside content (e.g. an 8-char
-	// run after the secret) still gets matched instead of being consumed by the
-	// straddling span. `firstPlaceholderScanStart` marks where the leading
-	// wholly-outside prefix ends, so a prefix that independently matches can be
-	// redacted on its own rather than skipped along with the cut span.
-	let cutResumeIndex = scanStart;
-	let firstPlaceholderScanStart = -1;
-	for (const segment of segments) {
-		if (segment.scanStart >= scanEnd || segment.scanEnd <= scanStart) continue;
-		recursive ||= segment.recursive;
-		preserveGeneratedPlaceholders ||= segment.generatedPlaceholder;
-		if (segment.generatedPlaceholder) {
-			if (firstPlaceholderScanStart === -1) firstPlaceholderScanStart = segment.scanStart;
-			if (segment.scanEnd > cutResumeIndex) cutResumeIndex = segment.scanEnd;
-		}
-	}
-	return {
-		start,
-		end,
-		recursive,
-		preserveGeneratedPlaceholders,
-		partialPlaceholderCut,
-		cutResumeIndex,
-		firstPlaceholderScanStart,
-	};
-}
-
-function findScanSegment(segments: ReadonlyArray<RegexScanSegment>, scanIndex: number): RegexScanSegment {
-	for (const segment of segments) {
-		if (scanIndex >= segment.scanStart && scanIndex < segment.scanEnd) return segment;
-	}
-	throw new Error("regex match did not map to source text");
-}
-
-/**
- * Extend a scan-space resume position past a consecutive run of generated
- * placeholder segments starting exactly at it, with no raw gap in between. A
- * cut-resolution resume point that happens to land precisely on the START of
- * ANOTHER placeholder must not stop there and hand it to a fresh `regex.exec`
- * attempt — the same content, scanned as an opaque adjacent placeholder run,
- * must resolve identically whether the run's LEADING member is still raw text
- * (this call is about to placeholder it) or is ALREADY a placeholder from a
- * prior call or an earlier pass of this same call. Without this, a bounded
- * regex whose reach spans two adjacent secrets plus trailing spillover bytes
- * (e.g. `[A-Z]{9}` over `ABCDEFGH` + `SECRETUV` + `A`) resolves the leading
- * secret as its own independent redaction on the FIRST obfuscate() call (a
- * genuinely raw prefix gets its own match, then the discard for the rest
- * resumes right after it), but on a LATER call — once that prefix is itself a
- * placeholder — the very first match attempt starts already inside the
- * placeholder run, cannot be prefix-narrowed at all, and its discard resume
- * point lands mid-run instead of past it, exposing a shorter tail (`SECRETUV`
- * + `A`) to a clean, un-cut match the first call never attempted. Chaining the
- * resume point through every immediately-adjacent placeholder makes both
- * calls land on the exact same next scan position.
- */
-function extendPastAdjacentPlaceholders(segments: ReadonlyArray<RegexScanSegment>, index: number): number {
-	let cursor = index;
-	for (;;) {
-		const segment = segments.find(candidate => candidate.scanStart === cursor && candidate.generatedPlaceholder);
-		if (!segment) return cursor;
-		cursor = segment.scanEnd;
-	}
-}
-
-// Apply a fixed custom replacement across a matched span while preserving any
-// inner generated placeholders. Usually the replacement is the user's single
-// redaction marker for the whole match, so emit it for the first non-empty
-// surrounding chunk and drop later chunks. But bounded regexes can cut through
-// an already-emitted marker on the trailing side (`X#…#RED` from
-// `XSECRETUVREDACTED`), where dropping the later prefix would leave raw bytes
-// (`ACTED`) to be consumed on the next pass. Promote later chunks that are a
-// prefix of the replacement to the FULL marker so the first pass is already a
-// fixed point. The reversible placeholder stays intact in its relative
-// position.
-function redactWithFixedReplacementOutsidePlaceholders(
-	text: string,
-	origin: string,
-	replacement: string,
-	shouldPreservePlaceholder: (placeholder: string) => boolean,
-): { text: string; origin: string } {
-	let emitted = false;
-	return transformOutsidePlaceholdersTracked(
-		text,
-		origin,
-		shouldPreservePlaceholder,
-		chunk => {
-			if (chunk.length === 0) return "";
-			if (!emitted) {
-				emitted = true;
-				return replacement;
-			}
-			return replacement.startsWith(chunk) ? replacement : "";
-		},
-		placeholder => placeholder,
-	);
-}
-
-function deobfuscateGeneratedPlaceholderRanges(
-	text: string,
-	start: number,
-	end: number,
-	ranges: ReadonlyArray<{ start: number; end: number }>,
-	deobfuscateMap: ReadonlyMap<string, { secret: string; recursive: boolean }>,
-): { text: string; recursive: boolean } {
-	let result = "";
-	let cursor = start;
-	let recursive = false;
-	for (const range of ranges) {
-		if (range.end <= start || range.start >= end) continue;
-		const overlapStart = Math.max(range.start, start);
-		const overlapEnd = Math.min(range.end, end);
-		result += text.slice(cursor, overlapStart);
-		const placeholder = text.slice(overlapStart, overlapEnd);
-		const mapping = lookupFriendlyPlaceholderAlias(deobfuscateMap, placeholder);
-		result += mapping?.secret ?? placeholder;
-		recursive ||= mapping?.recursive ?? false;
-		cursor = overlapEnd;
-	}
-	result += text.slice(cursor, end);
-	return { text: result, recursive };
-}
-
-// Concatenate ONLY the deobfuscated placeholder ranges within [start, end),
-// dropping the bytes that lie outside them. Used to test whether a regex match
-// that straddles a prior-call placeholder would still match on the placeholder's
-// own (expanded) secret value alone — i.e. the surrounding raw bytes are greedy
-// spillover the match does not need, rather than content the match depends on.
-function placeholderInnerText(
-	text: string,
-	start: number,
-	end: number,
-	ranges: ReadonlyArray<{ start: number; end: number }>,
-	deobfuscateMap: ReadonlyMap<string, { secret: string; recursive: boolean }>,
-): string {
-	let result = "";
-	for (const range of ranges) {
-		if (range.end <= start || range.start >= end) continue;
-		const overlapStart = Math.max(range.start, start);
-		const overlapEnd = Math.min(range.end, end);
-		const placeholder = text.slice(overlapStart, overlapEnd);
-		const mapping = lookupFriendlyPlaceholderAlias(deobfuscateMap, placeholder);
-		result += mapping?.secret ?? placeholder;
-	}
-	return result;
-}
-
-// Concatenate the bytes of [start, end) that lie OUTSIDE the given (ascending,
-// non-overlapping) placeholder ranges. Used to test whether a regex match that
-// straddles a prior-call placeholder would still match on its surrounding bytes
-// alone — i.e. those bytes are genuinely new content to redact rather than a
-// match that only exists because the deobfuscated placeholder bridges them.
-function textOutsidePlaceholderRanges(
-	text: string,
-	start: number,
-	end: number,
-	ranges: ReadonlyArray<{ start: number; end: number }>,
-): string {
-	let result = "";
-	let cursor = start;
-	for (const range of ranges) {
-		if (range.end <= start || range.start >= end) continue;
-		const overlapStart = Math.max(range.start, start);
-		const overlapEnd = Math.min(range.end, end);
-		result += text.slice(cursor, overlapStart);
-		cursor = overlapEnd;
-	}
-	result += text.slice(cursor, end);
-	return result;
-}
-
-// Like `textOutsidePlaceholderRanges`, but tests each outside chunk against
-// `regex` in its REAL context instead of on an isolated slice — tried in BOTH
-// the literal `#…#` placeholder-token text AND the EXPANDED scan context
-// (placeholder resolved to its secret value), since either can be the reason a
-// chunk independently requires redaction:
-//  - Literal-token context matters when the placeholder TOKEN's own non-word
-//    boundary is what completes a boundary-sensitive pattern, e.g. a prefix
-//    "ABCDEFGH" next to a placeholder token matches `\b[A-Z]{8}\b` because the
-//    token's leading `#` is a non-word byte — but that boundary disappears
-//    once the placeholder expands into more `[A-Z]` bytes with no separator.
-//  - Expanded scan context matters when a lookbehind/lookahead only resolves
-//    once the neighboring placeholder is expanded, e.g. a prior plain
-//    placeholder for `ABCDEFGH` next to raw `SECRET`, matched by
-//    `(?<=ABCDEFGH)SECRET`: the literal placeholder token before `SECRET`
-//    never satisfies the lookbehind, so literal-context alone wrongly reports
-//    no independent match.
-// A match only counts when it lies ENTIRELY within one outside chunk (in
-// whichever context it was tested); a match that reaches into the
-// placeholder itself is not evidence the outside chunk independently
-// requires redaction.
-function outsidePlaceholderRangesAnyIndependentlyMatch(
-	text: string,
-	scanText: string,
-	segments: ReadonlyArray<RegexScanSegment>,
-	start: number,
-	end: number,
-	ranges: ReadonlyArray<{ start: number; end: number }>,
-	regex: RegExp,
-): boolean {
-	// A text-space outside chunk lies entirely within one non-placeholder scan
-	// segment (placeholder ranges are exactly the gaps between such segments),
-	// so its scan-space span is a fixed offset from its text-space span.
-	const toScanSpace = (chunkStart: number, chunkEnd: number): [number, number] | undefined => {
-		for (const segment of segments) {
-			if (segment.generatedPlaceholder || segment.textStart > chunkStart || segment.textEnd < chunkEnd) continue;
-			const offset = segment.scanStart - segment.textStart;
-			return [chunkStart + offset, chunkEnd + offset];
-		}
-		return undefined;
-	};
-	const chunkIndependentlyMatches = (chunkStart: number, chunkEnd: number): boolean => {
-		if (chunkMatchesInSourceContext(text, chunkStart, chunkEnd, regex)) return true;
-		const scanSpan = toScanSpace(chunkStart, chunkEnd);
-		return scanSpan !== undefined && chunkMatchesInSourceContext(scanText, scanSpan[0], scanSpan[1], regex);
-	};
-	let cursor = start;
-	for (const range of ranges) {
-		if (range.end <= start || range.start >= end) continue;
-		const overlapStart = Math.max(range.start, start);
-		const overlapEnd = Math.min(range.end, end);
-		if (cursor < overlapStart && chunkIndependentlyMatches(cursor, overlapStart)) return true;
-		cursor = overlapEnd;
-	}
-	return cursor < end && chunkIndependentlyMatches(cursor, end);
-}
-
-// Whether `regex` (global) has a match fully contained in [chunkStart, chunkEnd)
-// when run against the full `text` — so lookbehind/lookahead see the actual
-// surrounding bytes rather than an isolated slice's edges.
-function chunkMatchesInSourceContext(text: string, chunkStart: number, chunkEnd: number, regex: RegExp): boolean {
-	regex.lastIndex = chunkStart;
-	for (;;) {
-		const found = regex.exec(text);
-		if (found === null || found.index >= chunkEnd) return false;
-		const matchEnd = found.index + found[0].length;
-		if (matchEnd <= chunkEnd) return true;
-		regex.lastIndex = found[0].length === 0 ? found.index + 1 : matchEnd;
-	}
-}
-
-function firstOutsidePlaceholderRange(
-	start: number,
-	end: number,
-	ranges: ReadonlyArray<{ start: number; end: number }>,
-): { start: number; end: number } | undefined {
-	let cursor = start;
-	for (const range of ranges) {
-		if (range.end <= start || range.start >= end) continue;
-		const overlapStart = Math.max(range.start, start);
-		const overlapEnd = Math.min(range.end, end);
-		if (cursor < overlapStart) return { start: cursor, end: overlapStart };
-		cursor = overlapEnd;
-	}
-	return cursor < end ? { start: cursor, end } : undefined;
-}
-
-function countOutsidePlaceholderRanges(
-	start: number,
-	end: number,
-	ranges: ReadonlyArray<{ start: number; end: number }>,
-): number {
-	let count = 0;
-	let cursor = start;
-	for (const range of ranges) {
-		if (range.end <= start || range.start >= end) continue;
-		const overlapStart = Math.max(range.start, start);
-		const overlapEnd = Math.min(range.end, end);
-		if (cursor < overlapStart) count++;
-		cursor = overlapEnd;
-	}
-	if (cursor < end) count++;
-	return count;
-}
-
-function replaceRange(text: string, start: number, end: number, replacement: string): string {
-	return text.slice(0, start) + replacement + text.slice(end);
-}
-
-/** Deep-walk an object, transforming all string values. */
-function deepWalkStrings<T>(obj: T, transform: (s: string) => string): T {
-	if (typeof obj === "string") {
-		return transform(obj) as unknown as T;
-	}
-	if (Array.isArray(obj)) {
-		let changed = false;
-		const result = obj.map(item => {
-			const transformed = deepWalkStrings(item, transform);
-			if (transformed !== item) changed = true;
-			return transformed;
-		});
-		return (changed ? result : obj) as unknown as T;
-	}
-	if (obj !== null && typeof obj === "object" && isPlainRecord(obj)) {
-		let changed = false;
-		const result: Record<string, unknown> = {};
-		for (const key of Object.keys(obj)) {
-			const value = (obj as Record<string, unknown>)[key];
-			const transformed = deepWalkStrings(value, transform);
-			if (transformed !== value) changed = true;
-			result[key] = transformed;
-		}
-		return (changed ? result : obj) as T;
-	}
-	return obj;
-}
-
-function isPlainRecord(obj: object): obj is Record<string, unknown> {
-	const prototype = Object.getPrototypeOf(obj);
-	return prototype === Object.prototype || prototype === null;
-}
-
-function collectJsonRegexSecretValues(obfuscator: SecretObfuscator, value: JsonValue): Set<string> {
-	const values = new Set<string>();
-	const collect = (item: JsonValue): void => {
-		if (typeof item === "string") {
-			for (const secretValue of obfuscator.collectRegexSecretValuesForObfuscation(item)) {
-				values.add(secretValue);
-			}
-			return;
-		}
-		if (Array.isArray(item)) {
-			for (const child of item) collect(child);
-			return;
-		}
-		if (item !== null && typeof item === "object") {
-			for (const child of Object.values(item)) {
-				if (child !== undefined) collect(child);
-			}
-		}
-	};
-	collect(value);
-	return values;
-}
-
-/**
- * Map every string in arbitrary JSON. Used ONLY for tool-call arguments, whose
- * shape is model-authored and not known ahead of time. No other caller may walk
- * untyped data: every message/content path is handled by a typed transformer.
- */
-function mapJsonStrings(value: JsonValue, fn: (s: string) => string): JsonValue {
-	if (typeof value === "string") return fn(value);
-	if (Array.isArray(value)) {
-		let changed = false;
-		const out = value.map(item => {
-			const next = mapJsonStrings(item, fn);
-			if (next !== item) changed = true;
-			return next;
-		});
-		return changed ? out : value;
-	}
-	if (value !== null && typeof value === "object") {
-		let changed = false;
-		const out: JsonRecord = {};
-		for (const key of Object.keys(value)) {
-			const item = value[key];
-			if (item === undefined) continue;
-			const next = mapJsonStrings(item, fn);
-			if (next !== item) changed = true;
-			out[key] = next;
-		}
-		return changed ? out : value;
-	}
-	return value;
 }

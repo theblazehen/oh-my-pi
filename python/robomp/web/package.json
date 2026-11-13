@@ -2,6 +2,8 @@
   "name": "robomp-web",
   "private": true,
   "version": "0.1.0",
+  "author": "Stencil Labs, Inc.",
+  "license": "MIT",
   "type": "module",
   "description": "Flat SolidJS operations console bundled by Vite and served by robomp's FastAPI app.",
   "homepage": "https://omp.sh",
@@ -9,7 +11,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check:types": "tsc --noEmit",
+    "check:types": "bun check --no-script",
     "test": "bun test"
   },
   "dependencies": {
@@ -19,7 +21,6 @@
     "@tailwindcss/vite": "catalog:",
     "@types/bun": "catalog:",
     "tailwindcss": "catalog:",
-    "typescript": "catalog:",
     "vite": "catalog:",
     "vite-plugin-solid": "catalog:"
   }

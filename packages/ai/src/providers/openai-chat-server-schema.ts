@@ -7,7 +7,7 @@
  * `stream_options.include_obfuscation`) — does not trip 400s on shapes we simply ignore.
  */
 
-import { type } from "arktype";
+import { type } from "@oh-my-pi/omptype";
 import type {
 	ChatCompletionContentPart,
 	ChatCompletionCreateParams,
@@ -94,7 +94,7 @@ export const toolSchema = type({
 		name: "string >= 1",
 		"description?": "string",
 		"parameters?": type({ "[string]": "unknown" }),
-		/** OpenAI structured-output strict mode. Accepted, not enforced upstream. */
+		/** Preserve the caller's strict-mode choice for the upstream provider. */
 		"strict?": "boolean",
 	},
 });
@@ -210,7 +210,7 @@ export const openaiChatRequestSchema = type({
 	"frequency_penalty?": "number",
 	"logit_bias?": type({ "[string]": "number" }),
 	"user?": "string",
-	"reasoning_effort?": "'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'",
+	"reasoning_effort?": "'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'",
 	"parallel_tool_calls?": "boolean",
 	"service_tier?": "'auto' | 'default' | 'flex' | 'scale' | 'priority'",
 	"metadata?": type({ "[string]": "unknown" }),

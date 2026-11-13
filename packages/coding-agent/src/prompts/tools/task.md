@@ -1,86 +1,42 @@
-{{#if asyncEnabled}}{{#if batchEnabled}}Delegate work to background subagents by passing multiple items in a single `tasks[]` batch.
-Execution does not block — you receive IDs immediately.{{else}}Delegate work to ONE background subagent per call.
-Execution does not block — you receive an ID immediately.{{/if}}{{#if hasBlockingAgents}}
-Agents marked BLOCKING run inline — results return in this call; non-blocking items in the same batch still spawn as background jobs.{{/if}}{{else}}{{#if batchEnabled}}Run subagents synchronously by passing items in a `tasks[]` batch. Execution blocks until all work finishes.{{else}}Run ONE subagent synchronously. Execution blocks until work finishes.{{/if}}{{/if}}
-{{#if asyncEnabled}}
+{{#if asyncEnabled}}{{#if batchEnabled}}Spawn `tasks[]` concurrently; IDs return immediately.{{else}}Spawn one agent; ID returns immediately.{{/if}}{{#if hasBlockingAgents}} BLOCKING agents return inline.{{/if}}{{else}}{{#if batchEnabled}}Run `tasks[]` synchronously.{{else}}Run one agent synchronously.{{/if}}{{/if}}
+{{#if asyncEnabled}}{{#ifAny structured hasStructuredAgents}}
 
-# Async Job Contract
-- Results auto-deliver. A settled `hub jobs`/`hub wait` snapshot is the delivery; no duplicate `async-result` follows.
-- Job IDs are process-local and expire roughly five minutes after settlement. Afterward, use the agent ID with `hub send`, `agent://<id>`, or `history://<id>`.
-- `completed` means successful yield/job exit, not artifact acceptance. Verify claimed changes.
+# Results
+{{#if structured}}`outputSchema`{{else}}STRUCTURED agents'{{/if}} parsed payload, even invalid: `agent://<id>` (field `/<field>`, nested `/reports/0/data`); invalid preview inline.
+{{/ifAny}}
+
+{{asyncGuidance}}
 {{/if}}
 
-# Task Design
-- **Agent typing:** Pick each item's `agent` type. Read-only research MUST use `agent: "scout"` (faster model). Use default worker only when no specialist fits.
-- **No overhead:** Each `task` MUST instruct its agent to skip formatters, linters, and project-wide test suites. Run those once at the end.
-- **One-pass:** Prefer agents that investigate AND edit in one pass; spin a read-only scout only when affected files are genuinely unknown.
-- **Overlap is safe:** Concurrent edits to the same files auto-resolve{{#if ircEnabled}}; worst case, agents coordinate directly over IRC{{/if}}. NEVER shrink or serialize a batch to avoid file overlap. Two prerequisites:
-  1. Every task MUST skip validation (build/lint/tests) — validating mid-flight blocks agents on each other's edits.
-  2. Decide cross-task contracts up front (e.g. the interface A implements and B consumes) and state them in the {{#if batchEnabled}}batch `context`{{else}}task{{/if}}, not left for agents to negotiate.
+# Delegation
+Use most specific agent.{{#if scoutAvailable}} Read-only research MUST use `scout` only when files unknown.{{/if}} Prefer one agent to investigate + edit. Omit `agent` only for default (`{{defaultAgent}}`); NEVER specify it.
+{{#if batchEnabled}}Specialist `agent` selectors belong inside each `tasks[]` item; NEVER put `agent` at the top level.
+{{/if}}
+Shared edits need one integration owner; give each task its files. Set interfaces in {{#if batchEnabled}}`context`{{else}}the task{{/if}}. Every task MUST skip build/lint/tests/formatters mid-flight; run once afterward.
 
 # Inputs
-{{#if batchEnabled}}
-- `context`: Shared project state, constraints, and contracts. Applies to the entire batch; do not duplicate this background into individual tasks.
-- `tasks[]`: Array of subagents to spawn.
-  - `name`: A stable CamelCase identifier (≤32 chars), used to address the agent (IRC, job ids). Generated automatically if omitted.
-  - `agent`: The agent type running this item (e.g. `scout`, `reviewer`). Omitting it gives you the general-purpose worker (`{{defaultAgent}}`) — NEVER pass that name explicitly. Only omit it after checking the agent list below and finding no specialist that fits.{{#if allowedAgentsText}} Current spawn policy allows: {{allowedAgentsText}}.{{/if}}
-  - `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
-{{#if effortEnabled}}  - `effort`: Scale w/ complexity of this task: `"lo"`|`"med"`|`"hi"`
+{{#if file}}`taskFile`: absolute path or `local://` file; contents become the task, read once at dispatch. Exactly one of `task`/`taskFile`.
 {{/if}}
-  - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
-  - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
-{{#if isolationEnabled}}
-{{#if applyIsolatedChanges}}
-  - `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.
-{{else}}
-  - `isolated`: Run in a dedicated worktree; changes are retained as patch or branch artifacts without modifying the parent checkout.
-{{/if}}
-{{/if}}
-{{else}}
-- `name`: A stable CamelCase identifier (≤32 chars), used to address the agent (IRC, job ids). Generated automatically if omitted.
-- `agent`: The agent type to spawn (e.g. `scout`, `reviewer`). Omitting it gives you the general-purpose worker (`{{defaultAgent}}`) — NEVER pass that name explicitly. Only omit it after checking the agent list below and finding no specialist that fits.{{#if allowedAgentsText}} Current spawn policy allows: {{allowedAgentsText}}.{{/if}}
-- `task`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
-{{#if effortEnabled}}- `effort`: Scale w/ complexity of this task: `"lo"`|`"med"`|`"hi"`
-{{/if}}
-- `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
-- `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
-{{#if isolationEnabled}}
-{{#if applyIsolatedChanges}}
-- `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.
-{{else}}
-- `isolated`: Run in a dedicated worktree; changes are retained as patch or branch artifacts without modifying the parent checkout.
-{{/if}}
-{{/if}}
-{{/if}}
+`name`: CamelCase ≤32, auto-generated if omitted; address agent by name.{{#if structured}} `outputSchema` overrides agent/session schemas.{{/if}}
+`solutionSpace`: describe how open-ended the child's problem is: whether the fix or design is given, or which causes or designs remain open. Volume of work does not widen it; NEVER mention sibling agents or coordination. (`one fix: rename, names given`; `one fix: slice end in paginate`; `single-flight cache load; races easy to miss`; `several retry API shapes; error classes to choose`; `deadlock cause open, no repro`)
+{{#if seanceGuidance}}{{seanceGuidance}}{{/if}}
+{{#if evalToolsEnabled}}`tools`: eval-defined, run in your kernel.
+{{/if}}{{#if effortEnabled}}`effort`: `"lo"`|`"med"`|`"hi"` by how open-ended the problem is.
+{{/if}}{{#if perCallModelEnabled}}`model`: one exact `provider/model-id[@upstream][:level]` string for this spawn only{{#if batchEnabled}}; per `tasks[]` item{{/if}}. `@upstream` pins an aggregator route and is part of the model identity. Only operator-approved models; no roles, arrays, globs or partial IDs. Approved: {{#list perCallModelAdvertisement.roles join=", "}}{{#list patterns join=", "}}`{{this}}`{{/list}} ({{role}}){{/list}}{{#if perCallModelAdvertisement.roles.length}}; {{/if}}{{#if perCallModelAdvertisement.parentModelWithheld}}{{else}}your own current model; {{/if}}the selected bundled/user agent's own configured model. A listed glob approves matching exact IDs; write the exact ID, NEVER the glob.{{#if perCallModelAdvertisement.allowlist.length}} Allowlist: {{#list perCallModelAdvertisement.allowlist join=", "}}`{{this}}`{{/list}} (must also be approved).{{/if}} An agent's `task.agentModelOverrides` entry or user-chosen effort conflicts with `model`. Omit unless needed. Requested model unavailable → stop and report; NEVER substitute another. Every request requires an approved model; retry fallback, context promotion and prewalk are off.
+{{/if}}{{#if structured}}`schemaMode`: default permissive warns after retries; strict fails.
+{{/if}}{{#if isolationEnabled}}{{#if applyIsolatedChanges}}`isolated`: worktree; successful changes apply to parent.
+{{else}}`isolated`: worktree; changes retained, not applied.
+{{/if}}{{/if}}Children start blank unless `source` is `fork`;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
 
 - `source`: Task context source: `fresh` or `fork`. `fresh` starts with normal blank child history. `fork` inherits the scheduling-time completed-parent branch as native conversation messages, scrubbing the parent-only eager task/todo, todo, checkpoint, and rewind control calls/results; it uses the selected child agent's normal model, prompt, tools, permissions, schema, and isolation. Agent type and context source are independent choices. In batch calls, a top-level `source` is inherited by items unless an item specifies its own source.
 - Prefer `fork` for work that benefits from the current conversation. Use `fresh` when independence or a clean perspective is specifically valuable.
 
-# Communication
-Subagents start blank — no conversation history, except forked tasks, which inherit the completed parent conversation as normal messages.{{#if ircEnabled}} Parent-to-subagent IRC delivered immediately as steering.{{/if}}
-Pass large payloads via `local://<path>` URIs, NEVER inline text.
-
-# Format Contracts
-{{#if batchEnabled}}
-`context` format:
-# Goal         ← what the batch accomplishes
-# Constraints  ← rules and session decisions
-# Contract     ← shared interfaces
-{{/if}}
-
-`task` format:
-# Target       ← exact files and symbols; explicit non-goals
-# Change       ← step-by-step add/remove/rename; APIs and patterns
-# Acceptance   ← observable result; no project-wide commands
+# Format
+{{#if batchEnabled}}`context`: shared (`# Goal`, `# Contract` interfaces); NEVER repeat per task.
+{{/if}}`task`{{#if file}} or the contents of `taskFile`{{/if}}: self-contained (`# Target` files/non-goals, `# Change` steps/APIs, `# Acceptance` observable result).
 
 # Available Agents
-{{#if spawningDisabled}}
-Agent spawning is currently disabled.
-{{else}}
-Pick the most specific agent; use default worker only when no specialist fits.
-{{#list agents join="\n"}}
-### {{name}}{{#if readOnly}} (READ-ONLY){{/if}}{{#if blocking}} (BLOCKING: inline result){{/if}}
-{{description}}
-{{#if readOnly}}Use ONLY for investigation; do edits yourself or assign to a writing agent.{{/if}}
-{{/list}}
-{{/if}}
+{{#if spawningDisabled}}Agent spawning is currently disabled.
+{{else}}{{#if hasModelMentions}}`m<N>` = user-tagged model (`<model agent="m<N>" name="…"/>`), not specialist; spawn only when user names it.
+{{/if}}{{#list agents join=""}}- `{{name}}`{{#if readOnly}} (READ-ONLY; investigation only, no edits){{/if}}{{#if blocking}} (BLOCKING; inline result){{/if}}{{#if structured}} (STRUCTURED; schema result){{/if}}: {{description}}
+{{/list}}{{/if}}

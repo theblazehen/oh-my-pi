@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { ShellFsFileType } from "@oh-my-pi/pi-natives";
 import * as capability from "../../src/capability";
 import type { SSHHost } from "../../src/capability/ssh";
 import type { CapabilityResult, SourceMeta } from "../../src/capability/types";
@@ -90,7 +91,9 @@ describe("SshProtocolHandler", () => {
 		mockHosts();
 		vi.spyOn(fileTransfer, "readRemoteFile").mockRejectedValue(new Error("Is a directory"));
 		vi.spyOn(fileTransfer, "statRemotePath").mockResolvedValue("directory");
-		const listSpy = vi.spyOn(fileTransfer, "listRemoteDir").mockResolvedValue([{ name: "etc", isDirectory: true }]);
+		const listSpy = vi
+			.spyOn(fileTransfer, "listRemoteDir")
+			.mockResolvedValue([{ name: "etc", fileType: ShellFsFileType.Dir }]);
 		const res = await handler.resolve(parseInternalUrl("ssh://icaro/"));
 		expect(res.isDirectory).toBe(true);
 		expect(res.content).toBe("etc/");
@@ -104,7 +107,9 @@ describe("SshProtocolHandler", () => {
 			bytes: new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 0x00, 0x01]),
 			truncated: false,
 		});
-		await expect(handler.resolve(parseInternalUrl("ssh://icaro/bin/true"))).rejects.toThrow(/binary or non-UTF-8/);
+		await expect(handler.resolve(parseInternalUrl("ssh://icaro/bin/true"))).rejects.toThrow(
+			/binary or non-UTF-8.*use `bash` with a remote SSH command or an `sshfs` mount/,
+		);
 	});
 
 	it("rejects a file whose first invalid byte falls past the old 8 KiB sniff window", async () => {
@@ -144,8 +149,8 @@ describe("SshProtocolHandler", () => {
 		);
 		vi.spyOn(fileTransfer, "statRemotePath").mockResolvedValue("directory");
 		const listSpy = vi.spyOn(fileTransfer, "listRemoteDir").mockResolvedValue([
-			{ name: "conf.d", isDirectory: true },
-			{ name: "hosts", isDirectory: false },
+			{ name: "conf.d", fileType: ShellFsFileType.Dir },
+			{ name: "hosts", fileType: ShellFsFileType.File },
 		]);
 		const res = await handler.resolve(parseInternalUrl("ssh://icaro/etc"));
 		expect(res.isDirectory).toBe(true);
@@ -181,7 +186,9 @@ describe("SshProtocolHandler", () => {
 		const readSpy = vi
 			.spyOn(fileTransfer, "readRemoteFile")
 			.mockResolvedValue({ bytes: new Uint8Array(), truncated: false });
-		await expect(handler.resolve(parseInternalUrl("ssh://icaro/dev/zero"))).rejects.toThrow(/not a regular file/);
+		await expect(handler.resolve(parseInternalUrl("ssh://icaro/dev/zero"))).rejects.toThrow(
+			/not a regular file.*use `bash` with a remote SSH command/,
+		);
 		expect(readSpy).not.toHaveBeenCalled();
 	});
 

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import {
 	type ApiKeyCredential,
 	type AuthCredential,
@@ -7,6 +7,8 @@ import {
 	type StoredAuthCredential,
 } from "@oh-my-pi/pi-ai/auth-storage";
 import type { CredentialRankingStrategy, UsageLimit, UsageProvider, UsageReport } from "@oh-my-pi/pi-ai/usage";
+import { claudeRankingStrategy } from "@oh-my-pi/pi-ai/usage/claude";
+import { logger } from "@oh-my-pi/pi-utils";
 
 interface CacheEntry {
 	value: string;
@@ -19,11 +21,13 @@ function makeStore(rows: StoredAuthCredential[], blocked = new Map<number, numbe
 		close() {},
 		listAuthCredentials: provider => rows.filter(row => provider === undefined || row.provider === provider),
 		updateAuthCredential() {},
-		deleteAuthCredential() {},
+		async deleteAuthCredential() {
+			return false;
+		},
 		tryDisableAuthCredentialIfMatches: () => false,
-		replaceAuthCredentialsForProvider: () => rows,
-		upsertAuthCredentialForProvider: () => rows,
-		deleteAuthCredentialsForProvider() {},
+		replaceAuthCredentials: async () => rows,
+		upsertAuthCredential: async () => rows,
+		async deleteAuthCredentials() {},
 		getCredentialBlock: credentialId => blocked.get(credentialId),
 		getCache(key) {
 			const entry = cache.get(key);
@@ -112,10 +116,76 @@ describe("AuthStorage model usage health", () => {
 			rankingStrategyResolver: provider => (provider === "anthropic" ? strategy : undefined),
 			configValueResolver: async value => value,
 		});
-		await storage.reload();
+		await storage.credentials.reload();
 		storages.push(storage);
 		return storage;
 	}
+
+	it("prefetches selection usage without pinning, and an aborted warmup does not cancel foreground resolution", async () => {
+		const release = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		let calls = 0;
+		const usageProvider: UsageProvider = {
+			id: "anthropic",
+			async fetchUsage(params) {
+				calls += 1;
+				if (calls === 2) started.resolve();
+				await release.promise;
+				return report(params.credential.accountId!, [limit("short", 0.2)]);
+			},
+		};
+		const storage = new AuthStorage(makeStore([oauthRow(1), oauthRow(2)]), {
+			usageProviderResolver: provider => (provider === "anthropic" ? usageProvider : undefined),
+			rankingStrategyResolver: provider => (provider === "anthropic" ? strategy : undefined),
+		});
+		await storage.credentials.reload();
+		storages.push(storage);
+		const controller = new AbortController();
+		const warm = storage.keys.prefetchUsage("anthropic", "prefetch-session", { signal: controller.signal });
+		await started.promise;
+		expect(storage.oauth.accounts("anthropic", "prefetch-session").some(account => account.active)).toBe(false);
+		const foreground = storage.keys.get("anthropic", "prefetch-session");
+		controller.abort();
+		await expect(warm).rejects.toThrow();
+		release.resolve();
+		expect(await foreground).toMatch(/^access-[12]$/);
+		expect(calls).toBe(2);
+		// Prefetching never advances the non-session round-robin cursor.
+		expect(await storage.keys.get("anthropic")).toBe("access-1");
+	});
+
+	it.each(["runtime", "config", "pinned", "single", "restricted", "unranked"] as const)(
+		"does not prefetch usage for a %s selection",
+		async mode => {
+			const fetchUsage = vi.fn(async () => null);
+			const storage = new AuthStorage(makeStore(mode === "single" ? [oauthRow(1)] : [oauthRow(1), oauthRow(2)]), {
+				usageProviderResolver: provider => (provider === "anthropic" ? { id: "anthropic", fetchUsage } : undefined),
+				rankingStrategyResolver: () => (mode === "unranked" ? undefined : strategy),
+			});
+			await storage.credentials.reload();
+			storages.push(storage);
+			if (mode === "runtime") storage.keys.setRuntime("anthropic", "override");
+			if (mode === "config") storage.keys.setConfig("anthropic", "override");
+			if (mode === "pinned") storage.sessions.pin("anthropic", "session", 1);
+			if (mode === "restricted") storage.sessions.restrict("anthropic", "session", ["account:account-1"]);
+
+			await storage.keys.prefetchUsage("anthropic", "session");
+			expect(fetchUsage).not.toHaveBeenCalled();
+		},
+	);
+
+	it("prefetches a model-gated single account when selection needs plan evidence", async () => {
+		const fetchUsage = vi.fn(async () => report("account-1", [limit("short", 0.2)]));
+		const storage = new AuthStorage(makeStore([oauthRow(1)]), {
+			usageProviderResolver: provider => (provider === "anthropic" ? { id: "anthropic", fetchUsage } : undefined),
+			rankingStrategyResolver: () => ({ ...strategy, planGate: () => () => true }),
+		});
+		await storage.credentials.reload();
+		storages.push(storage);
+		await storage.keys.prefetchUsage("anthropic", "session", { modelId: "plan-gated" });
+		expect(fetchUsage).toHaveBeenCalledTimes(1);
+		expect(storage.oauth.accounts("anthropic", "session").some(account => account.active)).toBe(false);
+	});
 
 	it("honours every request scope when checking persisted health blocks", async () => {
 		const rows = [oauthRow(1)];
@@ -130,10 +200,10 @@ describe("AuthStorage model usage health", () => {
 			rankingStrategyResolver: provider => (provider === "anthropic" ? strategy : undefined),
 			configValueResolver: async value => value,
 		});
-		await storage.reload();
+		await storage.credentials.reload();
 		storages.push(storage);
 
-		const health = await storage.getModelUsageHealth("anthropic", {
+		const health = await storage.health.model("anthropic", {
 			modelId: "claude",
 			reserveFraction: 0.1,
 		});
@@ -146,7 +216,7 @@ describe("AuthStorage model usage health", () => {
 			"account-1": report("account-1", [limit("short", 1)]),
 			"account-2": report("account-2", [limit("short", 0.4)]),
 		});
-		const health = await storage.getModelUsageHealth("anthropic", {
+		const health = await storage.health.model("anthropic", {
 			modelId: "claude",
 			reserveFraction: 0.1,
 		});
@@ -159,7 +229,7 @@ describe("AuthStorage model usage health", () => {
 			"account-1": report("account-1", [limit("short", 1)]),
 			"account-2": null,
 		});
-		const health = await storage.getModelUsageHealth("anthropic", {
+		const health = await storage.health.model("anthropic", {
 			modelId: "claude",
 			reserveFraction: 0.1,
 		});
@@ -172,7 +242,7 @@ describe("AuthStorage model usage health", () => {
 			"account-1": report("account-1", [limit("short", 0.95)]),
 			"account-2": report("account-2", [limit("short", 1)]),
 		});
-		const health = await storage.getModelUsageHealth("anthropic", {
+		const health = await storage.health.model("anthropic", {
 			modelId: "claude",
 			reserveFraction: 0.1,
 		});
@@ -187,7 +257,7 @@ describe("AuthStorage model usage health", () => {
 			"account-1": report("account-1", [limit("5-hour", short), limit("7-day", long)]),
 		});
 
-		const health = await storage.getModelUsageHealth("anthropic", {
+		const health = await storage.health.model("anthropic", {
 			modelId: "claude",
 			reserveFraction: 0.1,
 		});
@@ -212,7 +282,7 @@ describe("AuthStorage model usage health", () => {
 		};
 		const storage = await createStorage([oauthRow(1)], { "account-1": usageReport });
 
-		const health = await storage.getModelUsageHealth("anthropic", {
+		const health = await storage.health.model("anthropic", {
 			modelId: "claude",
 			reserveFraction: 0.1,
 		});
@@ -228,7 +298,7 @@ describe("AuthStorage model usage health", () => {
 		staleReport.limits[0].window = { id: "short", label: "short", resetsAt: now - 60_000 };
 		const storage = await createStorage([oauthRow(1)], { "account-1": staleReport });
 
-		const health = await storage.getModelUsageHealth("anthropic", {
+		const health = await storage.health.model("anthropic", {
 			modelId: "claude",
 			reserveFraction: 0.1,
 		});
@@ -242,13 +312,13 @@ describe("AuthStorage model usage health", () => {
 		const storage = await createStorage([oauthRow(1)], {
 			"account-1": usageReport,
 		});
-		const health = await storage.getModelUsageHealth("anthropic", {
+		const health = await storage.health.model("anthropic", {
 			modelId: "haiku",
 			reserveFraction: 0.1,
 		});
 		expect(health.state).toBe("healthy");
 		expect(health.accounts[0]?.remainingFraction).toBeCloseTo(0.8);
-		expect(storage.getUsageReportingModelIds("anthropic", ["claude", "haiku", "unmapped"], [usageReport])).toEqual([
+		expect(storage.usage.reportingModelIds("anthropic", ["claude", "haiku", "unmapped"], [usageReport])).toEqual([
 			"claude",
 			"haiku",
 		]);
@@ -271,7 +341,7 @@ describe("AuthStorage model usage health", () => {
 				},
 			],
 		};
-		expect(storage.getUsageReportingModelIds("cursor", ["composer-1", "composer-2"], [sharedReport])).toEqual([
+		expect(storage.usage.reportingModelIds("cursor", ["composer-1", "composer-2"], [sharedReport])).toEqual([
 			"composer-1",
 			"composer-2",
 		]);
@@ -284,7 +354,7 @@ describe("AuthStorage model usage health", () => {
 			{ "account-1": report("account-1", [limit("short", 0.1)]), "account-2": null },
 			new Map([[1, resetAt]]),
 		);
-		const health = await storage.getModelUsageHealth("anthropic", {
+		const health = await storage.health.model("anthropic", {
 			modelId: "claude",
 			reserveFraction: 0.1,
 		});
@@ -297,7 +367,7 @@ describe("AuthStorage model usage health", () => {
 			"key-1": report("key-1", [limit("short", 1)]),
 			"key-2": report("key-2", [limit("short", 0.1)]),
 		});
-		const health = await storage.getModelUsageHealth("anthropic", {
+		const health = await storage.health.model("anthropic", {
 			modelId: "claude",
 			reserveFraction: 0.1,
 		});
@@ -309,7 +379,7 @@ describe("AuthStorage model usage health", () => {
 		const storage = await createStorage([apiKeyRow(1)], {
 			"key-1": report("key-1", [limit("short", 1)]),
 		});
-		const health = await storage.getModelUsageHealth("anthropic", {
+		const health = await storage.health.model("anthropic", {
 			modelId: "claude",
 			reserveFraction: 0.1,
 		});
@@ -334,9 +404,9 @@ describe("AuthStorage model usage health", () => {
 			rankingStrategyResolver: provider => (provider === "anthropic" ? strategy : undefined),
 			configValueResolver: async value => value,
 		});
-		await storage.reload();
+		await storage.credentials.reload();
 		storages.push(storage);
-		const health = await storage.getModelUsageHealth("anthropic", {
+		const health = await storage.health.model("anthropic", {
 			modelId: "claude",
 			sessionId: "session-1",
 			reserveFraction: 0.1,
@@ -346,8 +416,8 @@ describe("AuthStorage model usage health", () => {
 			credentialId: 1,
 			state: "reserve",
 		});
-		expect(storage.releaseSessionCredentialForReselection("anthropic", "session-1")).toBe(true);
-		expect(await storage.getApiKey("anthropic", "session-1", { modelId: "claude" })).toBe("key-2");
+		expect(storage.sessions.release("anthropic", "session-1")).toBe(true);
+		expect(await storage.keys.get("anthropic", "session-1", { modelId: "claude" })).toBe("key-2");
 	});
 
 	it("does not consume the native API-key round-robin cursor", async () => {
@@ -355,19 +425,19 @@ describe("AuthStorage model usage health", () => {
 			"key-1": report("key-1", [limit("short", 0.2)]),
 			"key-2": report("key-2", [limit("short", 0.2)]),
 		});
-		await storage.getModelUsageHealth("anthropic", {
+		await storage.health.model("anthropic", {
 			modelId: "claude",
 			reserveFraction: 0.1,
 		});
-		expect(await storage.getApiKey("anthropic", undefined, { modelId: "claude" })).toBe("key-1");
+		expect(await storage.keys.get("anthropic", undefined, { modelId: "claude" })).toBe("key-1");
 	});
 
 	it("returns unknown for static overrides that bypass the native pool", async () => {
 		const storage = await createStorage([oauthRow(1)], {
 			"account-1": report("account-1", [limit("short", 1)]),
 		});
-		storage.setRuntimeApiKey("anthropic", "override-key");
-		const health = await storage.getModelUsageHealth("anthropic", {
+		storage.keys.setRuntime("anthropic", "override-key");
+		const health = await storage.health.model("anthropic", {
 			modelId: "claude",
 			reserveFraction: 0.1,
 		});
@@ -382,10 +452,10 @@ describe("AuthStorage model usage health", () => {
 			rankingStrategyResolver: provider => (provider === "anthropic" ? strategy : undefined),
 			configValueResolver: async value => value,
 		});
-		await storage.reload();
+		await storage.credentials.reload();
 		storages.push(storage);
 		const controller = new AbortController();
-		const health = storage.getModelUsageHealth("anthropic", {
+		const health = storage.health.model("anthropic", {
 			modelId: "claude",
 			reserveFraction: 0.1,
 			signal: controller.signal,
@@ -394,5 +464,322 @@ describe("AuthStorage model usage health", () => {
 		controller.abort();
 		await expect(health).rejects.toThrow("usage fetch aborted");
 		pending.resolve(report("key-1", [limit("short", 0.2)]));
+	});
+});
+
+function sqliteCorruptError(): Error & { code: string } {
+	const err = new Error("database disk image is malformed (11) (Rowid 77291 out of order)") as Error & {
+		code: string;
+	};
+	err.code = "SQLITE_CORRUPT";
+	return err;
+}
+
+describe("AuthStorage corrupt persisted block store", () => {
+	const storages: AuthStorage[] = [];
+	afterEach(() => {
+		for (const storage of storages) storage.close();
+		storages.length = 0;
+		vi.restoreAllMocks();
+	});
+
+	it("latches a corrupt block read, reports once, and stops re-querying the store", async () => {
+		const rows = [oauthRow(1)];
+		const store = makeStore(rows);
+		let getBlockCalls = 0;
+		store.getCredentialBlock = () => {
+			getBlockCalls += 1;
+			throw sqliteCorruptError();
+		};
+		const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider =>
+				provider === "anthropic"
+					? makeUsageProvider({ "account-1": report("account-1", [limit("short", 0.2)]) })
+					: undefined,
+			rankingStrategyResolver: provider => (provider === "anthropic" ? strategy : undefined),
+			configValueResolver: async value => value,
+		});
+		await storage.credentials.reload();
+		storages.push(storage);
+
+		const first = await storage.health.model("anthropic", { modelId: "claude", reserveFraction: 0.1 });
+		const second = await storage.health.model("anthropic", { modelId: "claude", reserveFraction: 0.1 });
+
+		// Availability is preserved: a corrupt persisted read fails open to the
+		// in-memory backoff (no block) instead of spuriously forcing depletion.
+		expect(first.state).toBe("healthy");
+		expect(second.state).toBe("healthy");
+		// Latched on the first unrecoverable error: the broken store is queried
+		// exactly once despite three block-scope reads per health check across two calls.
+		expect(getBlockCalls).toBe(1);
+		expect(errorSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("latches a corrupt block write and stops attempting persistence", async () => {
+		const rows = [apiKeyRow(1)];
+		const store = makeStore(rows);
+		let upsertCalls = 0;
+		store.upsertCredentialBlock = () => {
+			upsertCalls += 1;
+			throw sqliteCorruptError();
+		};
+		const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+		const storage = new AuthStorage(store);
+		await storage.credentials.reload();
+		storages.push(storage);
+
+		await storage.limits.markReached("anthropic", undefined, { apiKey: "key-1" });
+		await storage.limits.markReached("anthropic", undefined, { apiKey: "key-1" });
+
+		// First upsert throws SQLITE_CORRUPT and latches; the second mark skips
+		// the store entirely rather than retrying a broken write on every 429.
+		expect(upsertCalls).toBe(1);
+		expect(errorSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("skips reconcile-after reads after a corrupt Codex block write latches the store", async () => {
+		const credential: AuthCredential = {
+			type: "oauth",
+			access: "access-1",
+			refresh: "refresh-1",
+			expires: Date.now() + 60 * 60_000,
+			accountId: "account-1",
+		};
+		const rows: StoredAuthCredential[] = [{ id: 1, provider: "openai-codex", credential, disabledCause: null }];
+		const healthyReport: UsageReport = {
+			provider: "openai-codex",
+			fetchedAt: Date.now(),
+			limits: [limit("short", 0.2)],
+			metadata: { accountId: "account-1", allowed: true, limitReached: false },
+		};
+		const usageProvider: UsageProvider = {
+			id: "openai-codex",
+			fetchUsage: async () => healthyReport,
+		};
+		const store = makeStore(rows);
+		let upsertCalls = 0;
+		let reconcileAfterCalls = 0;
+		store.upsertCredentialBlock = () => {
+			upsertCalls += 1;
+			throw sqliteCorruptError();
+		};
+		store.getCredentialBlockReconcileAfter = () => {
+			reconcileAfterCalls += 1;
+			throw sqliteCorruptError();
+		};
+		const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "openai-codex" ? usageProvider : undefined),
+			rankingStrategyResolver: provider => (provider === "openai-codex" ? strategy : undefined),
+			configValueResolver: async value => value,
+		});
+		await storage.credentials.reload();
+		storages.push(storage);
+
+		await storage.limits.markReached("openai-codex", undefined, {
+			credentialId: 1,
+			modelId: "claude",
+		});
+		const health = await storage.health.model("openai-codex", {
+			modelId: "claude",
+			reserveFraction: 0.1,
+		});
+
+		expect(upsertCalls).toBe(1);
+		expect(reconcileAfterCalls).toBe(0);
+		expect(errorSpy).toHaveBeenCalledTimes(1);
+		expect(health.state).toBe("depleted");
+	});
+	it("latches every broker-facing block operation independently", async () => {
+		const block = {
+			credentialId: 1,
+			providerKey: "anthropic:api_key",
+			blockScope: "",
+			blockedUntilMs: Date.now() + 60_000,
+		};
+		const scenarios: Array<{
+			name: string;
+			install: (store: AuthCredentialStore, recordCall: () => void) => void;
+			invoke: (storage: AuthStorage) => unknown;
+			fallback: unknown;
+			failsWhenLatched: boolean;
+		}> = [
+			{
+				name: "listCredentialBlocks",
+				install: (store, recordCall) => {
+					store.listCredentialBlocks = () => {
+						recordCall();
+						throw sqliteCorruptError();
+					};
+				},
+				invoke: storage => storage.blocks.list([1]),
+				fallback: [],
+				failsWhenLatched: false,
+			},
+			{
+				name: "upsertCredentialBlock",
+				install: (store, recordCall) => {
+					store.upsertCredentialBlock = () => {
+						recordCall();
+						throw sqliteCorruptError();
+					};
+				},
+				invoke: storage => storage.blocks.upsert(block),
+				fallback: undefined,
+				failsWhenLatched: true,
+			},
+			{
+				name: "deleteCredentialBlock",
+				install: (store, recordCall) => {
+					store.deleteCredentialBlock = () => {
+						recordCall();
+						throw sqliteCorruptError();
+					};
+				},
+				invoke: storage => storage.blocks.delete(1, block.providerKey, block.blockScope),
+				fallback: undefined,
+				failsWhenLatched: true,
+			},
+			{
+				name: "deleteCredentialBlocks",
+				install: (store, recordCall) => {
+					store.deleteCredentialBlocks = () => {
+						recordCall();
+						throw sqliteCorruptError();
+					};
+				},
+				invoke: storage => storage.blocks.deleteAll(1),
+				fallback: undefined,
+				failsWhenLatched: true,
+			},
+		];
+		const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+
+		for (const scenario of scenarios) {
+			const store = makeStore([]);
+			let calls = 0;
+			scenario.install(store, () => {
+				calls += 1;
+			});
+			const storage = new AuthStorage(store);
+			await storage.credentials.reload();
+			storages.push(storage);
+
+			if (scenario.failsWhenLatched) {
+				expect(() => scenario.invoke(storage), scenario.name).toThrow("unavailable after SQLite corruption");
+				expect(() => scenario.invoke(storage), scenario.name).toThrow("unavailable after SQLite corruption");
+			} else {
+				expect(scenario.invoke(storage), scenario.name).toEqual(scenario.fallback);
+				expect(scenario.invoke(storage), scenario.name).toEqual(scenario.fallback);
+			}
+			expect(calls, scenario.name).toBe(1);
+		}
+		expect(errorSpy).toHaveBeenCalledTimes(scenarios.length);
+	});
+});
+
+describe("AuthStorage Claude tier reserve health", () => {
+	const storages: AuthStorage[] = [];
+	afterEach(() => {
+		for (const storage of storages) storage.close();
+		storages.length = 0;
+	});
+
+	const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+	const HOUR_MS = 60 * 60 * 1000;
+
+	function claudeLimit(opts: {
+		id: string;
+		windowId: "5h" | "7d";
+		usedFraction: number;
+		shared?: boolean;
+		tier?: string;
+		exhausted?: boolean;
+	}): UsageLimit {
+		const resetsAt = Date.now() + 3 * 24 * 60 * 60 * 1000;
+		return {
+			id: opts.id,
+			label: opts.id,
+			scope: {
+				provider: "anthropic",
+				windowId: opts.windowId,
+				...(opts.tier !== undefined ? { tier: opts.tier } : {}),
+				...(opts.shared !== undefined ? { shared: opts.shared } : {}),
+			},
+			window: {
+				id: opts.windowId,
+				label: opts.windowId,
+				durationMs: opts.windowId === "5h" ? 5 * HOUR_MS : WEEK_MS,
+				resetsAt,
+			},
+			amount: { usedFraction: opts.usedFraction, unit: "percent" },
+			status: opts.exhausted ? "exhausted" : "ok",
+		};
+	}
+
+	async function createClaudeStorage(reports: Record<string, UsageReport | null>): Promise<AuthStorage> {
+		const storage = new AuthStorage(makeStore([oauthRow(1)]), {
+			usageProviderResolver: provider => (provider === "anthropic" ? makeUsageProvider(reports) : undefined),
+			rankingStrategyResolver: provider => (provider === "anthropic" ? claudeRankingStrategy : undefined),
+			configValueResolver: async value => value,
+		});
+		await storage.credentials.reload();
+		storages.push(storage);
+		return storage;
+	}
+
+	function tieredReport(fableUsedFraction: number, exhausted = false): UsageReport {
+		return report("account-1", [
+			claudeLimit({ id: "anthropic:5h", windowId: "5h", usedFraction: 0.1, shared: true }),
+			claudeLimit({ id: "anthropic:7d", windowId: "7d", usedFraction: 0.72, shared: true }),
+			claudeLimit({
+				id: "anthropic:7d:fable",
+				windowId: "7d",
+				usedFraction: fableUsedFraction,
+				tier: "fable",
+				exhausted,
+			}),
+		]);
+	}
+
+	it("reports reserve when the mapped Fable tier row is inside the reserve margin", async () => {
+		const storage = await createClaudeStorage({ "account-1": tieredReport(0.96) });
+		const health = await storage.health.model("anthropic", {
+			modelId: "claude-fable-5",
+			reserveFraction: 0.1,
+		});
+		expect(health.state).toBe("reserve");
+		expect(health.accounts[0]?.remainingFraction).toBeCloseTo(0.04);
+	});
+
+	it("keeps a Fable model healthy while its tier row stays outside the reserve margin", async () => {
+		const storage = await createClaudeStorage({ "account-1": tieredReport(0.85) });
+		const health = await storage.health.model("anthropic", {
+			modelId: "claude-fable-5",
+			reserveFraction: 0.1,
+		});
+		expect(health.state).toBe("healthy");
+		expect(health.accounts[0]?.remainingFraction).toBeCloseTo(0.15);
+	});
+
+	it("does not let a Fable-only tier row pull unrelated Opus traffic into reserve", async () => {
+		const storage = await createClaudeStorage({ "account-1": tieredReport(0.96) });
+		const health = await storage.health.model("anthropic", {
+			modelId: "claude-opus-4-8",
+			reserveFraction: 0.1,
+		});
+		expect(health.state).toBe("healthy");
+		expect(health.accounts[0]?.remainingFraction).toBeCloseTo(0.28);
+	});
+
+	it("still depletes a Fable model on a confirmed 100% tier row", async () => {
+		const storage = await createClaudeStorage({ "account-1": tieredReport(1, true) });
+		const health = await storage.health.model("anthropic", {
+			modelId: "claude-fable-5",
+			reserveFraction: 0.1,
+		});
+		expect(health.state).toBe("depleted");
+		expect(health.accounts[0]?.resetsAt).toBeGreaterThan(Date.now());
 	});
 });

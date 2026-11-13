@@ -1,14 +1,12 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
-import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, setSystemTime, vi } from "bun:test";
+import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { Loader } from "@oh-my-pi/pi-tui";
+import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 
-interface FakeWorkingLoader {
-	stop: Mock<() => void>;
-	kind: "working";
-}
+import { cfgTerminalShowProgress } from "@oh-my-pi/pi-coding-agent/modes/settings";
 
 /**
  * Faithful model of the shared `statusContainer` + working-loader invariant that
@@ -25,83 +23,49 @@ interface FakeWorkingLoader {
  * the next `agent_start` recreates and re-attaches it.
  */
 function createContext(options: { terminalProgress?: boolean } = {}) {
-	const streamState = { isStreaming: false };
-	const children: unknown[] = [];
-	const statusContainer = {
-		children,
-		clear() {
-			children.length = 0;
-		},
-		disposeChildren() {
-			children.length = 0;
-		},
-		addChild(child: unknown) {
-			children.push(child);
-		},
-		removeChild(child: unknown) {
-			const index = children.indexOf(child);
-			if (index !== -1) children.splice(index, 1);
-		},
-	};
-	const workingLoaders: FakeWorkingLoader[] = [];
-	const setProgress = vi.fn();
-	const ctx = {
-		isInitialized: true,
-		settings: {
-			get: (path: string) => path === "terminal.showProgress" && options.terminalProgress === true,
-		},
-		statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn(), markActivityEnd: vi.fn() },
-		updateEditorTopBorder: vi.fn(),
-		flushPendingCommandOutput: vi.fn(),
-		transcriptMessageComponents: new WeakMap(),
-		pendingTools: new Map<string, unknown>(),
-		hideThinkingBlock: false,
-		setWorkingMessage: vi.fn(),
-		clearPinnedError: vi.fn(),
-		loadingAnimation: undefined,
-		autoCompactionLoader: undefined,
-		retryLoader: undefined,
-		streamingComponent: undefined,
-		streamingMessage: undefined,
-		statusContainer,
-		chatContainer: { removeChild: vi.fn(), clear: vi.fn() },
-		flushPendingModelSwitch: vi.fn(async () => {}),
-		flushCompactionQueue: vi.fn(async () => {}),
-		rebuildChatFromMessages: vi.fn(),
-		reloadTodos: vi.fn(async () => {}),
-		showStatus: vi.fn(),
-		showWarning: vi.fn(),
-		showError: vi.fn(),
-		editor: { getText: () => "" },
-		sessionManager: { getSessionName: () => "test-session" },
-		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn(), terminal: { setProgress } },
-		viewSession: {
-			isCompacting: false,
-			getLastAssistantMessage: () => undefined,
-			get isStreaming() {
-				return streamState.isStreaming;
-			},
-		},
+	// `continuation`: a scheduled retry/continuation the session still owes.
+	const streamState: { isStreaming: boolean; continuation?: PromiseWithResolvers<void> } = { isStreaming: false };
+	if (options.terminalProgress) cfgTerminalShowProgress.set(settings, true);
+	const progressCleared = Promise.withResolvers<void>();
+	const setProgress = vi.fn((active: boolean) => {
+		if (!active) progressCleared.resolve();
+	});
+	const ctx = createInteractiveModeContext({
+		ui: { terminal: { setProgress } },
 		session: {
 			get isStreaming() {
 				return streamState.isStreaming;
 			},
-			getToolByName: () => undefined,
+			get hasPostPromptWork() {
+				return streamState.continuation !== undefined;
+			},
+			waitForIdle: async () => {
+				await streamState.continuation?.promise;
+			},
 		},
-	} as unknown as InteractiveModeContext;
+	});
+	const { statusContainer } = ctx;
+	const workingLoaders: Loader[] = [];
 	ctx.ensureLoadingAnimation = vi.fn(() => {
 		if (ctx.loadingAnimation) return;
 		statusContainer.clear();
-		const working: FakeWorkingLoader = { stop: vi.fn(), kind: "working" };
+		const working = new Loader(
+			ctx.ui,
+			text => text,
+			text => text,
+			"Working…",
+		);
+		vi.spyOn(working, "stop");
 		workingLoaders.push(working);
-		ctx.loadingAnimation = working as unknown as typeof ctx.loadingAnimation;
-		statusContainer.addChild(ctx.loadingAnimation);
+		ctx.loadingAnimation = working;
+		statusContainer.addChild(working);
 	});
-	return { ctx, streamState, statusContainer, workingLoaders, setProgress };
+	return { ctx, streamState, statusContainer, workingLoaders, setProgress, progressCleared: progressCleared.promise };
 }
 
 const AGENT_START = { type: "agent_start" } as unknown as AgentSessionEvent;
 const AGENT_END = { type: "agent_end", messages: [] } as unknown as AgentSessionEvent;
+const NON_TERMINAL_AGENT_END = { type: "agent_end", messages: [], isTerminal: false } as unknown as AgentSessionEvent;
 const COMPACTION_START = {
 	type: "auto_compaction_start",
 	reason: "overflow",
@@ -113,6 +77,14 @@ const COMPACTION_END = {
 	result: { summary: "s", shortSummary: "s", tokensBefore: 10, details: {}, firstKeptEntryId: undefined },
 	willRetry: true,
 } as unknown as AgentSessionEvent;
+
+/** One macrotask hop: every microtask continuation queued so far has run. */
+async function nextMacrotask(): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	await promise;
+}
+
 const RETRY_START = {
 	type: "auto_retry_start",
 	attempt: 1,
@@ -141,6 +113,7 @@ describe("EventController loader recovery after overflow maintenance", () => {
 	});
 
 	afterEach(() => {
+		setSystemTime();
 		vi.useRealTimers();
 		vi.restoreAllMocks();
 		resetSettingsForTest();
@@ -154,7 +127,7 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		await controller.handleEvent(AGENT_START);
 		const firstWorking = workingLoaders[0];
 		expect(firstWorking).toBeDefined();
-		expect(statusContainer.children).toContain(ctx.loadingAnimation);
+		expect(statusContainer.children).toContain(ctx.loadingAnimation!);
 
 		// Overflow recovery hands the status container to the auto-compaction loader.
 		// The original turn's agent_end is held while the prompt is in flight, so the
@@ -174,7 +147,7 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		// status container so streaming shows "Working…" again (issue: it stayed gone).
 		await controller.handleEvent(AGENT_START);
 		expect(ctx.loadingAnimation).toBeDefined();
-		expect(statusContainer.children).toContain(ctx.loadingAnimation);
+		expect(statusContainer.children).toContain(ctx.loadingAnimation!);
 		expect(workingLoaders).toHaveLength(2);
 	});
 
@@ -184,7 +157,7 @@ describe("EventController loader recovery after overflow maintenance", () => {
 
 		await controller.handleEvent(AGENT_START);
 		const firstWorking = workingLoaders[0];
-		expect(statusContainer.children).toContain(ctx.loadingAnimation);
+		expect(statusContainer.children).toContain(ctx.loadingAnimation!);
 
 		// A transient error: the retry loader takes over the status container.
 		streamState.isStreaming = true;
@@ -195,7 +168,38 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		// The retry attempt re-enters the agent loop, emitting a fresh agent_start.
 		await controller.handleEvent(AGENT_START);
 		expect(ctx.loadingAnimation).toBeDefined();
-		expect(statusContainer.children).toContain(ctx.loadingAnimation);
+		expect(statusContainer.children).toContain(ctx.loadingAnimation!);
+	});
+
+	it("ticks the auto-retry countdown down on spinner ticks instead of freezing", async () => {
+		const { ctx, streamState } = createContext();
+		const controller = new EventController(ctx);
+		const visible = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+		// Spinner ticks land on the shared wall-clock grid (multiples of the 80ms
+		// period); starting on a boundary puts a tick exactly at the 400ms mark.
+		setSystemTime(1_000_000);
+
+		streamState.isStreaming = true;
+		await controller.handleEvent(RETRY_START);
+		expect(ctx.retryLoader).toBeDefined();
+
+		// Initial paint shows the full delay: RETRY_START carries delayMs 1000.
+		const first = visible(ctx.retryLoader!.render(80).join("\n"));
+		expect(first).toContain("Retrying (1/3) in 1.0s");
+
+		// 400ms of spinner ticks re-evaluate the closure: 600ms remain. A
+		// static label (the pre-fix banner) would still read "1.0s" here.
+		vi.advanceTimersByTime(400);
+		const second = visible(ctx.retryLoader!.render(80).join("\n"));
+		expect(second).toContain("in 600ms");
+		expect(second).not.toContain("in 1.0s");
+
+		// Past the deadline the remaining wait clamps at zero.
+		vi.advanceTimersByTime(2_000);
+		const third = visible(ctx.retryLoader!.render(80).join("\n"));
+		expect(third).toContain("in 0ms");
+
+		ctx.retryLoader!.stop();
 	});
 
 	it("re-shows the Working… loader after a subagent task completes while the session keeps streaming", async () => {
@@ -219,7 +223,7 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		await controller.handleEvent(TASK_TOOL_EXECUTION_END);
 
 		expect(ctx.loadingAnimation).toBeDefined();
-		expect(statusContainer.children).toContain(ctx.loadingAnimation);
+		expect(statusContainer.children).toContain(ctx.loadingAnimation!);
 		expect(workingLoaders).toHaveLength(2);
 	});
 
@@ -241,23 +245,102 @@ describe("EventController loader recovery after overflow maintenance", () => {
 		expect(statusContainer.children).toHaveLength(0);
 	});
 
-	it("mirrors agent and auto-compaction activity to OSC 9;4 when enabled", async () => {
+	it("keeps OSC 9;4 progress on through auto-compaction inside a live turn", async () => {
 		const { ctx, setProgress } = createContext({ terminalProgress: true });
 		const controller = new EventController(ctx);
 
 		await controller.handleEvent(AGENT_START);
-		expect(setProgress).toHaveBeenCalledTimes(1);
-		expect(setProgress).toHaveBeenLastCalledWith(true);
-
 		await controller.handleEvent(COMPACTION_START);
-		expect(setProgress).toHaveBeenCalledTimes(1);
-
 		await controller.handleEvent(COMPACTION_END);
-		expect(setProgress).toHaveBeenCalledTimes(2);
-		expect(setProgress).toHaveBeenLastCalledWith(false);
+		// Clearing here would tell Tern the agent finished while it keeps working.
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true]);
 
+		// The overflow retry's own agent_start/agent_end bracket ends the busy state once.
 		await controller.handleEvent(AGENT_START);
 		await controller.handleEvent(AGENT_END);
-		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false, true, false]);
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false]);
+	});
+
+	it("brackets OSC 9;4 progress around auto-compaction outside a turn", async () => {
+		const { ctx, setProgress } = createContext({ terminalProgress: true });
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(COMPACTION_START);
+		await controller.handleEvent(COMPACTION_END);
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false]);
+	});
+
+	it("leaves OSC 9;4 progress to a turn that starts during auto-compaction", async () => {
+		const { ctx, setProgress } = createContext({ terminalProgress: true });
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(COMPACTION_START);
+		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(COMPACTION_END);
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true]);
+
+		await controller.handleEvent(AGENT_END);
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false]);
+	});
+
+	it("ends OSC 9;4 progress when an abort cancels the overflow retry before it starts", async () => {
+		const { ctx, streamState, setProgress, progressCleared } = createContext({ terminalProgress: true });
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(AGENT_START);
+		await controller.handleEvent(COMPACTION_START);
+		await controller.handleEvent(COMPACTION_END);
+		// Recovery scheduled the retry, so the overflowed turn settles non-terminally.
+		const retry = Promise.withResolvers<void>();
+		streamState.continuation = retry;
+		await controller.handleEvent(NON_TERMINAL_AGENT_END);
+		await nextMacrotask();
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true]);
+
+		// Esc cancels the scheduled retry: no agent_start or terminal agent_end follows.
+		streamState.continuation = undefined;
+		retry.resolve();
+		await progressCleared;
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false]);
+	});
+
+	it("leaves OSC 9;4 progress to a scheduled continuation that does start", async () => {
+		const { ctx, streamState, setProgress } = createContext({ terminalProgress: true });
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent(AGENT_START);
+		const retry = Promise.withResolvers<void>();
+		streamState.continuation = retry;
+		await controller.handleEvent(NON_TERMINAL_AGENT_END);
+
+		// The retry runs: its agent_start supersedes the settle watch.
+		await controller.handleEvent(AGENT_START);
+		streamState.continuation = undefined;
+		retry.resolve();
+		await nextMacrotask();
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true]);
+
+		await controller.handleEvent(AGENT_END);
+		expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false]);
+	});
+
+	it("reports OSC 9;4 activity to Tern even when the setting is off", async () => {
+		const program = Bun.env.TERM_PROGRAM;
+		try {
+			Bun.env.TERM_PROGRAM = "vscode";
+			const outside = createContext();
+			await new EventController(outside.ctx).handleEvent(AGENT_START);
+			expect(outside.setProgress).not.toHaveBeenCalled();
+
+			Bun.env.TERM_PROGRAM = "tern";
+			const { ctx, setProgress } = createContext();
+			const controller = new EventController(ctx);
+			await controller.handleEvent(AGENT_START);
+			await controller.handleEvent(AGENT_END);
+			expect(setProgress.mock.calls.map(call => call[0])).toEqual([true, false]);
+		} finally {
+			if (program === undefined) delete Bun.env.TERM_PROGRAM;
+			else Bun.env.TERM_PROGRAM = program;
+		}
 	});
 });

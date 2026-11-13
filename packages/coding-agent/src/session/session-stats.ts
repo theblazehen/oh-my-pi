@@ -1,32 +1,51 @@
 import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
 import {
 	calculatePromptTokens,
-	estimateTokens,
-	hasContextTokenUsage,
+	findTranscriptUsageAnchor,
+	isTranscriptUsageAnchor,
 	type SessionMessageEntry,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Model, ProviderResponseMetadata, Usage } from "@oh-my-pi/pi-ai";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import { type } from "@oh-my-pi/omptype";
 import type { ModelRegistry } from "../config/model-registry";
+import type { Settings } from "../config/settings";
+
 import type { ContextUsage } from "../extensibility/extensions/types";
 import {
 	computeNonMessageBreakdown,
 	computeNonMessageTokens,
+	estimateContextToolSchemaTokens,
 	type NonMessageTokenSource,
-} from "../modes/utils/context-usage";
+} from "@oh-my-pi/pi-tui/status-line/context-usage";
 import type { ContextUsageBreakdown, SessionStats } from "./agent-session-types";
 import { getLatestCompactionEntry } from "./session-context";
+import type { SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
+import { cfgSkillful } from "./settings";
+
+/** Non-message accounting recorded with a provider prompt. */
+interface NonMessageSnapshot {
+	nonMessageTokens: number;
+	/** Schema tokens inside `nonMessageTokens`; absent on snapshots that predate the field. */
+	toolSchemaTokens?: number;
+}
 
 interface PendingContextSnapshot {
 	promptTokens: number;
 	nonMessageTokens: number;
+	toolSchemaTokens: number;
 	cutoffCount: number;
+	/**
+	 * Compaction epoch at rebase time. Distinguishes a genuinely fresh in-turn
+	 * anchor (same epoch) from a post-cutoff anchor that predates a mid-run
+	 * compaction (older epoch) so the latter never out-ranks this snapshot.
+	 */
+	epoch: number;
 }
 
 /** Capabilities the stats tracker borrows from its owning session. */
 export interface SessionStatsTrackerHost {
-	session: NonMessageTokenSource;
+	session: NonMessageTokenSource & { readonly settings?: Settings };
 	agent: Agent;
 	sessionManager: SessionManager;
 	modelRegistry: ModelRegistry;
@@ -34,22 +53,137 @@ export interface SessionStatsTrackerHost {
 	sessionId(): string;
 }
 
+function correctedPromptTokens(assistant: AssistantMessage): number {
+	const providerPromptTokens = assistant.contextSnapshot?.promptTokens ?? calculatePromptTokens(assistant.usage);
+	return Math.max(0, providerPromptTokens - (assistant.contextSnapshot?.historyRewriteTokensRemoved ?? 0));
+}
+
+function isUsageWindowBoundary(entry: SessionEntry): boolean {
+	return (
+		entry.type === "message" ||
+		entry.type === "custom_message" ||
+		entry.type === "branch_summary" ||
+		entry.type === "compaction" ||
+		entry.type === "reset_boundary"
+	);
+}
+
+/** Model calls belonging to the same active transcript window as `agent.state.messages`. */
+function forEachActiveModelUsage(branch: readonly SessionEntry[], visit: (usage: Usage) => void): void {
+	const latestCompaction = getLatestCompactionEntry(branch);
+	const compactionIndex = latestCompaction ? branch.lastIndexOf(latestCompaction) : -1;
+	let resetIndex = -1;
+	for (let index = branch.length - 1; index > compactionIndex; index--) {
+		if (branch[index].type === "reset_boundary") {
+			resetIndex = index;
+			break;
+		}
+	}
+	let startIndex = 0;
+	if (resetIndex > compactionIndex) {
+		startIndex = resetIndex + 1;
+	} else if (latestCompaction) {
+		const firstKeptIndex = branch.findIndex(entry => entry.id === latestCompaction.firstKeptEntryId);
+		startIndex = firstKeptIndex >= 0 ? firstKeptIndex : compactionIndex + 1;
+		while (startIndex > 0 && !isUsageWindowBoundary(branch[startIndex - 1])) startIndex--;
+	}
+	for (let index = startIndex; index < branch.length; index++) {
+		const entry = branch[index];
+		if (entry.type === "model_usage") visit(entry.usage);
+	}
+}
+
 /** Computes session totals and tracks the in-flight context estimate. */
 export class SessionStatsTracker {
 	readonly #host: SessionStatsTrackerHost;
 	#pendingContextSnapshot: PendingContextSnapshot | undefined;
 	#contextUsageRevision = 0;
+	#compactionEpoch = 0;
 
 	constructor(host: SessionStatsTrackerHost) {
 		this.#host = host;
 	}
 
+	get #tokenizer() {
+		return this.#host.agent.tokenizer;
+	}
+
+	/** Tool-schema tokens the active model carries in its prompt. */
+	#currentToolSchemaTokens(): number {
+		const session = this.#host.session;
+		return estimateContextToolSchemaTokens(session.agent?.state?.tools ?? [], this.#tokenizer, session.model, {
+			sourceRevision: session.settings?.revision,
+			pruneDescriptions: session.agent?.prunesToolDescriptions?.(session.model),
+		});
+	}
+
+	/**
+	 * Anchored used-token arithmetic shared by every anchored branch: provider
+	 * base + non-message change since the anchor + local tail + pending.
+	 *
+	 * Non-schema overhead only ever adds growth. Schema tokens move both ways:
+	 * the provider base already contains every schema it was sent, so a roster
+	 * shrink or a switch to a model that defers schemas must leave the base.
+	 */
+	#anchoredUsedTokens(
+		base: number,
+		anchor: NonMessageSnapshot,
+		current: Required<NonMessageSnapshot>,
+		tailFromIndex: number,
+		activeMessages: readonly AgentMessage[],
+		pendingTokens: number,
+	): number {
+		const nonMessageDelta =
+			anchor.toolSchemaTokens === undefined
+				? Math.max(0, current.nonMessageTokens - anchor.nonMessageTokens)
+				: Math.max(
+						0,
+						current.nonMessageTokens -
+							current.toolSchemaTokens -
+							(anchor.nonMessageTokens - anchor.toolSchemaTokens),
+					) +
+					current.toolSchemaTokens -
+					anchor.toolSchemaTokens;
+		return (
+			Math.max(0, base + nonMessageDelta) +
+			this.#tokenizer.countMessages(activeMessages.slice(tailFromIndex)) +
+			pendingTokens
+		);
+	}
+
+	/**
+	 * Token totals of {@link getSessionStats} without the message counts or the
+	 * context breakdown — for per-turn accounting (goal budgets) that only
+	 * needs the counters.
+	 */
+	getTokenTotals(): SessionStats["tokens"] {
+		const tokens = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+		const addUsage = (usage: Usage): void => {
+			tokens.input += usage.input;
+			tokens.output += usage.output;
+			tokens.reasoning += usage.reasoningTokens ?? 0;
+			tokens.cacheRead += usage.cacheRead;
+			tokens.cacheWrite += usage.cacheWrite;
+			tokens.total += usage.totalTokens;
+		};
+		for (const message of this.#host.agent.state.messages) {
+			if (message.role === "assistant") {
+				if (message.usage) addUsage(message.usage);
+			} else if (message.role === "toolResult" && message.toolName === "task") {
+				const usage = taskToolUsage(message.details);
+				if (usage) addUsage(usage);
+			}
+		}
+		forEachActiveModelUsage(this.#host.sessionManager.getBranchView(), addUsage);
+		return tokens;
+	}
+
 	/** Returns aggregate message, token, and cost statistics for the session. */
 	getSessionStats(): SessionStats {
 		const state = this.#host.agent.state;
-		const userMessages = state.messages.filter(message => message.role === "user").length;
-		const assistantMessages = state.messages.filter(message => message.role === "assistant").length;
-		const toolResults = state.messages.filter(message => message.role === "toolResult").length;
+		let userMessages = 0;
+		let assistantMessages = 0;
+		let toolResults = 0;
 		let toolCalls = 0;
 		let totalInput = 0;
 		let totalOutput = 0;
@@ -59,32 +193,59 @@ export class SessionStatsTracker {
 		let totalTokens = 0;
 		let totalCost = 0;
 		let totalPremiumRequests = 0;
-		for (const message of state.messages) {
-			if (message.role === "assistant") {
-				const assistant = message;
-				toolCalls += assistant.content.filter(content => content.type === "toolCall").length;
-				totalInput += assistant.usage.input;
-				totalOutput += assistant.usage.output;
-				totalReasoning += assistant.usage.reasoningTokens ?? 0;
-				totalCacheRead += assistant.usage.cacheRead;
-				totalCacheWrite += assistant.usage.cacheWrite;
-				totalTokens += assistant.usage.totalTokens;
-				totalPremiumRequests += assistant.usage.premiumRequests ?? 0;
-				totalCost += assistant.usage.cost.total;
+		let creditCost = 0;
+		let committedCreditCost = 0;
+		let committedAcuCost = 0;
+		let hasCredits = false;
+		const routedModels: Record<string, number> = {};
+		const editRejections: Record<string, number> = {};
+		const addUsage = (usage: Usage): void => {
+			totalInput += usage.input;
+			totalOutput += usage.output;
+			totalReasoning += usage.reasoningTokens ?? 0;
+			totalCacheRead += usage.cacheRead;
+			totalCacheWrite += usage.cacheWrite;
+			totalTokens += usage.totalTokens;
+			totalPremiumRequests += usage.premiumRequests ?? 0;
+			totalCost += usage.cost.total;
+			const credits = usage.credits;
+			if (credits !== undefined) {
+				hasCredits = true;
+				creditCost += credits.cost ?? 0;
+				committedCreditCost += credits.committedCost ?? 0;
+				committedAcuCost += credits.acuCost ?? 0;
 			}
-			if (message.role === "toolResult" && message.toolName === "task") {
-				const usage = taskToolUsage(message.details);
+		};
+		for (const message of state.messages) {
+			if (message.role === "user") {
+				userMessages++;
+			} else if (message.role === "toolResult") {
+				toolResults++;
+				if (message.toolName === "task") {
+					const usage = taskToolUsage(message.details);
+					if (usage) addUsage(usage);
+				} else if (message.toolName === "edit" && message.isError) {
+					const { details } = message;
+					if (details && typeof details === "object" && "errorKind" in details) {
+						const kind = details.errorKind;
+						if (typeof kind === "string") editRejections[kind] = (editRejections[kind] ?? 0) + 1;
+					}
+				}
+			} else if (message.role === "assistant") {
+				assistantMessages++;
+				for (const content of message.content) {
+					if (content.type === "toolCall") toolCalls++;
+				}
+				// Persisted and imported transcripts can predate usage metadata despite the current message type.
+				const usage = message.usage;
 				if (!usage) continue;
-				totalInput += usage.input;
-				totalOutput += usage.output;
-				totalReasoning += usage.reasoningTokens ?? 0;
-				totalCacheRead += usage.cacheRead;
-				totalCacheWrite += usage.cacheWrite;
-				totalTokens += usage.totalTokens;
-				totalPremiumRequests += usage.premiumRequests ?? 0;
-				totalCost += usage.cost.total;
+				addUsage(usage);
+				if (message.upstreamModel !== undefined) {
+					routedModels[message.upstreamModel] = (routedModels[message.upstreamModel] ?? 0) + 1;
+				}
 			}
 		}
+		forEachActiveModelUsage(this.#host.sessionManager.getBranchView(), addUsage);
 		return {
 			sessionFile: this.#host.sessionManager.getSessionFile(),
 			sessionId: this.#host.sessionId(),
@@ -103,6 +264,17 @@ export class SessionStatsTracker {
 			},
 			cost: totalCost,
 			premiumRequests: totalPremiumRequests,
+			...(hasCredits
+				? {
+						credits: {
+							cost: creditCost,
+							committedCost: committedCreditCost,
+							acuCost: committedAcuCost,
+						},
+					}
+				: undefined),
+			...(Object.keys(routedModels).length > 0 ? { routedModels } : undefined),
+			...(Object.keys(editRejections).length > 0 ? { editRejections } : undefined),
 			contextUsage: this.getContextUsage(),
 		};
 	}
@@ -114,33 +286,33 @@ export class SessionStatsTracker {
 	}): ContextUsageBreakdown | undefined {
 		const rawContextWindow = options?.contextWindow ?? this.#host.model()?.contextWindow ?? 0;
 		const contextWindow = Number.isFinite(rawContextWindow) && rawContextWindow > 0 ? rawContextWindow : 0;
+		const settings = this.#host.session.settings;
 		const { skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens } = computeNonMessageBreakdown(
 			this.#host.session,
+			this.#tokenizer,
+			settings?.revision,
+			settings ? cfgSkillful.get(settings) : undefined,
 		);
 		const categoryNonMessageTokens = skillsTokens + toolsTokens + systemContextTokens + systemPromptTokens;
-		const currentNonMessageTokens = computeNonMessageTokens(this.#host.session);
-		const branchEntries = this.#host.sessionManager.getBranch();
+		const current = {
+			nonMessageTokens: computeNonMessageTokens(this.#host.session, this.#tokenizer, settings?.revision),
+			toolSchemaTokens: toolsTokens,
+		};
+		const branchEntries = this.#host.sessionManager.getBranchView();
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
 		const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
 		let usedTokens = 0;
 		let anchored = false;
 		const pendingMessages = options?.pendingMessages ?? [];
+		const pendingTokens = this.#tokenizer.countMessages(pendingMessages);
 		const pending = this.#pendingContextSnapshot;
 
 		let anchorEntry: SessionMessageEntry | undefined;
 		for (let index = branchEntries.length - 1; index > compactionIndex; index--) {
 			const entry = branchEntries[index];
-			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-			const assistant = entry.message;
-			if (
-				assistant.stopReason !== "aborted" &&
-				assistant.stopReason !== "error" &&
-				assistant.usage &&
-				hasContextTokenUsage(assistant.usage)
-			) {
-				anchorEntry = entry;
-				break;
-			}
+			if (entry.type !== "message" || !isTranscriptUsageAnchor(entry.message)) continue;
+			anchorEntry = entry;
+			break;
 		}
 
 		const activeMessages = this.#host.agent.state.messages;
@@ -157,71 +329,49 @@ export class SessionStatsTracker {
 			}
 		}
 
+		const anchorEpoch = anchorAssistant?.contextSnapshot?.compactionEpoch ?? 0;
 		const useAnchor =
-			anchorAssistant !== undefined && anchorIndex !== -1 && (!pending || anchorIndex >= pending.cutoffCount);
+			anchorAssistant !== undefined &&
+			anchorIndex !== -1 &&
+			(!pending || (anchorIndex >= pending.cutoffCount && anchorEpoch >= pending.epoch));
 		if (useAnchor && anchorAssistant) {
-			const promptTokens =
-				anchorAssistant.contextSnapshot?.promptTokens ?? calculatePromptTokens(anchorAssistant.usage);
-			const nonMessageTokens =
-				anchorAssistant.contextSnapshot?.nonMessageTokens ?? computeNonMessageTokens(this.#host.session);
 			anchored = true;
-			let tailTokens = 0;
-			for (let index = anchorIndex + 1; index < activeMessages.length; index++) {
-				tailTokens += estimateTokens(activeMessages[index]);
-			}
-			usedTokens =
-				promptTokens +
-				Math.max(0, currentNonMessageTokens - nonMessageTokens) +
-				tailTokens +
-				pendingMessages.reduce((sum, message) => sum + estimateTokens(message), 0);
+			usedTokens = this.#anchoredUsedTokens(
+				correctedPromptTokens(anchorAssistant),
+				anchorAssistant.contextSnapshot ?? current,
+				current,
+				anchorIndex + 1,
+				activeMessages,
+				pendingTokens,
+			);
 		} else if (pending) {
 			anchored = true;
-			let tailTokens = 0;
-			for (let index = pending.cutoffCount; index < activeMessages.length; index++) {
-				tailTokens += estimateTokens(activeMessages[index]);
-			}
-			usedTokens =
-				pending.promptTokens +
-				Math.max(0, currentNonMessageTokens - pending.nonMessageTokens) +
-				tailTokens +
-				pendingMessages.reduce((sum, message) => sum + estimateTokens(message), 0);
+			usedTokens = this.#anchoredUsedTokens(
+				pending.promptTokens,
+				pending,
+				current,
+				pending.cutoffCount,
+				activeMessages,
+				pendingTokens,
+			);
 		}
 
 		if (!anchored && !pending && branchEntries.length === 0) {
-			for (let index = activeMessages.length - 1; index >= 0; index--) {
-				const message = activeMessages[index];
-				if (
-					message.role !== "assistant" ||
-					message.stopReason === "aborted" ||
-					message.stopReason === "error" ||
-					!message.usage ||
-					!hasContextTokenUsage(message.usage)
-				) {
-					continue;
-				}
-				const promptTokens = message.contextSnapshot?.promptTokens ?? calculatePromptTokens(message.usage);
-				const nonMessageTokens =
-					message.contextSnapshot?.nonMessageTokens ?? computeNonMessageTokens(this.#host.session);
-				let tailTokens = 0;
-				for (let tailIndex = index + 1; tailIndex < activeMessages.length; tailIndex++) {
-					tailTokens += estimateTokens(activeMessages[tailIndex]);
-				}
-				usedTokens =
-					promptTokens +
-					Math.max(0, currentNonMessageTokens - nonMessageTokens) +
-					tailTokens +
-					pendingMessages.reduce((sum, pendingMessage) => sum + estimateTokens(pendingMessage), 0);
+			const liveAnchor = findTranscriptUsageAnchor(activeMessages);
+			if (liveAnchor) {
+				usedTokens = this.#anchoredUsedTokens(
+					correctedPromptTokens(liveAnchor.message),
+					liveAnchor.message.contextSnapshot ?? current,
+					current,
+					liveAnchor.index + 1,
+					activeMessages,
+					pendingTokens,
+				);
 				anchored = true;
-				break;
 			}
 		}
 		if (!anchored) {
-			let messagesTokens = 0;
-			for (const message of activeMessages) messagesTokens += estimateTokens(message);
-			usedTokens =
-				currentNonMessageTokens +
-				messagesTokens +
-				pendingMessages.reduce((sum, message) => sum + estimateTokens(message), 0);
+			usedTokens = current.nonMessageTokens + this.#tokenizer.countMessages(activeMessages) + pendingTokens;
 		}
 		return {
 			contextWindow,
@@ -251,24 +401,90 @@ export class SessionStatsTracker {
 		return this.#contextUsageRevision;
 	}
 
-	/** Non-message token count captured for the active provider request. */
-	get pendingNonMessageTokens(): number | undefined {
-		return this.#pendingContextSnapshot?.nonMessageTokens;
+	/**
+	 * Monotonic compaction epoch, bumped whenever history is compacted. Stamped
+	 * onto each assistant snapshot at record time so {@link getContextBreakdown}
+	 * can reject a post-cutoff anchor whose usage predates the last compaction.
+	 */
+	get compactionEpoch(): number {
+		return this.#compactionEpoch;
+	}
+
+	/**
+	 * Non-message accounting for a provider response: the values captured for
+	 * the in-flight request, or the current values when none is pending.
+	 */
+	nonMessageSnapshot(): Required<NonMessageSnapshot> {
+		const pending = this.#pendingContextSnapshot;
+		if (pending) return { nonMessageTokens: pending.nonMessageTokens, toolSchemaTokens: pending.toolSchemaTokens };
+		return this.#currentNonMessageSnapshot();
+	}
+
+	#currentNonMessageSnapshot(): Required<NonMessageSnapshot> {
+		return {
+			nonMessageTokens: computeNonMessageTokens(
+				this.#host.session,
+				this.#tokenizer,
+				this.#host.session.settings?.revision,
+			),
+			toolSchemaTokens: this.#currentToolSchemaTokens(),
+		};
+	}
+
+	/**
+	 * Apply an estimated prompt-prefix reduction to the current provider anchor.
+	 *
+	 * History after the anchor is estimated live by {@link getContextBreakdown};
+	 * callers must pass only savings from entries already included in the
+	 * anchor's provider-reported prompt. Persisting the correction on the
+	 * assistant snapshot keeps reloads accurate, and the next successful
+	 * assistant response naturally replaces it with a fresh provider anchor.
+	 */
+	recordAnchoredHistoryRewrite(tokensRemoved: number): void {
+		if (!Number.isFinite(tokensRemoved) || tokensRemoved <= 0) return;
+
+		const branchEntries = this.#host.sessionManager.getBranchView();
+		const latestCompaction = getLatestCompactionEntry(branchEntries);
+		const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
+		for (let index = branchEntries.length - 1; index > compactionIndex; index--) {
+			const entry = branchEntries[index];
+			if (entry.type !== "message" || !isTranscriptUsageAnchor(entry.message)) continue;
+			const assistant = entry.message;
+
+			if (!assistant.contextSnapshot) {
+				assistant.contextSnapshot = {
+					promptTokens: calculatePromptTokens(assistant.usage),
+					...this.#currentNonMessageSnapshot(),
+					compactionEpoch: this.#compactionEpoch,
+				};
+			}
+			const snapshot = assistant.contextSnapshot;
+			snapshot.historyRewriteTokensRemoved = (snapshot.historyRewriteTokensRemoved ?? 0) + Math.floor(tokensRemoved);
+			this.#contextUsageRevision++;
+			return;
+		}
 	}
 
 	/** Sets or clears the in-flight context snapshot. */
-	setPendingSnapshot(snapshot: PendingContextSnapshot | undefined): void {
-		this.#pendingContextSnapshot = snapshot;
+	setPendingSnapshot(snapshot: Omit<PendingContextSnapshot, "epoch" | "toolSchemaTokens"> | undefined): void {
+		this.#pendingContextSnapshot = snapshot
+			? { ...snapshot, toolSchemaTokens: this.#currentToolSchemaTokens(), epoch: this.#compactionEpoch }
+			: undefined;
 		this.#contextUsageRevision++;
 	}
 
 	/** Recomputes an in-flight snapshot after history is compacted or rewritten. */
 	rebaseAfterCompaction(): void {
+		this.#compactionEpoch++;
 		if (!this.#pendingContextSnapshot) return;
-		const nonMessageTokens = computeNonMessageTokens(this.#host.session);
+		const nonMessageTokens = computeNonMessageTokens(
+			this.#host.session,
+			this.#tokenizer,
+			this.#host.session.settings?.revision,
+		);
 		const messages = this.#host.agent.state.messages;
 		this.setPendingSnapshot({
-			promptTokens: nonMessageTokens + messages.reduce((sum, message) => sum + estimateTokens(message), 0),
+			promptTokens: nonMessageTokens + this.#tokenizer.countMessages(messages),
 			nonMessageTokens,
 			cutoffCount: messages.length,
 		});
@@ -278,9 +494,10 @@ export class SessionStatsTracker {
 	ingestProviderUsageHeaders(response: ProviderResponseMetadata, model?: Model): void {
 		const provider = model?.provider;
 		if (!provider) return;
-		this.#host.modelRegistry.authStorage.ingestUsageHeaders(provider, response.headers, {
+		this.#host.modelRegistry.authStorage.usage.ingestHeaders(provider, response.headers, {
 			sessionId: this.#host.agent.sessionId,
 			baseUrl: this.#host.modelRegistry.getProviderBaseUrl?.(provider),
+			responseStatus: response.status,
 		});
 	}
 }
@@ -291,14 +508,15 @@ function taskToolUsage(details: unknown): Usage | undefined {
 	return isUsage(usage) ? usage : undefined;
 }
 
+const UsageShape = type({
+	input: "number",
+	output: "number",
+	cacheRead: "number",
+	cacheWrite: "number",
+	totalTokens: "number",
+	cost: { total: "number" },
+});
+
 function isUsage(value: unknown): value is Usage {
-	if (!isRecord(value) || !isRecord(value.cost)) return false;
-	return (
-		typeof value.input === "number" &&
-		typeof value.output === "number" &&
-		typeof value.cacheRead === "number" &&
-		typeof value.cacheWrite === "number" &&
-		typeof value.totalTokens === "number" &&
-		typeof value.cost.total === "number"
-	);
+	return UsageShape.allows(value);
 }

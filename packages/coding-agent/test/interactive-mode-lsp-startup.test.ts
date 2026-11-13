@@ -1,11 +1,12 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "@oh-my-pi/pi-coding-agent/lsp/startup-events";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
-import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -13,7 +14,9 @@ import type { LspStartupServerInfo } from "@oh-my-pi/pi-coding-agent/tools";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
-describe("InteractiveMode LSP startup welcome banner", () => {
+import { cfgStartupQuiet } from "@oh-my-pi/pi-coding-agent/modes/settings";
+
+describe("InteractiveMode LSP startup events", () => {
 	let authStorage: AuthStorage;
 	let eventBus: EventBus;
 	let lspServers: LspStartupServerInfo[];
@@ -68,7 +71,7 @@ describe("InteractiveMode LSP startup welcome banner", () => {
 				fileTypes: [".rs"],
 			},
 		];
-		mode = new InteractiveMode(session, "test", undefined, () => {}, lspServers, undefined, eventBus);
+		mode = new InteractiveMode(session, "test", () => {}, lspServers, undefined, eventBus);
 		// This test exercises the LSP startup banner, not git branch watching.
 		// Starting a real fs.watch on the repo HEAD in a parallel Bun worker is
 		// enough to trigger a Bun SIGTRAP in unrelated workers during the
@@ -85,19 +88,10 @@ describe("InteractiveMode LSP startup welcome banner", () => {
 		resetSettingsForTest();
 	});
 
-	it("updates the welcome banner when startup warmup completes", async () => {
+	it("stays silent on successful startup and suppresses startup warnings when quiet", async () => {
 		await mode.init();
 
-		const findServerLine = () =>
-			Bun.stripANSI(mode.ui.render(120).join("\n"))
-				.split("\n")
-				.find(line => line.includes("rust-analyzer")) ?? "";
-
-		expect(findServerLine()).toContain(theme.status.pending);
-
-		const requestRenderSpy = vi.spyOn(mode.ui, "requestRender");
 		const showStatusSpy = vi.spyOn(mode, "showStatus");
-		requestRenderSpy.mockClear();
 		showStatusSpy.mockClear();
 
 		lspServers[0].status = "ready";
@@ -114,21 +108,34 @@ describe("InteractiveMode LSP startup welcome banner", () => {
 
 		eventBus.emit(LSP_STARTUP_EVENT_CHANNEL, event);
 
-		expect(requestRenderSpy).toHaveBeenCalled();
 		expect(showStatusSpy).not.toHaveBeenCalled();
-		expect(findServerLine()).toContain(theme.status.enabled);
-		expect(findServerLine()).not.toContain(theme.status.pending);
-	});
 
-	it("does not render LSP startup warnings when startup.quiet is enabled", () => {
-		session.settings.set("startup.quiet", true);
+		cfgStartupQuiet.set(session.settings, true);
 		const showWarningSpy = vi.spyOn(mode, "showWarning").mockImplementation(() => {});
-
 		eventBus.emit(LSP_STARTUP_EVENT_CHANNEL, {
 			type: "failed",
 			error: "rust-analyzer timed out",
 		} satisfies LspStartupEvent);
-
 		expect(showWarningSpy).not.toHaveBeenCalled();
+	});
+
+	it("surfaces a sanitized warning when session persistence fails", async () => {
+		await mode.init();
+		await session.sessionManager.ensureOnDisk();
+		const showWarning = vi.spyOn(mode, "showWarning").mockImplementation(() => {});
+		const writeFailure = vi.spyOn(fs, "writeSync").mockImplementation(() => {
+			throw Object.assign(new Error("ENOSPC:\tdisk full\n\u001b[31mretry later\u001b[0m"), { code: "ENOSPC" });
+		});
+		session.sessionManager.appendCustomEntry("persistence-failure-probe", {});
+
+		expect(showWarning).toHaveBeenCalledTimes(1);
+		const warning = showWarning.mock.calls[0]?.[0] ?? "";
+		expect(warning).toContain("Session persistence failed: ENOSPC:");
+		expect(warning).toContain("Unsaved entries remain in memory");
+		expect(warning).not.toContain("\t");
+		expect(warning).not.toContain("\n");
+		expect(warning).not.toContain("\u001b");
+		writeFailure.mockRestore();
+		session.sessionManager.appendCustomEntry("persistence-recovery-probe", {});
 	});
 });

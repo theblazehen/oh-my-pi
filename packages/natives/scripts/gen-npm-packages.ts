@@ -17,6 +17,7 @@ export interface BuildLeafManifestInput extends LeafTarget {
 export interface LeafManifest {
 	name: string;
 	version: string;
+	author: string;
 	os: string[];
 	cpu: string[];
 	main: string;
@@ -53,9 +54,11 @@ export const LEAF_TARGETS: readonly LeafTarget[] = [
 	{ tag: "darwin-x64", os: "darwin", cpu: "x64" },
 	{ tag: "darwin-arm64", os: "darwin", cpu: "arm64" },
 	{ tag: "win32-x64", os: "win32", cpu: "x64" },
+	{ tag: "win32-arm64", os: "win32", cpu: "arm64" },
 ];
 
 const packageDirDefault = path.join(import.meta.dir, "..");
+const NATIVE_LEAF_LEGAL_FILES = ["LICENSE", "THIRD-PARTY-NOTICES.txt"] as const;
 
 function expectedAddonFilenames(tag: string): string[] {
 	return tag.endsWith("-x64")
@@ -89,10 +92,11 @@ export function buildLeafManifest({ tag, os, cpu, files, version }: BuildLeafMan
 	return {
 		name: `@oh-my-pi/pi-natives-${tag}`,
 		version,
+		author: "Stencil Labs, Inc.",
 		os: [os],
 		cpu: [cpu],
 		main: `./${main}`,
-		files: ["*.node", "README.md"],
+		files: ["*.node", "README.md", ...NATIVE_LEAF_LEGAL_FILES],
 		license: "MIT",
 		repository: {
 			type: "git",
@@ -100,7 +104,7 @@ export function buildLeafManifest({ tag, os, cpu, files, version }: BuildLeafMan
 			directory: "packages/natives",
 		},
 		engines: {
-			bun: ">=1.3.14",
+			bun: ">=1.4.4",
 		},
 	};
 }
@@ -153,6 +157,13 @@ export async function generateNpmPackages({
 		await fs.mkdir(leafDir, { recursive: true });
 		for (const file of files) {
 			await fs.copyFile(path.join(nativeDir, file), path.join(leafDir, file));
+		}
+		for (const file of NATIVE_LEAF_LEGAL_FILES) {
+			const source = path.join(packageDir, file);
+			if (!(await Bun.file(source).exists())) {
+				throw new Error(`Missing legal payload ${file} for generated native leaf ${target.tag}`);
+			}
+			await fs.copyFile(source, path.join(leafDir, file));
 		}
 		await Bun.write(path.join(leafDir, "package.json"), `${JSON.stringify(manifest, null, "\t")}\n`);
 		await Bun.write(path.join(leafDir, "README.md"), buildReadme(target.tag, manifest));

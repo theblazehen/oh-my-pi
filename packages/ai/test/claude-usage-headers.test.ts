@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { claudeCodeVersion } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
+import { getClaudeCodeVersion } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
 import type { UsageFetchContext, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai/usage";
 import { claudeRankingStrategy, claudeUsageProvider } from "@oh-my-pi/pi-ai/usage/claude";
 
@@ -96,7 +96,7 @@ describe("claude usage request headers", () => {
 			fetch: fetchMock,
 		};
 
-		const report = await claudeUsageProvider.fetchUsage(
+		await claudeUsageProvider.fetchUsage(
 			{
 				provider: "anthropic",
 				credential: {
@@ -110,16 +110,17 @@ describe("claude usage request headers", () => {
 			ctx,
 		);
 
-		expect(report).not.toBeNull();
-		expect(calls).toHaveLength(1);
-		expect(calls[0]?.input).toBe("https://api.anthropic.com/api/oauth/usage");
+		const usageCalls = calls.filter(call => new URL(call.input).search === "");
+		expect(usageCalls).toHaveLength(1);
+		expect(usageCalls[0]?.input).toBe("https://api.anthropic.com/api/oauth/usage");
 
-		const headers = calls[0]?.init?.headers;
+		const headers = usageCalls[0]?.init?.headers;
 		expect(getHeaderCaseInsensitive(headers, "authorization")).toBe(`Bearer ${token}`);
-		expect(getHeaderCaseInsensitive(headers, "user-agent")).toBe(`claude-cli/${claudeCodeVersion} (external, cli)`);
+		expect(getHeaderCaseInsensitive(headers, "user-agent")).toBe(
+			`claude-cli/${getClaudeCodeVersion()} (external, cli)`,
+		);
 
 		const beta = getHeaderCaseInsensitive(headers, "anthropic-beta");
-		expect(beta).toBeDefined();
 		const betaTokens = beta?.split(",").map(tokenValue => tokenValue.trim()) ?? [];
 		expect(betaTokens).toContain("claude-code-20250219");
 		expect(betaTokens).toContain("oauth-2025-04-20");
@@ -127,7 +128,6 @@ describe("claude usage request headers", () => {
 		expect(betaTokens).toContain("redact-thinking-2026-02-12");
 		expect(betaTokens).toContain("context-management-2025-06-27");
 		expect(betaTokens).toContain("prompt-caching-scope-2026-01-05");
-		expect(betaTokens).toContain("mid-conversation-system-2026-04-07");
 		expect(betaTokens).toContain("advanced-tool-use-2025-11-20");
 		expect(betaTokens).toContain("effort-2025-11-24");
 		expect(betaTokens).toContain("extended-cache-ttl-2025-04-11");
@@ -344,7 +344,6 @@ describe("claude usage request headers", () => {
 		// instead of burning retries. The trailing /profile call is the expected
 		// identity backfill for a payload/credential carrying no account identity.
 		expect(calls.filter(url => url.endsWith("/usage"))).toEqual(["https://api.anthropic.com/api/oauth/usage"]);
-		expect(report).not.toBeNull();
 		expect(report?.limits.map(limit => limit.id)).toEqual(["anthropic:5h", "anthropic:7d"]);
 		const session = report?.limits.find(limit => limit.id === "anthropic:5h");
 		const weekly = report?.limits.find(limit => limit.id === "anthropic:7d");
@@ -387,6 +386,8 @@ describe("claude usage request headers", () => {
 		expect(calls.filter(url => url.endsWith("/usage"))).toEqual(["https://api.anthropic.com/api/oauth/usage"]);
 		expect(report?.limits.map(limit => limit.id)).toEqual(["anthropic:extra"]);
 		expect(report?.limits[0]?.amount).toEqual({ used: 12.34, unit: "usd" });
+		// No limit → no used fraction → no status (not "unknown").
+		expect(report?.limits[0]?.status).toBeUndefined();
 	});
 
 	it("accepts a legacy-only extra payload on the first usage fetch", async () => {
@@ -921,7 +922,6 @@ describe("claude ranking strategy", () => {
 			limits,
 		};
 
-		expect(claudeRankingStrategy.scopeLimits).toBeDefined();
 		const scopeLimits = claudeRankingStrategy.scopeLimits;
 		if (!scopeLimits) throw new Error("expected claude scopeLimits");
 		expect(scopeLimits(report).map(limit => limit.id)).toEqual(["anthropic:5h", "anthropic:7d"]);

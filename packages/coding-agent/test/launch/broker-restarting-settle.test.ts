@@ -1,35 +1,35 @@
 // Integration test — real timers are required (ts-no-test-timers exception): this spawns the
 // actual cross-process daemon broker driving real child processes, and the bug is a leaked real
 // `setTimeout` in #settle that resurrects a stopped daemon. Fake timers cannot control the OS
-// process-exit promise or the unix-socket RPC the broker relies on, and proving the *absence* of a
-// resurrection means waiting past the real backoff window (no signal exists to await).
-import { describe, expect, it } from "bun:test";
+// process-exit promise or the unix-socket RPC the broker relies on. The embedded broker uses a
+// shorter real backoff here; proving the absence of resurrection still requires crossing it.
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Process } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
+import { type DaemonBrokerStartOptions, startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/launch/client";
-import {
-	DAEMON_IDLE_GRACE_ENV,
-	DAEMON_PROJECT_DIR_ENV,
-	DAEMON_RUNTIME_DIR_ENV,
-	type DaemonSnapshot,
-} from "../../src/launch/protocol";
+import { DAEMON_IDLE_GRACE_ENV, DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV } from "../../src/launch/protocol";
+import { type DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
+
+const RESTART_BACKOFF_BASE_MS = 250;
+const INITIAL_RESTART_DELAY_MS = RESTART_BACKOFF_BASE_MS * 2;
+const RESTART_SETTLE_MARGIN_MS = 150;
 
 function restoreEnv(name: string, value: string | undefined): void {
 	if (value === undefined) delete process.env[name];
 	else process.env[name] = value;
 }
 
-function startBroker(projectDir: string, runtimeDir: string): Promise<void> {
+function startBroker(projectDir: string, runtimeDir: string, options: DaemonBrokerStartOptions = {}): Promise<void> {
 	const previousProjectDir = process.env[DAEMON_PROJECT_DIR_ENV];
 	const previousRuntimeDir = process.env[DAEMON_RUNTIME_DIR_ENV];
 	const previousGrace = process.env[DAEMON_IDLE_GRACE_ENV];
 	process.env[DAEMON_PROJECT_DIR_ENV] = projectDir;
 	process.env[DAEMON_RUNTIME_DIR_ENV] = runtimeDir;
 	process.env[DAEMON_IDLE_GRACE_ENV] = "5000";
-	const broker = startDaemonBrokerFromEnvironment();
+	const broker = startDaemonBrokerFromEnvironment(options);
 	restoreEnv(DAEMON_PROJECT_DIR_ENV, previousProjectDir);
 	restoreEnv(DAEMON_RUNTIME_DIR_ENV, previousRuntimeDir);
 	restoreEnv(DAEMON_IDLE_GRACE_ENV, previousGrace);
@@ -69,7 +69,9 @@ describe("daemon broker restart settling", () => {
 		const previousTitle = process.title;
 		// Create the client (writes broker.token) before starting the broker, which reads that token.
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
-		const broker = startBroker(projectDir, runtimeDir);
+		const broker = startBroker(projectDir, runtimeDir, {
+			restartBackoffBaseMs: RESTART_BACKOFF_BASE_MS,
+		});
 		const name = "crash-loop";
 		try {
 			const started = await client.request({
@@ -106,14 +108,78 @@ describe("daemon broker restart settling", () => {
 			if (stopped.op !== "stop") throw new Error(`unexpected result: ${stopped.op}`);
 			expect(stopped.daemon.state).toBe("exited");
 
-			// Wait past the initial backoff (2s) where a leaked timer would have fired #launch.
-			await Bun.sleep(2_600);
+			// Cross the configured initial backoff where a leaked timer would fire #launch.
+			await Bun.sleep(INITIAL_RESTART_DELAY_MS + RESTART_SETTLE_MARGIN_MS);
 			const afterStop = await snapshotOf(client, name);
 			expect(afterStop.state).toBe("exited");
 			expect(afterStop.pid).toBeUndefined();
 			expect(afterStop.restartCount).toBe(baseline);
 		} finally {
 			await client.request({ op: "stop", name, timeoutMs: 2_000 }).catch(() => undefined);
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker;
+			process.title = previousTitle;
+		}
+	}, 20_000);
+
+	it("does not answer exit waits until stopping a restarting daemon is published", async () => {
+		using tempDir = TempDir.createSync("@omp-restart-stop-wait-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const previousTitle = process.title;
+		const broker = startBroker(projectDir, runtimeDir, { restartBackoffBaseMs: 5_000 });
+		const name = "stopped-during-backoff";
+		const metadataPath = path.join(runtimeDir, "daemons", name, "meta.json");
+		const writingExit = Promise.withResolvers<void>();
+		const releaseWrite = Promise.withResolvers<void>();
+		const rename = fs.rename;
+		let blocked = false;
+		let restoreRename: (() => void) | undefined;
+		try {
+			await client.request({
+				op: "start",
+				spec: {
+					name,
+					application: process.execPath,
+					args: ["-e", "process.exit(1)"],
+					env: {},
+					cwd: projectDir,
+					pty: false,
+					restart: "always",
+					persist: false,
+					detached: true,
+				},
+			});
+			await waitForState(client, name, "restarting", 5_000);
+			const renameSpy = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+				if (to === metadataPath && !blocked && (await fs.readFile(from, "utf8")).includes('"state":"exited"')) {
+					blocked = true;
+					writingExit.resolve();
+					await releaseWrite.promise;
+				}
+				return rename(from, to);
+			});
+			restoreRename = () => renameSpy.mockRestore();
+			const stopping = client.request({ op: "stop", name, timeoutMs: 2_000 });
+			await writingExit.promise;
+			const waiting = client.request({ op: "wait", name, for: "exit", timeoutMs: 5_000 });
+			// Real socket polling must get a full interval while the metadata rename stays blocked.
+			expect(await Promise.race([waiting.then(() => "returned"), Bun.sleep(150).then(() => "pending")])).toBe(
+				"pending",
+			);
+			releaseWrite.resolve();
+			await stopping;
+			const waited = await waiting;
+			if (waited.op !== "wait") throw new Error(`unexpected result: ${waited.op}`);
+			expect(waited.daemon.state).toBe("exited");
+			const metadata = await Bun.file(metadataPath).json();
+			expect(metadata.daemon.state).toBe("exited");
+		} finally {
+			releaseWrite.resolve();
+			restoreRename?.();
 			await client.request({ op: "shutdown" }).catch(() => undefined);
 			client.close();
 			await broker;

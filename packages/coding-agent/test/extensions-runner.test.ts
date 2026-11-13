@@ -2,29 +2,39 @@
  * Tests for ExtensionRunner - conflict detection, error handling, tool wrapping.
  */
 
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, expectTypeOf, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Type } from "@oh-my-pi/omptype/typebox";
+import type { AgentMessage, AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
+import type { MessageCreateParams } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { discoverAndLoadExtensions, ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ExtensionRuntime, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
+	SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS,
 	testSetExtensionHandlerTimeoutMs,
+	testSetSessionShutdownHandlerTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type {
+	Extension,
 	ExtensionError,
-	ExtensionServiceTier,
 	ExtensionUIContext,
+	InputEvent,
+	InputEventResult,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
-import { Type } from "@oh-my-pi/pi-coding-agent/extensibility/typebox";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
+import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 describe("ExtensionRunner", () => {
 	let tempDir: TempDir;
@@ -58,11 +68,18 @@ describe("ExtensionRunner", () => {
 
 	afterEach(() => {
 		testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
+		testSetSessionShutdownHandlerTimeoutMs(SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS);
 		tempDir.removeSync();
 	});
 
 	const loadTestExtensions = async (configuredPaths: string[] = []) => {
-		const result = await discoverAndLoadExtensions([extensionsDir, ...configuredPaths], tempDir.path());
+		const discoveredPaths = fs
+			.readdirSync(extensionsDir, { withFileTypes: true })
+			.filter(entry => entry.isFile() && (entry.name.endsWith(".ts") || entry.name.endsWith(".js")))
+			.map(entry => path.join(extensionsDir, entry.name))
+			.sort();
+		const explicitPaths = configuredPaths.map(configuredPath => path.resolve(tempDir.path(), configuredPath));
+		const result = await loadExtensions([...discoveredPaths, ...explicitPaths], tempDir.path());
 		const testRoots = [
 			extensionsDir,
 			...configuredPaths.map(configuredPath => path.resolve(tempDir.path(), configuredPath)),
@@ -78,26 +95,6 @@ describe("ExtensionRunner", () => {
 			errors: result.errors.filter(error => isTestScoped(error.path)),
 		};
 	};
-
-	it("exposes caller localProtocolOptions through extension context", async () => {
-		const localProtocolOptions = {
-			getArtifactsDir: () => tempDir.join("artifacts"),
-			getSessionId: () => "runner-session",
-		};
-		const result = await loadTestExtensions();
-		const runner = new ExtensionRunner(
-			result.extensions,
-			result.runtime,
-			tempDir.path(),
-			sessionManager,
-			modelRegistry,
-			undefined,
-			undefined,
-			localProtocolOptions,
-		);
-
-		expect(runner.createContext().localProtocolOptions).toBe(localProtocolOptions);
-	});
 
 	it("reflects SessionManager.moveTo() changes instead of the constructor-time snapshot (/move)", async () => {
 		const dirA = tempDir.join("dirA");
@@ -116,6 +113,98 @@ describe("ExtensionRunner", () => {
 
 		expect(runner.cwd).toBe(dirB);
 		expect(runner.createContext().cwd).toBe(dirB);
+	});
+
+	it("exposes the initialized host mode to extension contexts", async () => {
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const actions = {
+			sendMessage: () => {},
+			sendUserMessage: async () => {},
+			appendEntry: () => {},
+			setLabel: () => {},
+			getActiveTools: () => [],
+			getAllTools: () => [],
+			setActiveTools: async () => {},
+			getCommands: () => [],
+			setModel: async () => false,
+			getThinkingLevel: () => undefined,
+			setThinkingLevel: () => {},
+			getSessionName: () => undefined,
+			setSessionName: async () => {},
+		};
+		const contextActions = {
+			getModel: () => undefined,
+			isIdle: () => true,
+			abort: () => {},
+			hasPendingMessages: () => false,
+			shutdown: () => {},
+			getContextUsage: () => undefined,
+			compact: async () => {},
+			getSystemPrompt: () => [],
+		};
+
+		expect(runner.createContext().mode).toBe("print");
+
+		runner.initialize(actions, contextActions, undefined, undefined, "rpc");
+		expect(runner.createContext().mode).toBe("rpc");
+
+		runner.initialize(actions, contextActions, undefined, undefined, "json");
+		expect(runner.createContext().mode).toBe("json");
+
+		runner.initialize(actions, contextActions, undefined, undefined, "tui");
+		expect(runner.createContext().mode).toBe("tui");
+	});
+
+	it("uses required context actions when command actions are unavailable", async () => {
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const usage = { tokens: 1200, contextWindow: 8000, percent: 15 };
+		const compact = vi.fn(async () => {});
+
+		runner.initialize(
+			{
+				sendMessage: () => {},
+				sendUserMessage: async () => {},
+				appendEntry: () => {},
+				setLabel: () => {},
+				getActiveTools: () => [],
+				getAllTools: () => [],
+				setActiveTools: async () => {},
+				getCommands: () => [],
+				setModel: async () => false,
+				getThinkingLevel: () => undefined,
+				setThinkingLevel: () => {},
+				getSessionName: () => undefined,
+				setSessionName: async () => {},
+			},
+			{
+				getModel: () => undefined,
+				isIdle: () => true,
+				abort: () => {},
+				hasPendingMessages: () => false,
+				shutdown: () => {},
+				getContextUsage: () => usage,
+				compact,
+				getSystemPrompt: () => [],
+			},
+		);
+
+		expect(runner.createContext().getContextUsage()).toEqual(usage);
+		await runner.createContext().compact("preserve current task");
+		expect(compact).toHaveBeenCalledWith("preserve current task");
 	});
 
 	describe("shortcut conflicts", () => {
@@ -310,35 +399,6 @@ describe("ExtensionRunner", () => {
 			expect(commands.map(c => c.name).sort()).toEqual(["cmd-a", "cmd-b"]);
 		});
 
-		it("gets command by name", async () => {
-			const cmdCode = `
-				export default function(pi) {
-					pi.registerCommand("my-cmd", {
-						description: "My command",
-						handler: async () => {},
-					});
-				}
-			`;
-			fs.writeFileSync(path.join(extensionsDir, "cmd.ts"), cmdCode);
-
-			const result = await loadTestExtensions();
-			const runner = new ExtensionRunner(
-				result.extensions,
-				result.runtime,
-				tempDir.path(),
-				sessionManager,
-				modelRegistry,
-			);
-
-			const cmd = runner.getCommand("my-cmd");
-			expect(cmd).toBeDefined();
-			expect(cmd?.name).toBe("my-cmd");
-			expect(cmd?.description).toBe("My command");
-
-			const missing = runner.getCommand("not-exists");
-			expect(missing).toBeUndefined();
-		});
-
 		it("prefers later-loaded explicit extensions for conflicting commands", async () => {
 			const deployCommand = (description: string) => `
 				export default function(pi) {
@@ -372,6 +432,31 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("error handling", () => {
+		it("rejects instead of returning untransformed context when its caller aborts a pending handler", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("context", async () => {
+						await new Promise(() => {});
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "pending-context.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const controller = new AbortController();
+			const pending = runner.emitContext([{ role: "user", content: "unredacted", timestamp: 1 }], controller.signal);
+
+			controller.abort(new Error("caller aborted"));
+			await expect(pending).rejects.toThrow("caller aborted");
+		});
+
 		it("calls error listeners when handler throws", async () => {
 			const extCode = `
 				export default function(pi) {
@@ -449,6 +534,155 @@ describe("ExtensionRunner", () => {
 
 			expect(runner.getAssistantThinkingRenderers().length).toBe(1);
 		});
+
+		it("hands out assistant text renderers only while extensionRenderers.assistantText is on", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "text-renderer.ts"),
+				`export default function(pi) { pi.registerAssistantTextRenderer(context => context.text.toUpperCase()); }`,
+			);
+			const result = await loadTestExtensions();
+			const runnerWith = (settings: Settings | undefined) =>
+				new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+					undefined,
+					settings,
+				);
+
+			// Off (the default, or no session settings at all): nothing reaches the transcript.
+			expect(runnerWith(Settings.isolated({})).getAssistantTextRenderers()).toEqual([]);
+			expect(runnerWith(undefined).getAssistantTextRenderers()).toEqual([]);
+			const [renderer] = runnerWith(
+				Settings.isolated({ "extensionRenderers.assistantText": true }),
+			).getAssistantTextRenderers();
+			expect(
+				renderer?.({ message: createAssistantMessage("hi"), contentIndex: 0, text: "hi", streaming: false }),
+			).toBe("HI");
+		});
+
+		it("fails an extension's load when it registers an assistant text renderer that is not a function", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "bad-text-renderer.ts"),
+				`export default function(pi) { pi.registerAssistantTextRenderer("upper"); }`,
+			);
+			const result = await loadTestExtensions();
+
+			expect(result.extensions).toEqual([]);
+			expect(result.errors).toHaveLength(1);
+			expect(result.errors[0]?.error).toContain("registerAssistantTextRenderer expects a function, got string");
+			expect(result.errors[0]?.error).toContain("bad-text-renderer.ts");
+		});
+
+		it("routes a claimed link's click to its claimant only, while extensionRenderers.assistantText is on", async () => {
+			const clicks: string[] = [];
+			// The extension files below run in this process and record into this global.
+			Reflect.set(globalThis, "__linkClicks", clicks);
+			await Bun.write(
+				path.join(extensionsDir, "link-owner.ts"),
+				`export default function(pi) {
+					pi.registerLinkScheme("Demo");
+					pi.on("link_activate", event => { globalThis.__linkClicks.push("owner " + event.scheme + " " + event.url); });
+				}`,
+			);
+			await Bun.write(
+				path.join(extensionsDir, "link-bystander.ts"),
+				`export default function(pi) { pi.on("link_activate", event => { globalThis.__linkClicks.push("bystander " + event.url); }); }`,
+			);
+			await Bun.write(
+				path.join(extensionsDir, "link-hijack.ts"),
+				`export default function(pi) { pi.registerLinkScheme("https"); }`,
+			);
+			await Bun.write(
+				path.join(extensionsDir, "link-internal-hijack.ts"),
+				`export default function(pi) { pi.registerLinkScheme("Security"); }`,
+			);
+			await Bun.write(
+				path.join(extensionsDir, "link-drive-letter.ts"),
+				`export default function(pi) { pi.registerLinkScheme("C"); }`,
+			);
+			try {
+				const result = await loadTestExtensions();
+				// Claiming a web scheme or one of omp's internal URL schemes fails that extension's load
+				// instead of capturing every such link.
+				expect(result.errors.find(error => error.path.endsWith("link-hijack.ts"))?.error).toContain("reserved");
+				expect(result.errors.find(error => error.path.endsWith("link-internal-hijack.ts"))?.error).toContain(
+					"reserved",
+				);
+				// A one-letter scheme would claim Windows paths such as `C:/notes.md`.
+				expect(result.errors.find(error => error.path.endsWith("link-drive-letter.ts"))?.error).toContain(
+					"two or more characters",
+				);
+				const runnerWith = (settings: Settings) =>
+					new ExtensionRunner(
+						result.extensions,
+						result.runtime,
+						tempDir.path(),
+						sessionManager,
+						modelRegistry,
+						undefined,
+						settings,
+					);
+
+				const off = runnerWith(Settings.isolated({}));
+				expect(off.getLinkSchemes()).toEqual([]);
+				expect(await off.emitLinkActivate("demo:open/1")).toBe(false);
+
+				const on = runnerWith(Settings.isolated({ "extensionRenderers.assistantText": true }));
+				expect(on.getLinkSchemes()).toEqual(["demo"]);
+				expect(await on.emitLinkActivate("DEMO:open/2")).toBe(true);
+				expect(await on.emitLinkActivate("https://example.com")).toBe(false);
+				expect(clicks).toEqual(["owner demo DEMO:open/2"]);
+			} finally {
+				Reflect.deleteProperty(globalThis, "__linkClicks");
+			}
+		});
+
+		it("lets a link_activate handler run past the event-handler timeout, as a command would", async () => {
+			const release = Promise.withResolvers<void>();
+			const done: string[] = [];
+			Reflect.set(globalThis, "__linkRelease", release.promise);
+			Reflect.set(globalThis, "__linkDone", done);
+			await Bun.write(
+				path.join(extensionsDir, "link-dialog.ts"),
+				`export default function(pi) {
+					pi.registerLinkScheme("demo");
+					pi.on("link_activate", async event => {
+						await globalThis.__linkRelease;
+						globalThis.__linkDone.push(event.url);
+					});
+				}`,
+			);
+			vi.useFakeTimers();
+			try {
+				const result = await loadTestExtensions();
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+					undefined,
+					Settings.isolated({ "extensionRenderers.assistantText": true }),
+				);
+				const errors: string[] = [];
+				runner.onError(error => errors.push(error.error));
+				testSetExtensionHandlerTimeoutMs(10);
+				// The handler waits on the user (a dialog) far longer than the handler timeout.
+				const emission = runner.emitLinkActivate("demo:open/1");
+				vi.advanceTimersByTime(1_000);
+				release.resolve();
+				expect(await emission).toBe(true);
+				expect(done).toEqual(["demo:open/1"]);
+				expect(errors).toEqual([]);
+			} finally {
+				vi.useRealTimers();
+				Reflect.deleteProperty(globalThis, "__linkRelease");
+				Reflect.deleteProperty(globalThis, "__linkDone");
+			}
+		});
 	});
 
 	describe("flags", () => {
@@ -475,18 +709,29 @@ describe("ExtensionRunner", () => {
 
 			expect(flags.has("--my-flag")).toBe(true);
 		});
+	});
 
-		it("can set flag values", async () => {
+	describe("assistant_message", () => {
+		it("chains text rewrites, ignores in-place edits, and preserves non-text blocks", async () => {
 			const extCode = `
 				export default function(pi) {
-					pi.registerFlag("--test-flag", {
-						description: "Test flag",
-						handler: async () => {},
+					pi.on("assistant_message", event => {
+						event.message.content[0].text = "ignored";
+						event.message.usage.output = 999;
 					});
+					pi.on("assistant_message", event => ({
+						content: [{ type: "text", text: event.message.content[0].text + " one" }, event.message.content[1]],
+					}));
+					pi.on("assistant_message", event => ({
+						content: [{ type: "text", text: event.message.content[0].text + " two" }, event.message.content[1]],
+					}));
+					pi.on("assistant_message", () => { throw new Error("rewrite failed"); });
+					pi.on("assistant_message", event => ({
+						content: [{ type: "text", text: event.message.content[0].text + " three" }, event.message.content[1]],
+					}));
 				}
 			`;
-			fs.writeFileSync(path.join(extensionsDir, "flag.ts"), extCode);
-
+			fs.writeFileSync(path.join(extensionsDir, "assistant-message.ts"), extCode);
 			const result = await loadTestExtensions();
 			const runner = new ExtensionRunner(
 				result.extensions,
@@ -495,12 +740,243 @@ describe("ExtensionRunner", () => {
 				sessionManager,
 				modelRegistry,
 			);
+			const errors: ExtensionError[] = [];
+			runner.onError(error => errors.push(error));
+			const toolCall = { type: "toolCall" as const, id: "call-1", name: "read", arguments: { path: "x" } };
+			const message = {
+				...createAssistantMessage("original"),
+				content: [{ type: "text" as const, text: "original" }, toolCall],
+			};
+			const rewritten = await runner.emitAssistantMessage(message);
+			expect(rewritten).toEqual([{ type: "text", text: "original one two three" }, toolCall]);
+			expect(message.content[0]).toEqual({ type: "text", text: "original" });
+			expect(message.usage.output).not.toBe(999);
+			expect(errors).toHaveLength(1);
+			expect(errors[0]?.event).toBe("assistant_message");
+			expect(errors[0]?.error).toContain("rewrite failed");
+		});
+		it("preserves Cursor-resolved tool markers across no-op and text rewrite handlers", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "assistant-message-cursor.ts"),
+				`
+				export default function(pi) {
+					pi.on("assistant_message", event => ({ content: event.message.content }));
+					pi.on("assistant_message", event => ({
+						content: [
+							{ ...event.message.content[0], text: "rewritten" },
+							event.message.content[1],
+						],
+					}));
+				}
+				`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const resolvedToolCall = {
+				type: "toolCall" as const,
+				id: "call-cursor",
+				name: "read",
+				arguments: { path: "x" },
+				[kCursorExecResolved]: true as const,
+			};
+			const message = {
+				...createAssistantMessage("original"),
+				content: [{ type: "text" as const, text: "original" }, resolvedToolCall],
+			};
 
-			// Setting a flag value should not throw
-			runner.setFlagValue("--test-flag", true);
+			const rewritten = await runner.emitAssistantMessage(message);
 
-			// The flag values are stored in the shared runtime
-			expect(result.runtime.flagValues.get("--test-flag")).toBe(true);
+			expect(rewritten?.[0]).toMatchObject({ type: "text", text: "rewritten" });
+			expect(rewritten?.[1]).toBe(resolvedToolCall);
+			expect((rewritten?.[1] as typeof resolvedToolCall | undefined)?.[kCursorExecResolved]).toBe(true);
+		});
+
+		it("normalizes each text signature against its original text across chained rewrites", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "assistant-message-signatures.ts"),
+				`
+				export default function(pi) {
+					pi.on("assistant_message", event => ({
+						content: [
+							{ ...event.message.content[0], textSignature: "original-second" },
+							event.message.content[1],
+							{ ...event.message.content[2], text: "edited second", textSignature: "original-first" },
+						],
+					}));
+					pi.on("assistant_message", event => {
+						if (event.message.content[0].textSignature !== "original-first" ||
+							event.message.content[2].textSignature !== undefined) {
+							throw new Error("replay signatures were not normalized before chaining");
+						}
+					});
+					pi.on("assistant_message", event => ({
+						content: [
+							{ type: "text", text: event.message.content[0].text },
+							event.message.content[1],
+							{ ...event.message.content[2], textSignature: "original-first" },
+						],
+					}));
+					pi.on("assistant_message", event => ({
+						content: [
+							{ ...event.message.content[0], text: "edited first", textSignature: "original-first" },
+							event.message.content[1],
+							{ ...event.message.content[2], text: "second", textSignature: "forged" },
+						],
+					}));
+				}
+				`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const errors: ExtensionError[] = [];
+			runner.onError(error => errors.push(error));
+			const toolCall = { type: "toolCall" as const, id: "call-1", name: "read", arguments: { path: "x" } };
+			const message = {
+				...createAssistantMessage("first"),
+				content: [
+					{ type: "text" as const, text: "first", textSignature: "original-first" },
+					toolCall,
+					{ type: "text" as const, text: "second", textSignature: "original-second" },
+				],
+			};
+			expect(await runner.emitAssistantMessage(message)).toEqual([
+				{ type: "text", text: "edited first" },
+				toolCall,
+				{ type: "text", text: "second", textSignature: "original-second" },
+			]);
+			expect(message.content[0]).toEqual({ type: "text", text: "first", textSignature: "original-first" });
+			expect(errors).toEqual([]);
+		});
+
+		it.each([
+			[
+				"added text",
+				[
+					{ type: "text", text: "first" },
+					{ type: "text", text: "extra" },
+					{ type: "text", text: "second" },
+				],
+			],
+			["removed text", [{ type: "text", text: "first" }]],
+			[
+				"changed block kind",
+				[
+					{ type: "text", text: "first" },
+					{ type: "thinking", thinking: "second" },
+				],
+			],
+			[
+				"changed text metadata",
+				[
+					{ type: "text", text: "first", providerMetadata: "forged" },
+					{ type: "text", text: "second" },
+				],
+			],
+		] as const)("rejects %s topology or metadata changes", async (_case, content) => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "assistant-message-invalid.ts"),
+				`export default pi => pi.on("assistant_message", () => ({ content: ${JSON.stringify(content)} }));`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const errors: ExtensionError[] = [];
+			runner.onError(error => errors.push(error));
+			const message = {
+				...createAssistantMessage("first"),
+				content: [
+					{ type: "text" as const, text: "first", textSignature: "original-first" },
+					{ type: "text" as const, text: "second", textSignature: "original-second" },
+				],
+			};
+			expect(await runner.emitAssistantMessage(message)).toBeUndefined();
+			expect(errors).toHaveLength(1);
+			expect(errors[0]?.error).toContain("block positions");
+		});
+
+		it("returns completed rewrites without awaiting or accepting a handler after abort", async () => {
+			const signals = { started: Promise.withResolvers<void>(), skippedRan: false };
+			const globalState = globalThis as typeof globalThis & { __assistantMessageAbort?: typeof signals };
+			globalState.__assistantMessageAbort = signals;
+			fs.writeFileSync(
+				path.join(extensionsDir, "assistant-message-abort.ts"),
+				`
+				export default function(pi) {
+					pi.on("assistant_message", event => ({
+						content: event.message.content.map(block =>
+							block.type === "text" ? { ...block, text: "accepted" } : block
+						),
+					}));
+					pi.on("assistant_message", async () => {
+						globalThis.__assistantMessageAbort.started.resolve();
+						await Promise.withResolvers().promise;
+					});
+					pi.on("assistant_message", () => {
+						globalThis.__assistantMessageAbort.skippedRan = true;
+					});
+				}
+				`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const controller = new AbortController();
+			const message = createAssistantMessage("original");
+			const emission = runner.emitAssistantMessage(message, controller.signal);
+			await signals.started.promise;
+			controller.abort(new Error("cancelled"));
+			await expect(emission).resolves.toEqual([{ type: "text", text: "accepted" }]);
+			expect(signals.skippedRan).toBe(false);
+			delete globalState.__assistantMessageAbort;
+		});
+
+		it("rejects attempts to change tool calls", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "assistant-message-invalid.ts"),
+				`export default pi => pi.on("assistant_message", () => ({ content: [{ type: "text", text: "lost tool" }] }));`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const errors: ExtensionError[] = [];
+			runner.onError(error => errors.push(error));
+			const message = {
+				...createAssistantMessage("original"),
+				content: [
+					{ type: "text" as const, text: "original" },
+					{ type: "toolCall" as const, id: "call-1", name: "read", arguments: { path: "x" } },
+				],
+			};
+			expect(await runner.emitAssistantMessage(message)).toBeUndefined();
+			expect(errors).toHaveLength(1);
+			expect(errors[0]?.error).toContain("non-text blocks");
 		});
 	});
 
@@ -542,7 +1018,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -721,6 +1197,80 @@ describe("ExtensionRunner", () => {
 			expect(errors[0]?.event).toBe("after_provider_response");
 			expect(errors[0]?.error).toContain("response failed");
 		});
+
+		it("exposes the response model instead of the primary session model", async () => {
+			const primaryModel = getBundledModel("openai-codex", "gpt-5.6-sol");
+			const requestModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!primaryModel || !requestModel) throw new Error("Expected bundled cross-provider models to exist");
+
+			const eventsPath = path.join(tempDir.path(), "after-provider-response-model.jsonl");
+			const extCode = `
+				import * as fs from "node:fs";
+
+				export default function(pi) {
+					pi.on("after_provider_response", async (_event, ctx) => {
+						const current = ctx.models.current();
+						fs.appendFileSync(
+							${JSON.stringify(eventsPath)},
+							JSON.stringify({
+								model: ctx.model && { provider: ctx.model.provider, id: ctx.model.id },
+								current: current && { provider: current.provider, id: current.id },
+							}) + "\\n",
+						);
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "after-response-model.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: async () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => primaryModel,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+			);
+
+			await runner.emitAfterProviderResponse(
+				{ status: 402, headers: {}, requestId: "req_402", metadata: { provider: requestModel.provider } },
+				requestModel,
+			);
+
+			const expected = { provider: requestModel.provider, id: requestModel.id };
+			const events = fs
+				.readFileSync(eventsPath, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(events).toEqual([{ model: expected, current: expected }]);
+		});
 	});
 
 	describe("session_stop", () => {
@@ -801,6 +1351,40 @@ describe("ExtensionRunner", () => {
 				},
 			]);
 			expect(stopResult).toEqual({ continue: true, additionalContext: "Run one more pass." });
+		});
+
+		it("keeps both cleanup and unfinished-work feedback from separate stop handlers", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "session-stop-merge.ts"),
+				`
+				export default function(pi) {
+					pi.on("session_stop", () => ({ continue: true, additionalContext: "", reason: "Clean abandoned process." }));
+					pi.on("session_stop", () => ({ continue: true, additionalContext: "Continue unfinished work." }));
+				}
+			`,
+			);
+			const loaded = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const message = createAssistantMessage("Next is another unfinished change.");
+			const result = await runner.emitSessionStop({
+				messages: [message],
+				turn_id: 1,
+				last_assistant_message: message,
+				session_id: "session-123",
+				session_file: "/tmp/session.jsonl",
+				stop_hook_active: false,
+				signal: new AbortController().signal,
+			});
+			expect(result).toEqual({
+				continue: true,
+				additionalContext: "Clean abandoned process.\n\nContinue unfinished work.",
+			});
 		});
 
 		it("skips cancelled handlers, releases in-flight handlers, and preserves timeout errors", async () => {
@@ -904,7 +1488,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -953,12 +1537,12 @@ describe("ExtensionRunner", () => {
 				vi.useRealTimers();
 			}
 		});
-		it("continues to later handlers after empty continuation feedback", async () => {
+		it("gives a later hard block precedence over advisory continuation feedback", async () => {
 			await Bun.write(
-				path.join(extensionsDir, "session-stop-empty.ts"),
+				path.join(extensionsDir, "session-stop-precedence.ts"),
 				`
 				export default function(pi) {
-					pi.on("session_stop", async () => ({ continue: true }));
+					pi.on("session_stop", async () => ({ continue: true, additionalContext: "Earlier advisory." }));
 					pi.on("session_stop", async () => ({ decision: "block", reason: "Continue from second handler." }));
 				}
 			`,
@@ -1114,6 +1698,7 @@ describe("ExtensionRunner", () => {
 			label: "Boom",
 			description: "always throws",
 			parameters: {} as never,
+			approval: "read",
 			execute: async () => {
 				throw new Error("original explosion");
 			},
@@ -1124,7 +1709,20 @@ describe("ExtensionRunner", () => {
 			label: "Fine",
 			description: "always succeeds",
 			parameters: {} as never,
+			approval: "read",
 			execute: async () => ({ content: [{ type: "text" as const, text: "success" }] }),
+		};
+
+		const flaggedTool: AgentTool = {
+			name: "flagged",
+			label: "Flagged",
+			description: "returns a non-throwing failure",
+			parameters: {} as never,
+			approval: "read",
+			execute: async () => ({
+				content: [{ type: "text" as const, text: "reported failure" }],
+				isError: true,
+			}),
 		};
 
 		const firstText = (result: { content: readonly (TextContent | ImageContent)[] }): string | undefined => {
@@ -1199,9 +1797,55 @@ describe("ExtensionRunner", () => {
 			expect(firstText(res)).toBe("now failing");
 			expect(res.isError).toBe(true);
 		});
+
+		it("preserves a tool-reported error through extension rewrites", async () => {
+			const runner = await runnerFor(`
+				export default function(pi) {
+					pi.on("tool_result", (event) => ({
+						content: [{ type: "text", text: event.isError ? "observed failure" : "observed success" }],
+					}));
+				}
+			`);
+			const wrapper = new ExtensionToolWrapper(flaggedTool, runner);
+			const res = await wrapper.execute("call-reported-failure", {} as never, undefined, undefined, undefined);
+			expect(firstText(res)).toBe("observed failure");
+			expect(res.isError).toBe(true);
+		});
 	});
 
 	describe("handler timeouts", () => {
+		const initializeRunner = (runner: ExtensionRunner, uiContext: ExtensionUIContext): void => {
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: async () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+				undefined,
+				uiContext,
+			);
+		};
+
 		it("times out session_start handlers, emits an error, and continues to sibling extensions", async () => {
 			const hangExtensionPath = path.join(tempDir.path(), "hang-session-start.ts");
 			const fastExtensionPath = path.join(tempDir.path(), "fast-session-start.ts");
@@ -1267,7 +1911,55 @@ describe("ExtensionRunner", () => {
 			warnSpy.mockRestore();
 		});
 
-		it("times out tool_call handlers with fail-closed policy so a hung extension cannot indefinitely block tool execution (#3948)", async () => {
+		it("keeps a stalled registration inside the session_shutdown deadline", async () => {
+			const extensionPath = path.join(tempDir.path(), "shutdown-registration.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					export default function(pi) {
+						pi.on("session_shutdown", () => {
+							const { Type } = pi.typebox;
+							pi.registerTool({
+								name: "shutdown_tool",
+								label: "Shutdown Tool",
+								description: "Registered while shutting down.",
+								parameters: Type.Object({}),
+								execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+							});
+						});
+					}
+				`,
+			);
+
+			const result = await loadTestExtensions([extensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.onToolRegistered(() => Promise.withResolvers<void>().promise);
+			const errors: ExtensionError[] = [];
+			runner.onError(error => {
+				errors.push(error);
+			});
+			testSetSessionShutdownHandlerTimeoutMs(10);
+
+			const startedAt = performance.now();
+			await runner.emit({ type: "session_shutdown" });
+			const elapsedMs = performance.now() - startedAt;
+
+			expect(elapsedMs).toBeGreaterThanOrEqual(8);
+			expect(elapsedMs).toBeLessThan(150);
+			expect(errors).toContainEqual({
+				extensionPath,
+				event: "session_shutdown",
+				error: "handler timed out after 10ms",
+			});
+		});
+
+		it("uses the configured tool_call timeout and fails closed so a hung extension cannot block execution (#3948)", async () => {
 			const hangExtensionPath = path.join(tempDir.path(), "hang-tool-call.ts");
 			fs.writeFileSync(
 				hangExtensionPath,
@@ -1287,14 +1979,14 @@ describe("ExtensionRunner", () => {
 				tempDir.path(),
 				sessionManager,
 				modelRegistry,
+				undefined,
+				Settings.isolated({ "extensionHandlers.toolCallTimeoutMs": 10 }),
 			);
 			const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
 			const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
 			runner.onError(err => {
 				errors.push(err);
 			});
-			testSetExtensionHandlerTimeoutMs(10);
-
 			const executeCalls: unknown[] = [];
 			const tool: AgentTool = {
 				name: "sleepy",
@@ -1302,6 +1994,7 @@ describe("ExtensionRunner", () => {
 				description: "records execute() invocations",
 				parameters: Type.Object({}),
 				strict: true,
+				approval: "read",
 				execute: async (_id, params) => {
 					executeCalls.push(params);
 					return { content: [{ type: "text", text: "ran" }] };
@@ -1335,19 +2028,198 @@ describe("ExtensionRunner", () => {
 			warnSpy.mockRestore();
 		});
 
-		it("aborts a tool_call handler's confirmation before returning its timeout block", async () => {
-			const extensionPath = path.join(tempDir.path(), "confirm-tool-call.ts");
-			const markerPath = path.join(tempDir.path(), "confirm-settled.txt");
+		it("falls back to the default tool_call timeout for invalid configured values", async () => {
+			const extensionPath = path.join(tempDir.path(), "invalid-timeout-tool-call.ts");
 			fs.writeFileSync(
 				extensionPath,
 				`
-					import * as fs from "node:fs";
+					export default function(pi) {
+						pi.on("tool_call", async () => {
+							await Promise.withResolvers().promise;
+						});
+					}
+				`,
+			);
+			const loaded = await loadTestExtensions([extensionPath]);
+			// Configured through a config file (as a user would): writes reject NaN/Infinity outright,
+			// while a file carrying them must still load and fall back to the default.
+			const configuredSettings: Settings[] = [];
+			for (const [index, yamlValue] of ["0", "-1", ".nan", ".inf"].entries()) {
+				const overlayPath = path.join(tempDir.path(), `invalid-timeout-${index}.yml`);
+				fs.writeFileSync(overlayPath, `extensionHandlers:\n  toolCallTimeoutMs: ${yamlValue}\n`);
+				configuredSettings.push(
+					await Settings.loadIsolated({ inMemory: true, cwd: tempDir.path(), configFiles: [overlayPath] }),
+				);
+			}
 
+			vi.useFakeTimers();
+			try {
+				for (const settings of configuredSettings) {
+					const runner = new ExtensionRunner(
+						loaded.extensions,
+						loaded.runtime,
+						tempDir.path(),
+						sessionManager,
+						modelRegistry,
+						undefined,
+						settings,
+					);
+					let settled = false;
+					const decision = runner
+						.emitToolCall({
+							type: "tool_call",
+							toolName: "guarded",
+							toolCallId: "invalid-timeout-call",
+							input: {},
+						})
+						.then(result => {
+							settled = true;
+							return result;
+						});
+
+					vi.advanceTimersByTime(EXTENSION_HANDLER_TIMEOUT_MS - 1);
+					expect(settled).toBe(false);
+
+					vi.advanceTimersByTime(1);
+					await Promise.resolve();
+					await Promise.resolve();
+					vi.advanceTimersByTime(0);
+					expect(await decision).toEqual({
+						block: true,
+						reason: `Extension ${extensionPath} timed out after ${EXTENSION_HANDLER_TIMEOUT_MS}ms`,
+					});
+				}
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("fails closed when a tool_call handler registration cannot activate", async () => {
+			const extensionPath = path.join(tempDir.path(), "tool-call-registration.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					export default function(pi) {
+						pi.on("tool_call", () => {
+							const { Type } = pi.typebox;
+							pi.registerTool({
+								name: "tool_call_registered",
+								label: "Tool Call Registered",
+								description: "Registered from a tool-call hook.",
+								parameters: Type.Object({}),
+								execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+							});
+						});
+					}
+				`,
+			);
+
+			const result = await loadTestExtensions([extensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.onToolRegistered(async () => {
+				throw new Error("expected tool-call registration failure");
+			});
+			const errors: ExtensionError[] = [];
+			runner.onError(error => {
+				errors.push(error);
+			});
+			const executeCalls: unknown[] = [];
+			const wrapped = new ExtensionToolWrapper(
+				{
+					name: "gated",
+					label: "Gated",
+					description: "Must not execute after a gate registration fails.",
+					parameters: Type.Object({}),
+					approval: "read",
+					execute: async (_id, params) => {
+						executeCalls.push(params);
+						return { content: [{ type: "text", text: "ran" }] };
+					},
+				},
+				runner,
+			);
+
+			await expect(wrapped.execute("tool-call-id", {})).rejects.toThrow(
+				`Extension ${extensionPath} failed: expected tool-call registration failure`,
+			);
+			expect(executeCalls).toEqual([]);
+			expect(errors).toContainEqual({
+				extensionPath,
+				event: "tool_call",
+				error: "expected tool-call registration failure",
+				stack: expect.any(String),
+			});
+		});
+
+		it("does not charge detached registrations to unrelated tool-call handlers", async () => {
+			const extensionPath = path.join(tempDir.path(), "detached-registration-barrier.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					export default function(pi) {
+						const { Type } = pi.typebox;
+						pi.registerTool({
+							name: "detached_source_tool",
+							label: "Detached Source Tool",
+							description: "Provides a registration event for the detached barrier test.",
+							parameters: Type.Object({}),
+							execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+						});
+						pi.on("tool_call", () => undefined);
+					}
+				`,
+			);
+
+			const loaded = await loadTestExtensions([extensionPath]);
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.onToolRegistered(() => Promise.withResolvers<void>().promise);
+			const extension = loaded.extensions[0];
+			const registrationListener = extension?.toolRegistrationListeners?.values().next().value;
+			if (!registrationListener) throw new Error("expected registration listener");
+			registrationListener("detached_source_tool");
+
+			const errors: ExtensionError[] = [];
+			runner.onError(error => {
+				errors.push(error);
+			});
+			testSetExtensionHandlerTimeoutMs(10);
+
+			const result = await runner.emitToolCall({
+				type: "tool_call",
+				toolName: "unrelated",
+				toolCallId: "unrelated-call",
+				input: {},
+			});
+
+			expect(result).toBeUndefined();
+			expect(errors).toEqual([]);
+		});
+
+		it("pauses a tool_call handler timeout during standard and custom dialogs, then resumes its budget", async () => {
+			const extensionPath = path.join(tempDir.path(), "confirm-tool-call.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
 					export default function(pi) {
 						pi.on("tool_call", async (_event, ctx) => {
 							ctx.ui.notify("Waiting for confirmation");
+							await new Promise(resolve => setTimeout(resolve, 8));
 							await ctx.ui.confirm("High-risk command", "Allow this command?");
-							fs.writeFileSync(${JSON.stringify(markerPath)}, "settled");
+							await ctx.ui.custom(() => ({}));
+							ctx.ui.notify("Custom settled");
+							await Promise.withResolvers().promise;
 						});
 					}
 				`,
@@ -1362,66 +2234,325 @@ describe("ExtensionRunner", () => {
 				modelRegistry,
 			);
 			const dialog = Promise.withResolvers<boolean>();
+			const handlerStarted = Promise.withResolvers<void>();
+			const confirmationStarted = Promise.withResolvers<void>();
+			const customStarted = Promise.withResolvers<void>();
+			const customCompleted = Promise.withResolvers<void>();
 			let dialogSignal: AbortSignal | undefined;
-			const notify = vi.fn<ExtensionUIContext["notify"]>();
+			const notify: ExtensionUIContext["notify"] = message => {
+				if (message === "Waiting for confirmation") handlerStarted.resolve();
+				if (message === "Custom settled") customCompleted.resolve();
+			};
 			const confirm: ExtensionUIContext["confirm"] = async (_title, _message, dialogOptions) => {
 				dialogSignal = dialogOptions?.signal;
+				confirmationStarted.resolve();
+				dialogSignal?.addEventListener("abort", () => dialog.resolve(false), { once: true });
+				return await dialog.promise;
+			};
+			const customDialog = Promise.withResolvers<void>();
+			let customSignal: AbortSignal | undefined;
+			const custom: ExtensionUIContext["custom"] = async <T>(...args: Parameters<ExtensionUIContext["custom"]>) => {
+				customSignal = args[1]?.signal;
+				await args[0](undefined as never, undefined as never, undefined as never, () => {});
+				customStarted.resolve();
+				await customDialog.promise;
+				return undefined as T;
+			};
+			const uiPrototype = Object.create(runner.getUIContext(), {
+				confirm: { value: confirm },
+				custom: { value: custom },
+				notify: { value: notify },
+			});
+			const uiContext: ExtensionUIContext = Object.create(uiPrototype);
+			initializeRunner(runner, uiContext);
+			vi.useFakeTimers();
+			let now = 0;
+			const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => now);
+			try {
+				testSetExtensionHandlerTimeoutMs(25);
+
+				const tool: AgentTool = {
+					name: "guarded",
+					label: "Guarded",
+					description: "must not execute after the extension gate times out",
+					parameters: Type.Object({}),
+					strict: true,
+					approval: "read",
+					execute: async () => ({ content: [{ type: "text", text: "ran" }] }),
+				};
+				const wrapped = new ExtensionToolWrapper(tool, runner);
+
+				const execution = wrapped.execute("tool-call-id", {});
+				await handlerStarted.promise;
+				expect(dialogSignal).toBeUndefined();
+
+				now = 8;
+				vi.advanceTimersByTime(8);
+				await confirmationStarted.promise;
+				expect(dialogSignal).toBeDefined();
+
+				now = 108;
+				vi.advanceTimersByTime(100);
+				expect(dialogSignal?.aborted).toBe(false);
+
+				dialog.resolve(true);
+				await customStarted.promise;
+				expect(customSignal).toBeDefined();
+				expect(customSignal?.aborted).toBe(false);
+
+				now = 208;
+				vi.advanceTimersByTime(100);
+				expect(customSignal?.aborted).toBe(false);
+
+				customDialog.resolve();
+				await customCompleted.promise;
+
+				now = 225;
+				vi.advanceTimersByTime(17);
+				await Promise.resolve();
+				await Promise.resolve();
+				vi.advanceTimersByTime(0);
+				await expect(execution).rejects.toThrow(`Extension ${extensionPath} timed out after 25ms`);
+			} finally {
+				performanceNow.mockRestore();
+				vi.useRealTimers();
+			}
+		});
+
+		it("charges async custom factory setup to the handler timeout until the dialog is presented", async () => {
+			const extensionPath = path.join(tempDir.path(), "pending-custom-factory.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					export default function(pi) {
+						pi.on("tool_call", async (_event, ctx) => {
+							await ctx.ui.custom(async () => {
+								ctx.ui.notify("Factory started");
+								await Promise.withResolvers().promise;
+							});
+						});
+					}
+				`,
+			);
+
+			const result = await loadTestExtensions([extensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const factoryStarted = Promise.withResolvers<void>();
+			const notify: ExtensionUIContext["notify"] = message => {
+				if (message === "Factory started") factoryStarted.resolve();
+			};
+			const custom: ExtensionUIContext["custom"] = async <T>(...args: Parameters<ExtensionUIContext["custom"]>) => {
+				await args[0](undefined as never, undefined as never, undefined as never, () => {});
+				return undefined as T;
+			};
+			const uiPrototype = Object.create(runner.getUIContext(), {
+				custom: { value: custom },
+				notify: { value: notify },
+			});
+			const uiContext: ExtensionUIContext = Object.create(uiPrototype);
+			initializeRunner(runner, uiContext);
+			vi.useFakeTimers();
+			try {
+				testSetExtensionHandlerTimeoutMs(10);
+				let settled = false;
+				const decision = runner
+					.emitToolCall({
+						type: "tool_call",
+						toolName: "guarded",
+						toolCallId: "pending-custom-factory",
+						input: {},
+					})
+					.then(value => {
+						settled = true;
+						return value;
+					});
+
+				await factoryStarted.promise;
+				vi.advanceTimersByTime(10);
+				for (let i = 0; i < 3; i++) await Promise.resolve();
+				vi.advanceTimersByTime(0);
+				for (let i = 0; i < 5; i++) await Promise.resolve();
+
+				expect(settled).toBe(true);
+				expect(await decision).toEqual({
+					block: true,
+					reason: `Extension ${extensionPath} timed out after 10ms`,
+				});
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("keeps a session_before_* handler's dialog answerable past the handler budget, unlike a non-gate event", async () => {
+			const extensionPath = path.join(tempDir.path(), "gate-dialog.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					export default function(pi) {
+						pi.on("session_before_switch", async (_event, ctx) => ({ cancel: await ctx.ui.confirm("Leave?", "") }));
+						pi.on("agent_end", async (_event, ctx) => {
+							await ctx.ui.confirm("Still there?", "");
+						});
+					}
+				`,
+			);
+			const result = await loadTestExtensions([extensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const errors: string[] = [];
+			runner.onError(error => errors.push(error.error));
+			let presented = Promise.withResolvers<AbortSignal | undefined>();
+			let answer = Promise.withResolvers<boolean>();
+			const confirm: ExtensionUIContext["confirm"] = async (_title, _message, dialogOptions) => {
+				presented.resolve(dialogOptions?.signal);
+				return answer.promise;
+			};
+			// The runner proxies the UI context, so the overrides sit on its prototype.
+			initializeRunner(runner, Object.create(Object.create(runner.getUIContext(), { confirm: { value: confirm } })));
+			vi.useFakeTimers();
+			let now = 0;
+			const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => now);
+			try {
+				testSetExtensionHandlerTimeoutMs(15);
+				// The operator answers well after the handler budget.
+				const gate = runner.emit({ type: "session_before_switch", reason: "new" });
+				await presented.promise;
+				now = 100;
+				vi.advanceTimersByTime(100);
+				answer.resolve(true);
+				expect(await gate).toEqual({ cancel: true });
+				expect(errors).toEqual([]);
+
+				// Real timers from here: the handler's own 15ms budget is what ends the wait.
+				performanceNow.mockRestore();
+				vi.useRealTimers();
+				presented = Promise.withResolvers();
+				answer = Promise.withResolvers();
+				const notification = runner.emit({ type: "agent_end", messages: [] });
+				const dialogSignal = await presented.promise;
+				await notification;
+				expect(errors).toHaveLength(1);
+				expect(errors[0]).toContain("timed out after 15ms");
+				expect(dialogSignal?.aborted).toBe(true);
+			} finally {
+				performanceNow.mockRestore();
+				vi.useRealTimers();
+				testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
+			}
+		});
+
+		it("closes a gate handler's pending dialog and drops its late result when the event's signal aborts", async () => {
+			const extensionPath = path.join(tempDir.path(), "gate-abort.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					export default function(pi) {
+						pi.on("session_before_shutdown", async (_event, ctx) => {
+							await ctx.ui.select("Outcome", ["done"]);
+							return { cancel: true };
+						});
+					}
+				`,
+			);
+			const result = await loadTestExtensions([extensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const presented = Promise.withResolvers<AbortSignal | undefined>();
+			const answer = Promise.withResolvers<string | undefined>();
+			// Ignores its signal, like a handler that never checks it.
+			const select: ExtensionUIContext["select"] = async (_title, _options, dialogOptions) => {
+				presented.resolve(dialogOptions?.signal);
+				return answer.promise;
+			};
+			initializeRunner(runner, Object.create(Object.create(runner.getUIContext(), { select: { value: select } })));
+			const controller = new AbortController();
+			const emission = runner.emit({ type: "session_before_shutdown", signal: controller.signal });
+			const dialogSignal = await presented.promise;
+			controller.abort();
+			expect(await emission).toBeUndefined();
+			expect(dialogSignal?.aborted).toBe(true);
+			answer.resolve("done");
+		});
+
+		it("cancels a pending confirmation and blocks tool execution when the outer dispatch aborts (#4223)", async () => {
+			const extensionPath = path.join(tempDir.path(), "confirm-abort-tool-call.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					export default function(pi) {
+						pi.on("tool_call", async (_event, ctx) => {
+							await ctx.ui.confirm("High-risk command", "Allow this command?");
+						});
+					}
+				`,
+			);
+
+			const result = await loadTestExtensions([extensionPath]);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			let dialogSignal: AbortSignal | undefined;
+			const dialog = Promise.withResolvers<boolean>();
+			const confirmationStarted = Promise.withResolvers<void>();
+			const confirm: ExtensionUIContext["confirm"] = async (_title, _message, dialogOptions) => {
+				dialogSignal = dialogOptions?.signal;
+				confirmationStarted.resolve();
 				dialogSignal?.addEventListener("abort", () => dialog.resolve(false), { once: true });
 				return await dialog.promise;
 			};
 			const uiPrototype = Object.create(runner.getUIContext(), {
 				confirm: { value: confirm },
-				notify: { value: notify },
 			});
 			const uiContext: ExtensionUIContext = Object.create(uiPrototype);
-			runner.initialize(
-				{
-					sendMessage: () => {},
-					sendUserMessage: () => {},
-					appendEntry: () => {},
-					setLabel: () => {},
-					getActiveTools: () => [],
-					getAllTools: () => [],
-					setActiveTools: async () => {},
-					getCommands: () => [],
-					setModel: async () => false,
-					getThinkingLevel: () => undefined,
-					setThinkingLevel: () => {},
-					getSessionName: () => undefined,
-					setSessionName: async () => {},
-				},
-				{
-					getModel: () => undefined,
-					isIdle: () => true,
-					abort: () => {},
-					hasPendingMessages: () => false,
-					shutdown: () => {},
-					getContextUsage: () => undefined,
-					compact: async () => {},
-					getSystemPrompt: () => [],
-				},
-				undefined,
-				uiContext,
-			);
-			testSetExtensionHandlerTimeoutMs(10);
+			initializeRunner(runner, uiContext);
+			let executed = false;
 
 			const tool: AgentTool = {
 				name: "guarded",
 				label: "Guarded",
-				description: "must not execute after the extension gate times out",
+				description: "must not execute after the dispatch aborts",
 				parameters: Type.Object({}),
 				strict: true,
-				execute: async () => ({ content: [{ type: "text", text: "ran" }] }),
+				approval: "read",
+				execute: async () => {
+					executed = true;
+					return { content: [{ type: "text", text: "ran" }] };
+				},
 			};
 			const wrapped = new ExtensionToolWrapper(tool, runner);
 
-			await expect(wrapped.execute("tool-call-id", {})).rejects.toThrow(
-				`Extension ${extensionPath} timed out after 10ms`,
-			);
-			expect(notify).toHaveBeenCalledWith("Waiting for confirmation");
+			const controller = new AbortController();
+			const execution = wrapped.execute("tool-call-id", {} as never, controller.signal);
+			await confirmationStarted.promise;
+
+			expect(dialogSignal).toBeDefined();
+			expect(dialogSignal?.aborted).toBe(false);
+
+			controller.abort();
+			await expect(execution).rejects.toThrow();
 
 			expect(dialogSignal?.aborted).toBe(true);
-			expect(fs.readFileSync(markerPath, "utf8")).toBe("settled");
+			expect(executed).toBe(false);
 		});
 	});
 
@@ -1460,7 +2591,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -1497,14 +2628,6 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("service tier API", () => {
-		it("restricts tiers to values supported by each provider family", () => {
-			expectTypeOf<"scale">().toExtend<ExtensionServiceTier<"openai">>();
-			expectTypeOf<"flex">().toExtend<ExtensionServiceTier<"google">>();
-			expectTypeOf<"priority">().toExtend<ExtensionServiceTier<"anthropic">>();
-			expectTypeOf<"scale">().not.toExtend<ExtensionServiceTier<"google">>();
-			expectTypeOf<"flex">().not.toExtend<ExtensionServiceTier<"anthropic">>();
-		});
-
 		it("returns a detached snapshot, forwards valid changes, and rejects invalid family tiers", async () => {
 			const extCode = `
 				export default function(pi) {
@@ -1543,7 +2666,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: (_customType, data) => {
 						snapshots.push(data);
 					},
@@ -1614,7 +2737,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -1672,7 +2795,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -1702,6 +2825,9 @@ describe("ExtensionRunner", () => {
 					input: async () => undefined,
 					notify: () => {},
 					onTerminalInput: () => () => {},
+					rerenderMessage: () => {},
+					refreshTranscript: () => {},
+					getLinkClicksAvailable: () => false,
 					setStatus: () => {},
 					setWorkingMessage: () => {},
 					setWidget: () => {},
@@ -1715,6 +2841,7 @@ describe("ExtensionRunner", () => {
 					editor: async () => undefined,
 					addAutocompleteProvider: () => {},
 					setEditorComponent: () => {},
+					getEditorComponent: () => undefined,
 					get theme() {
 						return {} as never;
 					},
@@ -1774,7 +2901,7 @@ describe("ExtensionRunner", () => {
 				isIdle: () => true,
 				hasQueuedMessages: () => false,
 				abort: () => {},
-				settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) } as never,
+				settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
 			});
 
 			expect(events).toEqual([
@@ -1784,9 +2911,163 @@ describe("ExtensionRunner", () => {
 			]);
 			expect(select).toHaveBeenCalledWith(expect.stringContaining("Allow tool: dangerous_tool"), [
 				"Approve",
+				"Approve dangerous_tool for this session",
 				"Deny",
 			]);
 			delete globalState.__approvalEvents;
+		});
+
+		it("approving for this session skips later mode prompts of that tool and tier, until the session changes", async () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			const select = vi.fn(async (_title: string, options: string[]) => options[1]);
+			initializeRunner(runner, select);
+			const context = () => ({
+				sessionManager,
+				modelRegistry,
+				model: undefined,
+				isIdle: () => true,
+				hasQueuedMessages: () => false,
+				abort: () => {},
+				settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+			});
+			const run = (tool: typeof approvalTool | AgentTool, id: string) =>
+				(new ExtensionToolWrapper(tool, runner) as ExtensionToolWrapper<any>).execute(
+					id,
+					{},
+					undefined,
+					undefined,
+					context(),
+				);
+			await run(approvalTool, "call-grant");
+			await run(approvalTool, "call-granted");
+			expect(select).toHaveBeenCalledTimes(1);
+			// The grant covers that tool at that tier only: its write-tier calls and other tools still ask.
+			await run({ ...approvalTool, approval: "write" as const }, "call-write-tier");
+			await run({ ...approvalTool, name: "other_tool" }, "call-other");
+			expect(select).toHaveBeenCalledTimes(3);
+			// A critical override asks every time and never offers the session choice.
+			const critical = { ...approvalTool, approval: () => ({ tier: "exec" as const, override: true }) };
+			select.mockImplementationOnce(async () => "Approve");
+			await run(critical, "call-critical");
+			expect(select).toHaveBeenLastCalledWith(expect.any(String), ["Approve", "Deny"]);
+			// A new session starts without the grant.
+			await sessionManager.newSession();
+			await run(approvalTool, "call-new-session");
+			expect(select).toHaveBeenCalledTimes(5);
+		});
+		it("runs bridged preflight before approval and cancels denied state", async () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			const order: string[] = [];
+			initializeRunner(runner, async () => {
+				order.push("ui_select");
+				return "Approve";
+			});
+			runner.setToolCallPreflight({
+				before: async () => {
+					order.push("preflight");
+					return { block: true, reason: "rule blocked" };
+				},
+			});
+			const wrapper = new ExtensionToolWrapper(approvalTool, runner);
+			await expect(
+				(wrapper as ExtensionToolWrapper<any>).execute("call-preflight-order", {}, undefined, undefined, {
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+				}),
+			).rejects.toThrow("rule blocked");
+			expect(order).toEqual(["preflight"]);
+
+			const deniedRunner = new ExtensionRunner(
+				[],
+				new ExtensionRuntime(),
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			initializeRunner(deniedRunner, async () => "Deny");
+			let cancelled = 0;
+			deniedRunner.setToolCallPreflight({
+				before: async () => undefined,
+				cancel: () => {
+					cancelled++;
+				},
+			});
+			const deniedWrapper = new ExtensionToolWrapper(approvalTool, deniedRunner);
+			await expect(
+				(deniedWrapper as ExtensionToolWrapper<any>).execute("call-preflight-denied", {}, undefined, undefined, {
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+				}),
+			).rejects.toThrow("denied by user");
+			expect(cancelled).toBe(1);
+		});
+
+		it("does not present approval before canonical or wire-aliased tool previews are ready", async () => {
+			const cases = [
+				{ tool: approvalTool, wireName: "dangerous_tool", toolCallId: "call-preview" },
+				{
+					tool: { ...approvalTool, name: "edit", customWireName: "apply_patch" },
+					wireName: "apply_patch",
+					toolCallId: "call-aliased-preview",
+				},
+			];
+			for (const { tool, wireName, toolCallId } of cases) {
+				const result = await loadTestExtensions();
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				const preview = Promise.withResolvers<void>();
+				const order: string[] = [];
+				runner.setToolApprovalPreviewWaiter(async waitedToolCallId => {
+					order.push(`preview_wait:${waitedToolCallId}`);
+					await preview.promise;
+					order.push("preview_ready");
+				});
+				initializeRunner(
+					runner,
+					vi.fn(async () => {
+						order.push("ui_select");
+						return "Approve";
+					}),
+				);
+
+				const wrapper = new ExtensionToolWrapper(tool, runner);
+				const execution = (wrapper as ExtensionToolWrapper<any>).execute(toolCallId, {}, undefined, undefined, {
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+					toolCall: {
+						batchId: `batch-${toolCallId}`,
+						index: 0,
+						total: 1,
+						toolCalls: [{ id: toolCallId, name: wireName }],
+					},
+				});
+				await Promise.resolve();
+				expect(order).toEqual([`preview_wait:${toolCallId}`]);
+
+				preview.resolve();
+				await execution;
+				expect(order).toEqual([`preview_wait:${toolCallId}`, "preview_ready", "ui_select"]);
+			}
 		});
 
 		it("emits resolved false when approval is denied", async () => {
@@ -1828,7 +3109,7 @@ describe("ExtensionRunner", () => {
 					isIdle: () => true,
 					hasQueuedMessages: () => false,
 					abort: () => {},
-					settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) } as never,
+					settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
 				}),
 			).rejects.toThrow("Tool call denied by user: dangerous_tool");
 
@@ -1879,7 +3160,7 @@ describe("ExtensionRunner", () => {
 					isIdle: () => true,
 					hasQueuedMessages: () => false,
 					abort: () => {},
-					settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) } as never,
+					settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
 				}),
 			).rejects.toThrow("dialog aborted");
 
@@ -1926,7 +3207,7 @@ describe("ExtensionRunner", () => {
 			const wrapper = new ExtensionToolWrapper(approvalTool, runner);
 			await expect(
 				(wrapper as ExtensionToolWrapper<any>).execute("call-partial-context", {}, undefined, undefined, {
-					settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) },
+					settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
 				} as never),
 			).rejects.toThrow('Tool "dangerous_tool" requires approval but no interactive UI available.');
 
@@ -1944,6 +3225,10 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("tool_call input", () => {
+		const yoloContext = {
+			settings: Settings.isolated({ "tools.approvalMode": "yolo" }),
+		} as never;
+
 		function createHashlineEditTool(): AgentTool {
 			return {
 				name: "edit",
@@ -1951,11 +3236,12 @@ describe("ExtensionRunner", () => {
 				description: "Test edit tool",
 				parameters: Type.Object({ input: Type.String() }),
 				strict: true,
+				approval: "read",
 				execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
 			};
 		}
 
-		it("exposes a single hashline edit path to extension gate handlers", async () => {
+		it("allows bracketed Markdown paths, blocks non-Markdown paths, and accepts legacy headers", async () => {
 			const eventsPath = path.join(tempDir.path(), "tool-call-events.jsonl");
 			const extCode = `
 				import * as fs from "node:fs";
@@ -1967,7 +3253,7 @@ describe("ExtensionRunner", () => {
 							${JSON.stringify(eventsPath)},
 							JSON.stringify({ path: event.input.path, paths: event.input.paths }) + "\\n",
 						);
-						if (typeof event.input.path !== "string") {
+						if (typeof event.input.path !== "string" || !event.input.path.endsWith(".md")) {
 							return { block: true, reason: \`Blocked: \${event.input.path}\` };
 						}
 					});
@@ -1986,17 +3272,37 @@ describe("ExtensionRunner", () => {
 			const wrapped = new ExtensionToolWrapper(createHashlineEditTool(), runner);
 
 			const resultMessage = await wrapped.execute("tool-call-id", {
-				input: "¶plans/switch-case-array-syntax.md#ABC1\n27 27\n+new content",
+				input: [
+					"*** Begin Patch",
+					'["plans/switch case-array.md"#ABC1]',
+					"PUT 27.=27:",
+					"+new content",
+					"*** End Patch",
+				].join("\n"),
+			});
+			await expect(
+				wrapped.execute("non-markdown-tool-call-id", {
+					input: "[packages/coding-agent/src/main.ts#BCD2]\nPUT 1.=1:\n+changed",
+				}),
+			).rejects.toThrow("Blocked: packages/coding-agent/src/main.ts");
+			const legacyResult = await wrapped.execute("legacy-tool-call-id", {
+				input: "¶plans/legacy.md#CDE3\n27 27\n+new content",
 			});
 
 			expect(resultMessage.content).toEqual([{ type: "text", text: "ok" }]);
+			expect(legacyResult.content).toEqual([{ type: "text", text: "ok" }]);
 			const events = fs
 				.readFileSync(eventsPath, "utf8")
 				.trim()
 				.split("\n")
 				.map(line => JSON.parse(line));
 			expect(events).toEqual([
-				{ path: "plans/switch-case-array-syntax.md", paths: ["plans/switch-case-array-syntax.md"] },
+				{ path: "plans/switch case-array.md", paths: ["plans/switch case-array.md"] },
+				{
+					path: "packages/coding-agent/src/main.ts",
+					paths: ["packages/coding-agent/src/main.ts"],
+				},
+				{ path: "plans/legacy.md", paths: ["plans/legacy.md"] },
 			]);
 		});
 		it("keeps non-tag hash suffixes in hashline edit paths", async () => {
@@ -2027,7 +3333,7 @@ describe("ExtensionRunner", () => {
 			const wrapped = new ExtensionToolWrapper(createHashlineEditTool(), runner);
 
 			await wrapped.execute("tool-call-id", {
-				input: "¶plans/foo.md#notatag\n27 27\n+new content",
+				input: "[plans/foo.md#notatag]\nPUT 27.=27:\n+new content",
 			});
 
 			const events = fs
@@ -2067,7 +3373,7 @@ describe("ExtensionRunner", () => {
 
 			await wrapped.execute("tool-call-id", {
 				_path: "plans/allowed.md",
-				input: "¶src/secret.ts#ABC1\n27 27\n+evil content",
+				input: "[src/secret.ts#ABC1]\nPUT 27.=27:\n+evil content",
 			});
 
 			const events = fs
@@ -2110,7 +3416,7 @@ describe("ExtensionRunner", () => {
 
 			await expect(
 				wrapped.execute("tool-call-id", {
-					input: "¶plans/switch-case-array-syntax.md#ABC1\n27 27\n+new content\n¶packages/coding-agent/src/main.ts#DEF2\n1 1\n+changed",
+					input: "[plans/switch-case-array-syntax.md#ABC1]\nPUT 27.=27:\n+new content\n[packages/coding-agent/src/main.ts#DEF2]\nPUT 1.=1:\n+changed",
 				}),
 			).rejects.toThrow("Blocked: undefined");
 
@@ -2164,7 +3470,13 @@ describe("ExtensionRunner", () => {
 			);
 			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
 
-			const resultMessage = await wrapped.execute("tool-call-id", { command: "echo original" });
+			const resultMessage = await wrapped.execute(
+				"tool-call-id",
+				{ command: "echo original" },
+				undefined,
+				undefined,
+				yoloContext,
+			);
 
 			expect(resultMessage.content).toEqual([{ type: "text", text: "ran" }]);
 			const executed = fs
@@ -2201,38 +3513,6 @@ describe("ExtensionRunner", () => {
 			expect(fs.existsSync(recordPath)).toBe(false); // tool never executed
 		});
 
-		it("executes with the original input when no handler returns a replacement", async () => {
-			const recordPath = path.join(tempDir.path(), "override-absent.jsonl");
-			const extCode = `
-				export default function(pi) {
-					pi.on("tool_call", async (event) => {
-						if (event.toolName !== "bash") return;
-						// observe only; no input override
-					});
-				}
-			`;
-			fs.writeFileSync(path.join(extensionsDir, "tool-call-no-override.ts"), extCode);
-
-			const result = await loadTestExtensions();
-			const runner = new ExtensionRunner(
-				result.extensions,
-				result.runtime,
-				tempDir.path(),
-				sessionManager,
-				modelRegistry,
-			);
-			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
-
-			await wrapped.execute("tool-call-id", { command: "echo original" });
-
-			const executed = fs
-				.readFileSync(recordPath, "utf8")
-				.trim()
-				.split("\n")
-				.map(line => JSON.parse(line));
-			expect(executed).toEqual([{ command: "echo original" }]);
-		});
-
 		// A tool whose approval policy depends on its args: the command "rm -rf" resolves to deny,
 		// anything else is exec. Lets a test prove the post-override approval re-check (P1).
 		function createArgGatedTool(recordPath: string): AgentTool {
@@ -2252,10 +3532,6 @@ describe("ExtensionRunner", () => {
 				},
 			} as AgentTool;
 		}
-
-		const yoloContext = {
-			settings: { get: (key: string) => (key === "tools.approvalMode" ? "yolo" : {}) },
-		} as never;
 
 		// Minimal runtime init so the approval gate's interactive `select` is wired for prompt-path tests.
 		const initApprovalRunner = (
@@ -2299,7 +3575,7 @@ describe("ExtensionRunner", () => {
 			isIdle: () => true,
 			hasQueuedMessages: () => false,
 			abort: () => {},
-			settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) },
+			settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
 		} as never;
 
 		it("blocks a revised input that resolves to a deny policy (approval gates the revised args)", async () => {
@@ -2329,7 +3605,7 @@ describe("ExtensionRunner", () => {
 			// resolves against the revised args and blocks — the tool never runs.
 			await expect(
 				wrapped.execute("tool-call-id", { command: "echo original" }, undefined, undefined, yoloContext),
-			).rejects.toThrow(/blocked by user policy/);
+			).rejects.toThrow('Tool "bash" is blocked by tool policy.\nReason: dangerous');
 			expect(fs.existsSync(recordPath)).toBe(false); // tool never executed
 		});
 
@@ -2397,7 +3673,7 @@ describe("ExtensionRunner", () => {
 			);
 			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
 
-			await wrapped.execute("tool-call-id", { command: "echo original" });
+			await wrapped.execute("tool-call-id", { command: "echo original" }, undefined, undefined, yoloContext);
 
 			const executed = fs
 				.readFileSync(recordPath, "utf8")
@@ -2405,6 +3681,304 @@ describe("ExtensionRunner", () => {
 				.split("\n")
 				.map(line => JSON.parse(line));
 			expect(executed).toEqual([{ command: "echo second" }]);
+		});
+
+		it("preserves distinct additional context from every non-blocking handler in registration order", async () => {
+			const first = `
+				export default function(pi) {
+					pi.on("tool_call", async () => ({
+						input: { command: "echo first" },
+						additionalContext: "first context",
+					}));
+					pi.on("tool_call", async () => ({ additionalContext: "   " }));
+				}
+			`;
+			const second = `
+				export default function(pi) {
+					pi.on("tool_call", async () => ({ additionalContext: "second context" }));
+					pi.on("tool_call", async () => ({ additionalContext: "first context" }));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-context-a.ts"), first);
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-context-b.ts"), second);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			await expect(
+				runner.emitToolCall({
+					type: "tool_call",
+					toolName: "bash",
+					toolCallId: "tool-call-id",
+					input: { command: "echo original" },
+				}),
+			).resolves.toEqual({
+				input: { command: "echo first" },
+				additionalContext: "first context\n\nsecond context",
+			});
+		});
+
+		it("preserves additional context from every tool_result handler in registration order", async () => {
+			const first = `
+				export default function(pi) {
+					pi.on("tool_result", async () => ({ additionalContext: "first result context" }));
+					pi.on("tool_result", async () => ({ additionalContext: "   " }));
+				}
+			`;
+			const second = `
+				export default function(pi) {
+					pi.on("tool_result", async () => ({ additionalContext: "second result context" }));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-result-context-a.ts"), first);
+			fs.writeFileSync(path.join(extensionsDir, "tool-result-context-b.ts"), second);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			await expect(
+				runner.emitToolResult({
+					type: "tool_result",
+					toolName: "bash",
+					toolCallId: "tool-call-id",
+					input: { command: "false" },
+					content: [{ type: "text", text: "failed" }],
+					details: undefined,
+					isError: true,
+				}),
+			).resolves.toEqual({ additionalContext: "first result context\n\nsecond result context" });
+		});
+
+		it("keeps an earlier extension's redaction when a later one returns only repeated context", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "tool-result-redact-a.ts"),
+				`export default function(pi) {
+					pi.on("tool_result", async () => ({
+						content: [{ type: "text", text: "token [REDACTED]" }],
+						additionalContext: "use the redacted result",
+					}));
+				}`,
+			);
+			fs.writeFileSync(
+				path.join(extensionsDir, "tool-result-redact-b.ts"),
+				`export default function(pi) {
+					pi.on("tool_result", async () => ({ additionalContext: "use the redacted result  " }));
+				}`,
+			);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			await expect(
+				runner.emitToolResult({
+					type: "tool_result",
+					toolName: "bash",
+					toolCallId: "tool-call-id",
+					input: { command: "cat" },
+					content: [{ type: "text", text: "token sk-SECRET" }],
+					details: undefined,
+					isError: false,
+				}),
+			).resolves.toEqual({
+				content: [{ type: "text", text: "token [REDACTED]" }],
+				details: undefined,
+				isError: false,
+				additionalContext: "use the redacted result",
+			});
+		});
+
+		it("forwards failure-specific tool_result context through the tool context", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_result", async (event) =>
+						event.isError ? { additionalContext: "inspect the failure before retrying" } : undefined);
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-result-failure-context.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const failingTool: AgentTool = {
+				name: "failing_tool",
+				label: "Failing Tool",
+				description: "Always fails",
+				parameters: Type.Object({}),
+				strict: true,
+				execute: async () => {
+					throw new Error("tool failed");
+				},
+			};
+			const delivered: string[] = [];
+			const contextWithRecorder = {
+				...(yoloContext as unknown as Record<string, unknown>),
+				addAdditionalContext: (context: string) => {
+					delivered.push(context);
+				},
+			} as unknown as AgentToolContext;
+
+			await expect(
+				new ExtensionToolWrapper(failingTool, runner).execute(
+					"tool-call-id",
+					{},
+					undefined,
+					undefined,
+					contextWithRecorder,
+				),
+			).rejects.toThrow("tool failed");
+			expect(delivered).toEqual(["inspect the failure before retrying"]);
+		});
+
+		it("forwards passive context from wrapper-dispatched calls through the tool context", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async () => ({ additionalContext: "nested device context" }));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-wrapper-context.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(
+				createRecordingTool(path.join(tempDir.path(), "context-call.jsonl")),
+				runner,
+			);
+			const delivered: string[] = [];
+
+			await wrapped.execute("tool-call-id", { command: "echo context" }, undefined, undefined, {
+				...(yoloContext as unknown as Record<string, unknown>),
+				addAdditionalContext: (context: string) => {
+					delivered.push(context);
+				},
+			} as unknown as AgentToolContext);
+
+			expect(delivered).toEqual(["nested device context"]);
+		});
+
+		it("discards collected additional context when a later handler blocks", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async () => ({ additionalContext: "must not leak" }));
+					pi.on("tool_call", async () => ({ block: true, reason: "blocked" }));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-context-block.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			await expect(
+				runner.emitToolCall({
+					type: "tool_call",
+					toolName: "bash",
+					toolCallId: "tool-call-id",
+					input: { command: "echo original" },
+				}),
+			).resolves.toEqual({ block: true, reason: "blocked" });
+		});
+
+		it("defers passive context until the wrapper approval gate succeeds", async () => {
+			// Wrapper-dispatched calls collect additionalContext before the
+			// approval gate. Forwarding waits for approval: an approved call
+			// delivers, a denied call throws before anything is injected.
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "prompt_tool") return;
+						return { additionalContext: "passive after approval" };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-context-approval.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const promptTool = {
+				name: "prompt_tool",
+				label: "Prompt Tool",
+				description: "Always prompt-gated",
+				parameters: Type.Object({ command: Type.String() }),
+				strict: true,
+				approval: "exec" as const,
+				formatApprovalDetails: (args: unknown) =>
+					args && typeof args === "object" && "command" in args ? String(args.command) : "",
+				execute: async (_id: string, params: unknown) => {
+					return { content: [{ type: "text", text: `ran ${JSON.stringify(params)}` }] };
+				},
+			} as AgentTool;
+			const wrapped = new ExtensionToolWrapper(promptTool, runner);
+			const contextWithRecorder = (delivered: string[]) =>
+				({
+					...(alwaysAskContext as unknown as Record<string, unknown>),
+					addAdditionalContext: (context: string) => {
+						delivered.push(context);
+					},
+				}) as never;
+
+			initApprovalRunner(runner, async () => "Approve");
+			const deliveredOnApprove: string[] = [];
+			await (wrapped as ExtensionToolWrapper).execute(
+				"call-approve",
+				{ command: "approved-command" },
+				undefined,
+				undefined,
+				contextWithRecorder(deliveredOnApprove),
+			);
+			expect(deliveredOnApprove).toEqual(["passive after approval"]);
+
+			initApprovalRunner(runner, async () => "Deny");
+			const deliveredOnDeny: string[] = [];
+			await expect(
+				(wrapped as ExtensionToolWrapper).execute(
+					"call-deny",
+					{ command: "denied-command" },
+					undefined,
+					undefined,
+					contextWithRecorder(deliveredOnDeny),
+				),
+			).rejects.toThrow("Tool call denied by user: prompt_tool");
+			expect(deliveredOnDeny).toEqual([]);
 		});
 
 		it("prompts for the revised input, not the original, on an approval-gated tool (P1 prompt→prompt)", async () => {
@@ -2494,9 +4068,9 @@ describe("ExtensionRunner", () => {
 			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
 
 			runner.markToolCallEmitted("loop-call-id", "bash");
-			await wrapped.execute("loop-call-id", { command: "echo original" });
+			await wrapped.execute("loop-call-id", { command: "echo original" }, undefined, undefined, yoloContext);
 			// Marker consumed above: an unmarked dispatch under the same id emits normally.
-			await wrapped.execute("loop-call-id", { command: "echo original" });
+			await wrapped.execute("loop-call-id", { command: "echo original" }, undefined, undefined, yoloContext);
 
 			const executed = fs
 				.readFileSync(recordPath, "utf8")
@@ -2506,8 +4080,8 @@ describe("ExtensionRunner", () => {
 			expect(executed).toEqual([{ command: "echo original" }, { command: "echo revised" }]);
 		});
 
-		it("forfeits the xdevApproved prompt bypass when a handler revises the input", async () => {
-			// write.ts dispatches xd:// devices with xdevApproved: true because its
+		it("forfeits the xd:// prompt bypass when a handler revises the input", async () => {
+			// write.ts dispatches xd:// devices with xdevPolicyKey because its
 			// outer gate already approved the ORIGINAL device input. A tool_call
 			// revision may raise the tier, so revised input must face the full gate
 			// (here: no interactive UI => reject) instead of riding the outer approval.
@@ -2532,14 +4106,94 @@ describe("ExtensionRunner", () => {
 			);
 			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
 			const xdevContext = {
-				settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) },
-				xdevApproved: true,
+				settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+				xdevPolicyKey: "bash",
 			} as never;
 
 			await expect(
 				wrapped.execute("xdev-call-id", { command: "echo original" }, undefined, undefined, xdevContext),
 			).rejects.toThrow(/requires approval but no interactive UI available/);
 			expect(fs.existsSync(recordPath)).toBe(false); // tool never executed
+		});
+
+		it.each([
+			["without returning a replacement", false],
+			["while returning the same object", true],
+		] as const)("forfeits ACP approval after in-place input mutation %s", async (_case, returnsInput) => {
+			const recordPath = path.join(tempDir.path(), `acp-mutated-${returnsInput}.jsonl`);
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "bash") return;
+						event.input.command = "echo revised";
+						${returnsInput ? "return { input: event.input };" : ""}
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-acp-mutate.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
+			const acpContext = {
+				settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+				acpApprovedArgs: { command: "echo original" },
+			} as never;
+
+			await expect(
+				wrapped.execute("acp-call-id", { command: "echo original" }, undefined, undefined, acpContext),
+			).rejects.toThrow(/requires approval but no interactive UI available/);
+			expect(fs.existsSync(recordPath)).toBe(false);
+		});
+
+		it("reports the effective tier after a tool_call handler revises xd:// input", async () => {
+			const recordPath = path.join(tempDir.path(), "xdev-effective-tier.jsonl");
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName !== "bash") return;
+						return { input: { command: "echo revised" } };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-call-xdev-tier.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const tool = createRecordingTool(recordPath);
+			tool.approval = args =>
+				args &&
+				typeof args === "object" &&
+				"command" in args &&
+				typeof args.command === "string" &&
+				args.command.includes("revised")
+					? "write"
+					: "read";
+			const wrapped = new ExtensionToolWrapper(tool, runner);
+			let effectiveTier: string | undefined;
+			const xdevContext = {
+				settings: Settings.isolated({ "tools.approvalMode": "yolo" }),
+				xdevPolicyKey: "bash",
+				xdevTierResolved: (tier: string) => {
+					effectiveTier = tier;
+				},
+			} as never;
+
+			await wrapped.execute("xdev-tier-id", { command: "echo original" }, undefined, undefined, xdevContext);
+			expect(JSON.parse(fs.readFileSync(recordPath, "utf8"))).toEqual({ command: "echo revised" });
+			expect(effectiveTier).toBe("write");
 		});
 
 		it("emits tool_call before the approval prompt so approval sees the final input", async () => {
@@ -2668,6 +4322,196 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("event delivery order", () => {
+		type Handler = (event: { type: string; toolCallId?: string }) => unknown;
+		const inlineExtension = (name: string, handlers: Record<string, Handler>): Extension => {
+			const extensionPath = path.join(extensionsDir, `${name}.ts`);
+			return {
+				path: extensionPath,
+				resolvedPath: extensionPath,
+				handlers: new Map(
+					Object.entries(handlers).map(([type, handler]) => [
+						type,
+						[async (...args: unknown[]) => handler(args[0] as { type: string; toolCallId?: string })],
+					]),
+				),
+				tools: new Map(),
+				assistantThinkingRenderers: [],
+				assistantTextRenderers: [],
+				transcriptPresenters: [],
+				linkSchemes: [],
+				fileWriteFallbackHandlers: [],
+				fileDeleteFallbackHandlers: [],
+				messageRenderers: new Map(),
+				composerShapes: new Map(),
+				commands: new Map(),
+				flags: new Map(),
+				shortcuts: new Map(),
+			};
+		};
+
+		it("delivers a call's end after its start even while an earlier extension is still handling the start", async () => {
+			const releaseSlowStart = Promise.withResolvers<void>();
+			const seen: string[] = [];
+			const slow = inlineExtension("slow-start", {
+				tool_execution_start: async () => {
+					seen.push("slow:start");
+					await releaseSlowStart.promise;
+				},
+			});
+			const observer = inlineExtension("observer", {
+				tool_execution_start: () => seen.push("observer:start"),
+				tool_execution_end: () => seen.push("observer:end"),
+			});
+			const runner = new ExtensionRunner(
+				[slow, observer],
+				new ExtensionRuntime(),
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			const start = runner.emit({ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} });
+			const end = runner.emit({
+				type: "tool_execution_end",
+				toolCallId: "call-1",
+				toolName: "read",
+				result: {},
+				isError: false,
+			});
+			// One loop turn drains every microtask, so an end that was not queued
+			// behind the start has reached the observer by now.
+			const turn = Promise.withResolvers<void>();
+			setImmediate(turn.resolve);
+			await turn.promise;
+			expect(seen).toEqual(["slow:start"]);
+
+			releaseSlowStart.resolve();
+			await Promise.all([start, end]);
+			expect(seen).toEqual(["slow:start", "observer:start", "observer:end"]);
+		});
+
+		it("delivers an event emitted inside a handler at once instead of queueing it behind that handler", async () => {
+			// Queued behind its own emitter the inner emit would wait out this budget.
+			testSetExtensionHandlerTimeoutMs(1_000);
+			try {
+				const errors: ExtensionError[] = [];
+				const seen: string[] = [];
+				// Stands in for `ctx.newSession()` from `agent_end`: the handler awaits a
+				// session event that both it and a later extension still queued on
+				// `agent_end` handle.
+				const switcher = inlineExtension("switcher", {
+					agent_end: async () => {
+						await runner.emit({ type: "session_switch", reason: "new", previousSessionFile: undefined });
+						seen.push("switcher:agent_end");
+					},
+					session_switch: () => seen.push("switcher:session_switch"),
+				});
+				const observer = inlineExtension("observer", {
+					agent_end: () => seen.push("observer:agent_end"),
+					session_switch: () => seen.push("observer:session_switch"),
+				});
+				const runner = new ExtensionRunner(
+					[switcher, observer],
+					new ExtensionRuntime(),
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				runner.onError(error => errors.push(error));
+
+				await runner.emit({ type: "agent_end", messages: [] });
+				expect(errors).toEqual([]);
+				expect(seen).toEqual([
+					"switcher:session_switch",
+					"observer:session_switch",
+					"switcher:agent_end",
+					"observer:agent_end",
+				]);
+			} finally {
+				testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
+			}
+		});
+
+		it("stops queueing a stalled extension's events behind each other after one handler budget", async () => {
+			// Real timers: the bound under test is the handler timeout itself, which
+			// runs on setTimeout/performance.now.
+			const budgetMs = 100;
+			testSetExtensionHandlerTimeoutMs(budgetMs);
+			const stall = Promise.withResolvers<void>();
+			try {
+				const entered: number[] = [];
+				const stalled = inlineExtension("stalled-updates", {
+					tool_execution_update: async () => {
+						entered.push(performance.now());
+						await stall.promise;
+					},
+				});
+				const runner = new ExtensionRunner(
+					[stalled],
+					new ExtensionRuntime(),
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				const timeouts: string[] = [];
+				runner.onError(error => timeouts.push(error.error));
+
+				const emittedAt = performance.now();
+				const updates = Array.from({ length: 4 }, (_, i) =>
+					runner.emit({
+						type: "tool_execution_update",
+						toolCallId: "call-1",
+						toolName: "bash",
+						args: {},
+						partialResult: i,
+					}),
+				);
+				await Promise.all(updates);
+
+				expect(timeouts).toHaveLength(4);
+				// Served one after another the fourth update would start after three
+				// full budgets; capped, every update starts within about one.
+				expect(entered).toHaveLength(4);
+				expect(Math.max(...entered) - emittedAt).toBeLessThan(2 * budgetMs);
+			} finally {
+				stall.resolve();
+				testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
+			}
+		});
+
+		it("stops waiting behind an extension's earlier event when the queued event's signal aborts", async () => {
+			const stall = Promise.withResolvers<void>();
+			try {
+				let asked = 0;
+				const busy = inlineExtension("busy", {
+					agent_end: () => stall.promise,
+					session_before_shutdown: () => {
+						asked++;
+					},
+				});
+				const runner = new ExtensionRunner(
+					[busy],
+					new ExtensionRuntime(),
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				void runner.emit({ type: "agent_end", messages: [] });
+				const controller = new AbortController();
+				const startedAt = performance.now();
+				const emission = runner.emit({ type: "session_before_shutdown", signal: controller.signal });
+				controller.abort();
+				expect(await emission).toBeUndefined();
+				// The default budget would hold the event for 30 seconds behind agent_end.
+				expect(performance.now() - startedAt).toBeLessThan(1_000);
+				expect(asked).toBe(0);
+			} finally {
+				stall.resolve();
+			}
+		});
+	});
+
 	describe("credential_disabled", () => {
 		it("delivers credential_disabled events to subscribed extensions with the typed payload", async () => {
 			const eventsPath = path.join(tempDir.path(), "credential-disabled-events.jsonl");
@@ -2760,22 +4604,6 @@ describe("ExtensionRunner", () => {
 			expect(errors[0]?.error).toContain("subscriber exploded");
 		});
 
-		it("is a no-op when no extension subscribes", async () => {
-			const result = await loadTestExtensions();
-			const runner = new ExtensionRunner(
-				result.extensions,
-				result.runtime,
-				tempDir.path(),
-				sessionManager,
-				modelRegistry,
-			);
-
-			expect(runner.hasHandlers("credential_disabled")).toBe(false);
-			await expect(
-				runner.emit({ type: "credential_disabled", provider: "anthropic", disabledCause: "invalid_grant" }),
-			).resolves.toBeUndefined();
-		});
-
 		it("caps the pre-initialize buffer and drops oldest events under pressure", async () => {
 			const eventsPath = path.join(tempDir.path(), "credential-disabled-cap.jsonl");
 			const extCode = `
@@ -2809,7 +4637,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -2834,8 +4662,11 @@ describe("ExtensionRunner", () => {
 				},
 			);
 
-			// Drain microtasks so the fire-and-forget emit() calls inside initialize() complete.
-			for (let i = 0; i < 5; i++) await Promise.resolve();
+			// The drained emits inside initialize() are fire-and-forget and run one at a time per
+			// extension; one loop turn lets their microtask chain finish.
+			const drained = Promise.withResolvers<void>();
+			setImmediate(drained.resolve);
+			await drained.promise;
 
 			const events = fs
 				.readFileSync(eventsPath, "utf8")
@@ -2881,7 +4712,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -2971,7 +4802,7 @@ describe("ExtensionRunner", () => {
 			runner.initialize(
 				{
 					sendMessage: () => {},
-					sendUserMessage: () => {},
+					sendUserMessage: async () => {},
 					appendEntry: () => {},
 					setLabel: () => {},
 					getActiveTools: () => [],
@@ -2996,8 +4827,11 @@ describe("ExtensionRunner", () => {
 				},
 			);
 
-			// Drain microtasks so the fire-and-forget emit() calls inside initialize() complete.
-			for (let i = 0; i < 5; i++) await Promise.resolve();
+			// The drained emits inside initialize() are fire-and-forget and run one at a time per
+			// extension; one loop turn lets their microtask chain finish.
+			const drained = Promise.withResolvers<void>();
+			setImmediate(drained.resolve);
+			await drained.promise;
 
 			const events = fs
 				.readFileSync(eventsPath, "utf8")
@@ -3211,6 +5045,132 @@ describe("ExtensionRunner", () => {
 			);
 			// A fresh chain at depth 0 is unaffected by another chain's depth.
 			await expect(runner.invokeNativeTool("bash", { command: "echo hi" }, { depth: 0 })).resolves.toBeDefined();
+		});
+	});
+
+	describe("input attachment transforms", () => {
+		const inputRunner = (handler: (event: InputEvent) => InputEventResult): ExtensionRunner => {
+			const extensionPath = path.join(extensionsDir, "input-transform.ts");
+			const extension: Extension = {
+				path: extensionPath,
+				resolvedPath: extensionPath,
+				handlers: new Map([["input", [async (...args: unknown[]) => handler(args[0] as InputEvent)]]]),
+				tools: new Map(),
+				assistantThinkingRenderers: [],
+				assistantTextRenderers: [],
+				transcriptPresenters: [],
+				linkSchemes: [],
+				fileWriteFallbackHandlers: [],
+				fileDeleteFallbackHandlers: [],
+				messageRenderers: new Map(),
+				composerShapes: new Map(),
+				commands: new Map(),
+				flags: new Map(),
+				shortcuts: new Map(),
+			};
+			return new ExtensionRunner([extension], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+		};
+
+		it("applies image-only removal independently of text", async () => {
+			const runner = inputRunner(() => ({ images: [] }));
+			const image: ImageContent = { type: "image", mimeType: "image/png", data: "aW1hZ2U=" };
+
+			expect(await runner.emitInput("keep text", [image], "interactive")).toEqual({ images: [] });
+		});
+
+		it("omits unchanged images from a text-only transform result", async () => {
+			const runner = inputRunner(event => ({ text: event.text.toUpperCase() }));
+			const image: ImageContent = { type: "image", mimeType: "image/png", data: "aW1hZ2U=" };
+
+			expect(await runner.emitInput("rewrite me", [image], "interactive")).toEqual({ text: "REWRITE ME" });
+		});
+	});
+
+	describe("context prompt caching", () => {
+		it("anchors Anthropic rolling breakpoints on persisted history behind injected messages", async () => {
+			const extensionCode = `
+				export default function(pi) {
+					const name = import.meta.path.endsWith("inject-a.ts") ? "a" : "b";
+					pi.on("context", async event => ({
+						messages: [...event.messages.map(message => ({ ...message })), {
+							role: "custom",
+							customType: "collab-prompt",
+							content: "<probe-" + name + ">",
+							display: false,
+							attribution: "user",
+							timestamp: Date.now(),
+						}],
+					}));
+				}
+			`;
+			await Bun.write(path.join(extensionsDir, "inject-a.ts"), extensionCode);
+			await Bun.write(path.join(extensionsDir, "inject-b.ts"), extensionCode);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const model = getBundledModel<"anthropic-messages">("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic model to exist");
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "persisted user", timestamp: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "persisted assistant" }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: model.id,
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 2,
+				},
+			];
+			const transformed = await runner.emitContext(messages);
+			let body: MessageCreateParams | undefined;
+			const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
+				body = JSON.parse(String(init?.body ?? "{}")) as MessageCreateParams;
+				return new Response(
+					JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
+					{ status: 400, headers: { "Content-Type": "application/json" } },
+				);
+			}) as typeof fetch;
+
+			await streamAnthropic(
+				model,
+				{
+					systemPrompt: ["system"],
+					messages: convertToLlm(wrapSteeringForModel(transformed)),
+					tools: [
+						{
+							name: "lookup",
+							description: "Lookup a value",
+							parameters: { type: "object", properties: {}, additionalProperties: false },
+						},
+					],
+				},
+				{ apiKey: "sk-ant-api-test", fetch: fetchMock },
+			)
+				.result()
+				.catch(() => undefined);
+			if (!body) throw new Error("Expected Anthropic wire body");
+
+			const cachedTexts = body.messages.flatMap(message => {
+				if (!Array.isArray(message.content)) return [];
+				return message.content.flatMap(block =>
+					"cache_control" in block && block.cache_control != null && block.type === "text" ? [block.text] : [],
+				);
+			});
+			expect(cachedTexts).toEqual(["persisted user", "persisted assistant"]);
 		});
 	});
 });

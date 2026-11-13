@@ -7,10 +7,10 @@ import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
-import { zip } from "@oh-my-pi/pi-coding-agent/utils/zip";
 import * as scrapers from "@oh-my-pi/pi-coding-agent/web/scrapers/types";
 import * as scraperUtils from "@oh-my-pi/pi-coding-agent/web/scrapers/utils";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { encodeArchive } from "@oh-my-pi/pi-utils/ar";
 
 function makeSession(testDir: string): ToolSession {
 	const sessionFile = path.join(testDir, "session.jsonl");
@@ -112,10 +112,10 @@ describe("read URL binary dispatch", () => {
 	});
 
 	it("lists a remote zip instead of dumping decoded bytes", async () => {
-		const zipBytes = zip({
-			"root.txt": Buffer.from("root file\n"),
-			"nested/data.txt": Buffer.from("nested file\n"),
-		});
+		const zipBytes = await encodeArchive("zip", [
+			["root.txt", "root file\n"],
+			["nested/data.txt", "nested file\n"],
+		]);
 		const url = uniqueUrl("archive", ".zip");
 		stubUrlBytes(zipBytes, "application/octet-stream");
 
@@ -129,6 +129,31 @@ describe("read URL binary dispatch", () => {
 		expect(text).toContain("nested/");
 		expect(text).not.toContain("PK\u0003\u0004");
 		expect(text).not.toContain("�");
+	});
+
+	it("downloads a generic-MIME convertible document body only once", async () => {
+		const url = uniqueUrl("report", ".pdf");
+		const bodyReads: string[] = [];
+		const loadPage = vi.spyOn(scrapers, "loadPage").mockImplementation(async (requestedUrl, options) => {
+			const contentType = "application/octet-stream";
+			if (options?.skipBodyForContentType?.(contentType)) {
+				return { ok: true, status: 200, finalUrl: requestedUrl, contentType, content: "", bodySkipped: true };
+			}
+			bodyReads.push(requestedUrl);
+			return { ok: true, status: 200, finalUrl: requestedUrl, contentType, content: "%PDF-1.4 binary" };
+		});
+		const fetchBinary = vi
+			.spyOn(scraperUtils, "fetchBinary")
+			.mockImplementation(async () => ({ ok: false, error: "offline" }));
+
+		const tool = new ReadTool(makeSession(testDir));
+		const result = await tool.execute("read-url-generic-pdf", { path: url });
+
+		expect(loadPage).toHaveBeenCalledTimes(1);
+		expect(bodyReads).toEqual([]);
+		// One download even when it fails: the binary fallback reuses the conversion attempt.
+		expect(fetchBinary).toHaveBeenCalledTimes(1);
+		expect(textOutput(result).split("Binary fetch failed: offline").length - 1).toBe(1);
 	});
 
 	it("returns a metadata notice when a hinted binary refetch fails", async () => {
@@ -214,4 +239,70 @@ describe("read URL binary dispatch", () => {
 		expect(text).toContain("second line");
 		expect(fetchBinarySpy).not.toHaveBeenCalled();
 	});
+
+	it("renders HTML when a binary-looking identity response is valid text on refetch", async () => {
+		const html = `<!DOCTYPE html><html><body><h1>ARTICLE_TITLE</h1>${"<p>Readable article paragraph.</p>".repeat(300)}</body></html>`;
+		const compressed = Bun.gzipSync(new TextEncoder().encode(html));
+		const encodings: string[] = [];
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				if (new URL(request.url).pathname !== "/article") return new Response("Not found", { status: 404 });
+				const encoding = request.headers.get("accept-encoding") ?? "";
+				encodings.push(encoding);
+				const headers: Record<string, string> = { "content-type": "text/html; charset=utf-8" };
+				if (encoding.includes("gzip")) headers["content-encoding"] = "gzip";
+				return new Response(compressed, { headers });
+			},
+		});
+
+		try {
+			const tool = new ReadTool(makeSession(testDir));
+			const result = await tool.execute("read-url-gzip-html", { path: `http://127.0.0.1:${server.port}/article` });
+			const text = textOutput(result);
+
+			expect(encodings[0]).toBe("identity");
+			expect(encodings[1]).toContain("gzip");
+			expect(result.details?.method).not.toBe("binary");
+			expect(text).toContain("ARTICLE_TITLE");
+			expect(text).toContain("Readable article paragraph.");
+			expect(text).not.toContain("[Binary content:");
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	for (const { charset, encoding, title } of [
+		{ charset: "utf-16le", encoding: "utf16le", title: "Северный чай" },
+		{ charset: "windows-1252", encoding: "latin1", title: "Café résumé" },
+	] as const) {
+		it(`renders refetched ${charset} HTML using its HTTP charset`, async () => {
+			const html = `<!DOCTYPE html><html><body><h1>${title}</h1>${"<p>Readable article paragraph.</p>".repeat(300)}</body></html>`;
+			const compressed = Bun.gzipSync(Buffer.from(html, encoding));
+			const server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(request) {
+					if (new URL(request.url).pathname !== "/article") return new Response("Not found", { status: 404 });
+					const headers: Record<string, string> = { "content-type": "text/html" };
+					if (request.headers.get("accept-encoding")?.includes("gzip")) {
+						headers["content-type"] = `text/html; charset=${charset}`;
+						headers["content-encoding"] = "gzip";
+					}
+					return new Response(compressed, { headers });
+				},
+			});
+
+			try {
+				const result = await new ReadTool(makeSession(testDir)).execute("read-url-charset-html", {
+					path: `http://127.0.0.1:${server.port}/article`,
+				});
+				expect(result.details?.method).not.toBe("binary");
+				expect(textOutput(result)).toContain(title);
+			} finally {
+				server.stop(true);
+			}
+		});
+	}
 });

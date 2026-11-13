@@ -1,6 +1,9 @@
 import * as path from "node:path";
-import { theme } from "../modes/theme/theme";
-import { expandPath, normalizeLocalScheme } from "../tools/path-utils";
+import { postmortem } from "@oh-my-pi/pi-utils";
+import { theme } from "@oh-my-pi/pi-tui/theme";
+import { extractUriScheme } from "../internal-urls/parse";
+import { InternalUrlRouter } from "../internal-urls/router";
+import { expandPath } from "../tools/path-utils";
 import type { HookUIContext } from "./hooks/types";
 
 /**
@@ -11,10 +14,9 @@ import type { HookUIContext } from "./hooks/types";
  */
 export function resolvePath(filePath: string, cwd: string): string {
 	const expanded = expandPath(filePath);
-	const expandedAndNormalized = normalizeLocalScheme(expanded);
-	if (expandedAndNormalized.startsWith("local://")) {
+	if (InternalUrlRouter.instance().canHandle(expanded)) {
 		throw new Error(
-			`Path "${filePath}" uses internal scheme "local://" and must be resolved through the proper protocol handler, not as a filesystem path.`,
+			`Path "${filePath}" uses internal scheme "${extractUriScheme(expanded)}://" and must be resolved through the proper protocol handler, not as a filesystem path.`,
 		);
 	}
 	if (path.isAbsolute(expanded)) {
@@ -115,12 +117,19 @@ function guardedExit(alias: ExitAliasName): (code?: number | string) => never {
 
 export async function withHostGuard<T>(fn: () => Promise<T>): Promise<T> {
 	if (hostGuardDepth === 0) {
+		// Stamp each throwing replacement with the native primitive it shadows so
+		// host-owned shutdown (postmortem's signal/fatal handlers) can still exit
+		// through the real exit even while this guard window is open (#6488).
 		hostGuardOriginalProcessExit = process.exit;
-		process.exit = guardedExit("process.exit") as typeof process.exit;
+		const processExitGuard = guardedExit("process.exit") as typeof process.exit;
+		Reflect.set(processExitGuard, postmortem.NATIVE_PROCESS_EXIT, hostGuardOriginalProcessExit);
+		process.exit = processExitGuard;
 
 		if (typeof process.reallyExit === "function") {
 			hostGuardOriginalReallyExit = process.reallyExit;
-			process.reallyExit = guardedExit("process.reallyExit") as typeof process.reallyExit;
+			const reallyExitGuard = guardedExit("process.reallyExit") as typeof process.reallyExit;
+			Reflect.set(reallyExitGuard, postmortem.NATIVE_PROCESS_EXIT, hostGuardOriginalReallyExit);
+			process.reallyExit = reallyExitGuard;
 		}
 
 		const stdin = process.stdin;

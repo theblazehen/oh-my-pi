@@ -1,9 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import type { Tool } from "@oh-my-pi/pi-ai/types";
 import { isArkSchema, toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
-import { type } from "arktype";
-import { z } from "zod/v4";
 
 // ---------------------------------------------------------------------------
 // Phase-1 parity gate: ArkType schemas must flow through the same wire-emission
@@ -36,8 +35,7 @@ describe("isArkSchema", () => {
 		expect(isArkSchema(type("string"))).toBe(true);
 	});
 
-	it("rejects Zod schemas, JSON Schema objects, and non-objects", () => {
-		expect(isArkSchema(z.object({ a: z.string() }))).toBe(false);
+	it("rejects JSON Schema objects and non-objects", () => {
 		expect(isArkSchema({ type: "object", properties: {} })).toBe(false);
 		expect(isArkSchema(null)).toBe(false);
 		expect(isArkSchema(undefined)).toBe(false);
@@ -69,30 +67,6 @@ describe("arkToWireSchema — emission", () => {
 	it("never emits the $schema metadata key", () => {
 		expect(toolWireSchema(plainTool).$schema).toBeUndefined();
 		expect(toolWireSchema(rejectTool).$schema).toBeUndefined();
-	});
-
-	it("emits a wire structurally equal to the plain-Zod equivalent", () => {
-		const zodTwin: Tool = {
-			name: "zod-plain",
-			description: "",
-			parameters: z.object({
-				name: z.string().describe("the display name"),
-				count: z.number().describe("how many items"),
-				nested: z.object({ inner: z.string().describe("inner value") }).describe("a nested object"),
-			}),
-		};
-		// Normalize key + array ordering (semantically irrelevant to JSON Schema).
-		const norm = (x: unknown): unknown =>
-			Array.isArray(x)
-				? [...x].map(norm).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
-				: x && typeof x === "object"
-					? Object.fromEntries(
-							Object.keys(x as Record<string, unknown>)
-								.sort()
-								.map(k => [k, norm((x as Record<string, unknown>)[k])]),
-						)
-					: x;
-		expect(norm(toolWireSchema(plainTool))).toEqual(norm(toolWireSchema(zodTwin)));
 	});
 });
 
@@ -160,10 +134,10 @@ describe("validateToolArguments — ArkType contracts", () => {
 		const zodTwin: Tool = {
 			name: "zod-plain",
 			description: "",
-			parameters: z.object({
-				name: z.string(),
-				count: z.number(),
-				nested: z.object({ inner: z.string() }),
+			parameters: type({
+				name: type("string"),
+				count: type("number"),
+				nested: type({ inner: type("string") }),
 			}),
 		};
 		const zodResult = validateToolArguments(zodTwin, {

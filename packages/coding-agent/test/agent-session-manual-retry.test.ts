@@ -1,6 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { type } from "@oh-my-pi/omptype";
+import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -8,6 +9,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -23,11 +25,13 @@ describe("AgentSession manual retry", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
 	let session: AgentSession | undefined;
+	let modelRegistry: ModelRegistry;
 
-	beforeEach(async () => {
+	beforeAll(async () => {
 		tempDir = TempDir.createSync("@pi-manual-retry-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		modelRegistry = new ModelRegistry(authStorage);
 	});
 
 	afterEach(async () => {
@@ -35,6 +39,9 @@ describe("AgentSession manual retry", () => {
 			await session.dispose();
 			session = undefined;
 		}
+	});
+
+	afterAll(() => {
 		authStorage.close();
 		tempDir.removeSync();
 	});
@@ -65,7 +72,7 @@ describe("AgentSession manual retry", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
 		});
 		session.subscribe(() => {});
 
@@ -104,7 +111,7 @@ describe("AgentSession manual retry", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
 		});
 		session.subscribe(() => {});
 
@@ -150,7 +157,7 @@ describe("AgentSession manual retry", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
 		});
 		session.subscribe(() => {});
 
@@ -162,6 +169,7 @@ describe("AgentSession manual retry", () => {
 		expect(messages.at(-1)?.role).toBe("toolResult");
 		const failedAssistant = messages.findLast(m => m.role === "assistant") as AssistantMessage;
 		expect(failedAssistant.stopReason).toBe("error");
+		expect(session.hasAbortedToolCallTail).toBe(true);
 
 		await expect(session.retry()).resolves.toBe(true);
 		await session.waitForIdle();
@@ -172,6 +180,278 @@ describe("AgentSession manual retry", () => {
 			type: "text",
 			text: "recovered after stalled tool call",
 		});
+	});
+
+	it("reports an aborted tool-call tail only when the failed turn ended on a tool call", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const mock = createMockModel({ responses: [] });
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
+			modelRegistry,
+		});
+		session.subscribe(() => {});
+
+		const zeroUsage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const user = { role: "user", content: "run the tool", timestamp: Date.now() } as const;
+		const toolTurn: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call_1", name: "bash", arguments: { command: "ls" } }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: zeroUsage,
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		};
+		const abortedBoundary: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: zeroUsage,
+			stopReason: "aborted",
+			errorMessage: "Stopped before model call",
+			timestamp: Date.now(),
+		};
+		const toolResult = (isError: boolean) => ({
+			role: "toolResult" as const,
+			toolCallId: "call_1",
+			toolName: "bash",
+			content: [{ type: "text" as const, text: isError ? "aborted" : "ok" }],
+			isError,
+			timestamp: Date.now(),
+		});
+
+		// Esc landed during tool execution: errored result right before the boundary.
+		agent.replaceMessages([user, toolTurn, toolResult(true), abortedBoundary]);
+		expect(session.hasAbortedToolCallTail).toBe(true);
+
+		// The tool completed; the abort only killed the next model call.
+		agent.replaceMessages([user, toolTurn, toolResult(false), abortedBoundary]);
+		expect(session.hasAbortedToolCallTail).toBe(false);
+
+		// Abort with no tool activity in the turn at all.
+		agent.replaceMessages([user, abortedBoundary]);
+		expect(session.hasAbortedToolCallTail).toBe(false);
+	});
+
+	it("re-executes the aborted tool call instead of re-issuing it via the model", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const toolSchema = type({ value: type("string") });
+		const executed: string[] = [];
+		const probeTool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "probe",
+			label: "Probe",
+			description: "Probe tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return { content: [{ type: "text", text: `ok:${params.value}` }], details: params };
+			},
+		};
+		// One response only: the retry must re-run the tool directly, spending the
+		// single model call on the continuation after the fresh result.
+		const mock = createMockModel({ responses: [{ content: ["done after replay"], stopReason: "stop" }] });
+		const zeroUsage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		// Esc landed during tool execution: complete tool-calling turn, errored
+		// result, aborted boundary.
+		const toolTurn: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call_1", name: "probe", arguments: { value: "again" } }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: zeroUsage,
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		};
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [probeTool],
+				messages: [
+					{ role: "user", content: "run the probe", timestamp: Date.now() },
+					toolTurn,
+					{
+						role: "toolResult",
+						toolCallId: "call_1",
+						toolName: "probe",
+						content: [{ type: "text", text: "Execution interrupted" }],
+						isError: true,
+						timestamp: Date.now(),
+					},
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "" }],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: zeroUsage,
+						stopReason: "aborted",
+						errorMessage: "Interrupted by user",
+						timestamp: Date.now(),
+					},
+				],
+			},
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
+			modelRegistry,
+		});
+		session.subscribe(() => {});
+
+		await expect(session.retry()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		expect(executed).toEqual(["again"]);
+		expect(mock.calls.length).toBe(1);
+		const messages = session.agent.state.messages;
+		expect(messages.map(message => message.role)).toEqual(["user", "assistant", "toolResult", "assistant"]);
+		const replayResult = messages[2];
+		if (replayResult.role !== "toolResult") throw new Error("Expected replayed tool result");
+		expect(replayResult.isError).not.toBe(true);
+		expect(replayResult.content).toContainEqual({ type: "text", text: "ok:again" });
+		expect(lastAgentMessage(session).content).toContainEqual({ type: "text", text: "done after replay" });
+	});
+
+	it("retries an aborted tool-call turn past a background-job result folded in after the interrupt", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const toolSchema = type({ question: type("string") });
+		const executed: string[] = [];
+		const askTool: AgentTool<typeof toolSchema, { question: string }> = {
+			name: "ask",
+			label: "Ask",
+			description: "Ask tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.question);
+				return { content: [{ type: "text", text: "answered" }], details: params };
+			},
+		};
+		const mock = createMockModel({ responses: [{ content: ["retried with job result"], stopReason: "stop" }] });
+		const zeroUsage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		// #17266: the user cancelled `ask`, then a background job finished while
+		// idle and its async-result was folded in behind the aborted boundary.
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [askTool],
+				messages: [
+					{ role: "user", content: "start the job, then ask me", timestamp: Date.now() },
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", id: "call_ask", name: "ask", arguments: { question: "which?" } }],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: zeroUsage,
+						stopReason: "toolUse",
+						timestamp: Date.now(),
+					},
+					{
+						role: "toolResult",
+						toolCallId: "call_ask",
+						toolName: "ask",
+						content: [{ type: "text", text: "Ask tool was cancelled by the user" }],
+						isError: true,
+						timestamp: Date.now(),
+					},
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "" }],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: zeroUsage,
+						stopReason: "aborted",
+						errorMessage: "Interrupted by user",
+						timestamp: Date.now(),
+					},
+					{
+						role: "custom",
+						customType: "async-result",
+						content: "Background job bg_1 finished: build ok",
+						display: true,
+						timestamp: Date.now(),
+					},
+				],
+			},
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
+			modelRegistry,
+		});
+		session.subscribe(() => {});
+
+		expect(session.hasAbortedToolCallTail).toBe(true);
+		await expect(session.retry()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		// A tool replay would cut the job result out of history; the retry
+		// re-attempts the model call with the result still in context instead.
+		expect(executed).toEqual([]);
+		expect(mock.calls.length).toBe(1);
+		const messages = session.agent.state.messages;
+		expect(messages.map(message => message.role)).toEqual(["user", "assistant", "toolResult", "custom", "assistant"]);
+		const delivery = messages[3];
+		expect(delivery.role === "custom" ? delivery.customType : undefined).toBe("async-result");
+		expect(lastAgentMessage(session).content).toContainEqual({ type: "text", text: "retried with job result" });
 	});
 
 	it("retries a persisted failed turn after rebuilding provider context", async () => {
@@ -205,7 +485,7 @@ describe("AgentSession manual retry", () => {
 			agent,
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
 		});
 		session.subscribe(() => {});
 
@@ -247,10 +527,13 @@ describe("AgentSession manual retry", () => {
 			agent: reopenedAgent,
 			sessionManager: reopenedManager,
 			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
-			modelRegistry: new ModelRegistry(authStorage),
+			modelRegistry,
 		});
 		session.subscribe(() => {});
 
+		// Provider context dropped the failed turn, so the tail predicate must
+		// fall back to the persisted display transcript (mirrors retry()).
+		expect(session.hasAbortedToolCallTail).toBe(true);
 		await expect(session.retry()).resolves.toBe(true);
 		await session.waitForIdle();
 		expect(session.agent.state.messages.map(message => message.role)).toEqual(["user", "assistant"]);
@@ -261,5 +544,82 @@ describe("AgentSession manual retry", () => {
 			type: "text",
 			text: "recovered after session reopen",
 		});
+	});
+
+	it("lets an idle aside start a turn after the user resumes an interrupted run with retry", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const toolSchema = type({});
+		const firstRunStarted = Promise.withResolvers<void>();
+		let probeRuns = 0;
+		const probeTool: AgentTool<typeof toolSchema> = {
+			name: "probe",
+			label: "Probe",
+			description: "Probe tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, _params, signal) {
+				probeRuns++;
+				if (probeRuns === 1) {
+					// Blocks until the user interrupt aborts it, like a pending `ask`.
+					const aborted = Promise.withResolvers<never>();
+					signal?.addEventListener("abort", () => aborted.reject(new Error("aborted")), { once: true });
+					firstRunStarted.resolve();
+					await aborted.promise;
+				}
+				return { content: [{ type: "text", text: "probed" }] };
+			},
+		};
+		const mock = createMockModel({
+			handler: context => {
+				const transcript = JSON.stringify(context.messages);
+				if (transcript.includes("LATE_ASIDE")) return { content: ["handled late aside"] };
+				if (context.messages.at(-1)?.role === "user") {
+					return { content: [{ type: "toolCall", name: "probe", arguments: {} }] };
+				}
+				if (transcript.includes("probed")) return { content: ["done after retry"] };
+				// The interrupted run's follow-up call after the aborted tool; the abort cancels it.
+				return { content: ["unreachable"], delayMs: 60_000 };
+			},
+		});
+		const agent = new Agent({
+			convertToLlm,
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [probeTool], messages: [] },
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
+			modelRegistry,
+			toolRegistry: new Map([[probeTool.name, probeTool]]),
+		});
+		session.subscribe(() => {});
+
+		// The user presses Esc while the tool runs, then resumes with /retry.
+		const run = session.prompt("run the probe");
+		await firstRunStarted.promise;
+		await session.abort({ reason: USER_INTERRUPT_LABEL });
+		await run.catch(() => {});
+		await session.waitForIdle();
+		await expect(session.retry()).resolves.toBe(true);
+		await session.waitForIdle();
+		expect(probeRuns).toBe(2);
+		expect(lastAgentMessage(session).content).toContainEqual({ type: "text", text: "done after retry" });
+
+		// The resumed run finished; a late aside must wake the agent, not stay folded
+		// as if the earlier interrupt were still in effect.
+		const dispatched = await session.sendCustomMessage(
+			{ customType: "ext-aside", content: "LATE_ASIDE", display: false, attribution: "agent" },
+			{ deliverAs: "aside" },
+		);
+		await session.waitForIdle();
+
+		expect(dispatched).toBe(true);
+		expect(mock.calls.filter(call => JSON.stringify(call.context.messages).includes("LATE_ASIDE"))).toHaveLength(1);
+		expect(lastAgentMessage(session).content).toContainEqual({ type: "text", text: "handled late aside" });
 	});
 });

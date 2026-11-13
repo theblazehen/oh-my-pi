@@ -1,204 +1,193 @@
 # edit
 
-> Applies source edits; default mode is the hashline patch language consumed from a single `input` string.
+> Applies source edits. The default `hashline` mode consumes one line-anchored patch string and edits existing files directly.
 
 ## Source
-- Entry: `packages/coding-agent/src/edit/index.ts`
-- Model-facing prompt: `packages/hashline/src/prompt.md`
-- Key collaborators:
-  - `packages/coding-agent/src/utils/edit-mode.ts` — selects active edit mode
-  - `packages/hashline/src/grammar.lark` — canonical constrained-decoding grammar
-  - `packages/hashline/src/format.ts` — sigils and header constants (`[`, `]`, `#`, `+`, `SWAP`, `CUT`, `INS`, `PASTE`)
-  - `packages/hashline/src/input.ts` — parses `[PATH#TAG]` sections
-  - `packages/hashline/src/tokenizer.ts` / `packages/hashline/src/parser.ts` — tokenizes and parses ops
-  - `packages/hashline/src/apply.ts` — applies parsed edits to file text
-  - `packages/hashline/src/mismatch.ts` — stale-anchor mismatch formatting
-  - `packages/hashline/src/recovery.ts` — snapshot-based stale-anchor recovery
-  - `packages/hashline/src/snapshots.ts` — mints and resolves per-path opaque snapshot tags
 
-## Inputs
+- Entry and mode registration: `packages/coding-agent/src/edit/index.ts`
+- Mode schemas: `packages/coding-agent/src/edit/schemas.ts`
+- Model-facing prompts: `crates/pi-edit/prompts/`; compact hashline variant: `packages/coding-agent/src/edit/hashline-compact.md`
+- Constrained-decoding grammars: `crates/pi-edit/grammars/`
+- Native bridge: `crates/pi-natives/src/edit.rs` — `EditSession`, `EditStore`, inspection, prompt/grammar exports
+- Hashline parser/application: `crates/pi-edit/src/modes/hashline/`
+- Snapshot/register state: `crates/pi-edit/src/store.rs`; staging, streaming previews, and result shaping: `crates/pi-edit/src/session.rs`
+- Host writes, LSP integration, and parse-regression handling: `packages/coding-agent/src/edit/index.ts`
+- Mode selection/settings: `packages/coding-agent/src/utils/edit-mode.ts`, `packages/coding-agent/src/edit/settings.ts`
 
-### Hashline mode (default)
+## Mode selection and availability
 
-| Field | Type | Required | Description |
-| --- | --- | --- | --- |
-| `input` | `string` | Yes | One or more file sections. Anchored sections must start with `[PATH#TAG]`; `TAG` is the four-hex snapshot tag emitted by the latest `read`/`grep`/`write`/successful `edit`. Optional `*** Begin Patch` / `*** End Patch` envelope is ignored if present. |
+`edit` is an essential built-in tool. `resolveEditMode()` selects the active wire contract in this order:
 
-Patch language inside `input`:
+1. model-specific configured variant;
+2. `PI_EDIT_VARIANT`;
+3. `edit.mode`;
+4. default `hashline`.
 
-- **File header**: `[PATH#TAG]`. `TAG` is four uppercase-hex chars — a content-derived hash of the whole normalized file (`computeFileHash()`), recorded in the session snapshot store.
-- **Operations**:
-  - `SWAP N.=M:` — replace original lines N.=M with the body rows below.
-  - `SWAP.BLK N:` — replace the whole tree-sitter block beginning on line N (its header line through its closing line) with the body rows. The line span is resolved at apply time from the file's parse tree; point N at the line that opens the construct. The resolved span is exactly the node that begins on line N — a leading decorator, attribute, or doc-comment is a separate node and is not included; point N at the first decorator line (Python wraps `@dec` + `def` as one block) or fall back to `SWAP N.=M:` to take a leading line-comment that parses as its own node (e.g. Rust `///`). On success the result echoes the matched span (`SWAP.BLK N → resolved lines A-B`). Errors (and steers to `SWAP N.=M:`) when the language is unsupported, line N is blank or a closing delimiter, no node begins there, or the resolved block has a syntax error.
-  - `CUT N.=M` — delete original lines N.=M and capture them in the clipboard. No body. A standalone cut is valid; the latest cut replaces the clipboard contents.
-  - `CUT.BLK N` — delete and capture the whole tree-sitter block beginning on line N (resolved like `SWAP.BLK N`, with the same decorator/comment caveat). No body. On success the result echoes the matched span (`CUT.BLK N → resolved lines A-B`). Same resolution failure modes and `CUT N.=M` fallback.
-  - `INS.PRE N:` — insert body rows immediately before line N.
-  - `INS.POST N:` — insert body rows immediately after line N.
-  - `INS.BLK.POST N:` — insert body rows after the last line of the tree-sitter block beginning on line N. Point N at the line that opens the construct, never its closing delimiter / last visible line; if you can see the last line already, use plain `INS.POST M:`. An anchor that can't resolve to a block is lowered to plain `INS.POST N:` with a warning instead of failing the patch.
-  - **Markdown sections**: tree-sitter-md nests a heading and its body (including deeper subsections) in one `section` node, so all four block ops anchored on a `#`/`##`/`###` heading line resolve the whole section — heading through every nested deeper heading, up to the next same-or-higher heading. `CUT.BLK` drops and captures the section, `SWAP.BLK` rewrites it, and `INS.BLK.POST` / `PASTE.BLK.POST` land after it. A heading with no body resolves to a single line and is rejected with guidance to use the corresponding plain line op.
-  - `INS.HEAD:` — insert body rows at the start of the file.
-  - `INS.TAIL:` — insert body rows at the end of the file.
-  - `PASTE.PRE N` / `PASTE.POST N` / `PASTE.HEAD` / `PASTE.TAIL` — insert the clipboard at that position. No body. An empty clipboard is an error.
-  - `PASTE.BLK.POST N` — insert the clipboard after the resolved block's last line. An unresolvable anchor lowers to `PASTE.POST N` with a warning, matching `INS.BLK.POST`.
-  - **Clipboard**: operations execute top-to-bottom across all patch sections. The latest `CUT` wins; `PASTE` does not consume the clipboard and may be repeated. The coding agent persists the register across edit calls in the same session, enabling cross-file moves. Keep each path under one header when clipboard operations would otherwise be interleaved around another file's section.
-- **Body rows**:
-  - Only body-bearing headers end in `:`.
-  - Every body row is `+TEXT`; `+` alone adds a blank line.
-  - `CUT` and `PASTE` never have body rows.
-  - There is no repeat row kind. To keep a line, leave it out of every range; split edits into multiple hunks when needed.
-  - `-` rows are invalid. Literal Markdown bullets or text beginning with `-` / `+` must be written as `+- item` / `++ item`.
+Supported modes are `hashline`, `apply_patch`, `patch`, `replace`, and `sloppy`. `edit.mode: none` (or `PI_EDIT_VARIANT=none`) instead unregisters `edit`, wins over `edit.modelVariants`, turns off hashline anchors, and keeps `bash` registered regardless of `bash.enabled`; explicit tool lists still get `bash` only when they name it. `edit.modelVariants` uses the first case-insensitive substring match against the active model string. `PI_EDIT_VARIANT` pins the mode exactly; for settings-derived `hashline`, `PI_STRICT_EDIT_MODE` disables the model-family fallback to `replace` (Kimi, MiMo, MiniMax, DeepSeek, StepFun, Codex Spark, and GLM 5.3 Flash).
 
-Anchors come from `read`/`grep` output. `read` emits a `[PATH#TAG]` header from the session snapshot store and lines as `LINE:TEXT`; copy the header into the edit section and copy only the line number into hunk headers.
+This page primarily documents hashline. The schema, prompt, examples, renderer, and optional Lark format switch with the mode. Models with `editPromptVariant: "compact"` receive the compact hashline prompt. In `apply_patch` custom-tool mode the wire name is `apply_patch`; dispatch still reaches the same internal tool. The tool is strict, essential, and uses exclusive concurrency.
 
-### Tolerated input shapes (lenient parsing)
+## Input
 
-The canonical grammar is strict, but the hand parser accepts a few non-dangerous variants:
+| Field   | Type     | Required | Description                                                                                                                                                                                                      |
+| ------- | -------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `input` | `string` | Yes      | One or more `[PATH#TAG]` sections containing hashline operations. The strict custom-tool grammar wraps the sections in `*** Begin Patch` / `*** End Patch`; the normal parser also accepts an unwrapped payload. |
 
-- `SWAP N:` — accepted as `SWAP N.=N:`.
-- `CUT N` — accepted as a single-line cut/delete.
-- Missing trailing colon on `SWAP` or `INS` — accepted.
-- `SWAP N-M:`, `SWAP N…M:`, `SWAP N M:`, and legacy `SWAP N..M:` — accepted as `SWAP N.=M:`.
-- Bare body rows with no `+` prefix are auto-prepended with `+` and a `BARE_BODY_AUTO_PIPED_WARNING` is appended.
-- Bare `-` body rows are judged once the whole hunk body is known: when every `-` row is Markdown-bullet-shaped (`- item`) and the body is either fully bare or contains an explicit `+- item` sibling, the rows are kept as literal content and `MINUS_BULLET_AUTO_PIPED_WARNING` is appended; otherwise they are rejected as unified-diff contamination (see Errors).
-- `*** Begin Patch` / `*** End Patch` envelopes are silently consumed. `*** Abort` terminates parsing silently — ops parsed before the marker still apply, no warning surfaced.
-- Some malformed bracketed headers are recovered after stripping apply-patch path noise such as `Update File:` / `Add File:` and extra `***`, but the recovered header still needs a valid four-hex tag for the patcher to apply it.
-- `*** Update File:` / `*** Add File:` / `*** Delete File:` / `*** Move to:` apply_patch sentinels inside the diff body throw an `apply_patch sentinel … is not valid in hashline` error.
-- `@@`-bracketed hunk headers are rejected with guidance to write a verb header.
-- Bare `N` and bare `N M` / `N.=M` headers are rejected with guidance to write `SWAP` or `CUT`.
-- A trailing colon on `CUT N.=M:` / `CUT.BLK N:` is tolerated and ignored, but body rows under `CUT`, `CUT.BLK`, or any `PASTE` form are rejected.
-- Bare `PASTE` is rejected because the insertion position is required.
-- Empty `INS` / `SWAP.BLK` hunks are rejected; an empty `SWAP N.=M:` deletes the range, though `CUT N.=M` is the canonical deletion form.
-- `-` body rows are rejected with `MINUS_ROW_REJECTED` unless the hunk is unambiguously a Markdown bullet list (see Tolerated input shapes).
-- `SWAP.BLK N:` / `CUT.BLK N` / `INS.BLK.POST N:` / `PASTE.BLK.POST N` consult the wired tree-sitter resolver. `SWAP.BLK` and `INS.BLK.POST` need at least one `+TEXT` body row; `CUT.BLK` and `PASTE.BLK.POST` take none. A null resolution rejects `SWAP.BLK` / `CUT.BLK` on the apply or final-preview path (the streaming preview silently drops it), while `INS.BLK.POST` / `PASTE.BLK.POST` lower to the corresponding plain `POST` form with a warning. A single-line resolution rejects every block form with guidance to use its plain line equivalent.
-
-## Outputs
-- Single-shot tool result; hashline mode does not use the staged preview/apply devices (`/xdev/resolve`, `/xdev/reject`).
-- `content` contains one text block per call. For a successful single-file edit it is the post-edit `[path#TAG]` section header (a fresh snapshot tag for the written content), followed by a compact diff preview from `packages/hashline/src/diff-preview.ts` when one is emitted.
-- When the patch used `SWAP.BLK` / `CUT.BLK` / `INS.BLK.POST` / `PASTE.BLK.POST` ops (and the apply matched the tagged content), one `<OP> N → resolved lines A-B (K lines)` line per block op is inserted between the `[PATH#TAG]` header and the diff preview. Single-line spans render `resolved line A (1 line)`; `INS.BLK.POST` appends `body lands after line B`, and `PASTE.BLK.POST` appends `clipboard lands after line B`.
-- Parse, apply, or recovery warnings are appended as:
+Each section edits one existing file and MUST copy the four-uppercase-hex snapshot tag from the latest anchored `read`, `grep`, or successful `edit` result:
 
 ```text
-Warnings:
-...
+[src/example.ts#1A2B]
+PUT 4.=4:
++const value = 2;
 ```
 
-- `details` is `EditToolDetails` from `packages/coding-agent/src/edit/renderer.ts`:
-  - `diff`: unified diff string
-  - `firstChangedLine`: first changed post-edit line
-  - `diagnostics`: LSP/format result if available
-  - `op`: `"create"` or `"update"` for hashline mode
-  - `meta`: output metadata
-  - `perFileResults`: present for multi-section input
-- Multi-section input returns one aggregated result with combined text and per-file details.
+Use `write` to create or wholly overwrite a file. Hashline rejects untagged anchored edits at application time.
 
-## Worked examples
+## Canonical patch language
 
-Reference file (the exact shape `read` returns):
+All line numbers refer to the original tagged snapshot, not to earlier hunks in the same call.
+
+| Form                                             | Effect                                                                                                                                                    |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PUT N.=M:`                                      | Replace inclusive original lines `N..M` with the following `+TEXT` rows.                                                                                  |
+| `PUT N*:`                                        | Replace the multi-line syntactic block beginning on line `N`.                                                                                             |
+| `PUT <N:` / `PUT >N:`                            | Insert body rows immediately before / after line `N`. `PUT <1:` is file head.                                                                             |
+| `PUT >$:`                                        | Append body rows at file tail.                                                                                                                            |
+| `PUT >N*:`                                       | Insert after the syntactic block beginning on line `N`.                                                                                                   |
+| `CUT N.=M` / `CUT N*`                            | Delete and capture an inclusive range or resolved block. Add `@name` to write a named register.                                                           |
+| `PUT <N` / `PUT >N` / `PUT >$`                   | Paste the anonymous register into a gap.                                                                                                                  |
+| `PUT <N @name` / `PUT >N @name` / `PUT >$ @name` | Paste a named register into a gap.                                                                                                                        |
+| `PUT N.=M @name` / `PUT N* @name`                | Replace a range or block with a named register. Named registers are required for span/block paste.                                                        |
+| `REM`                                            | Delete the section file.                                                                                                                                  |
+| `MV DEST`                                        | Write the edited file to the destination, then delete the source. Existing destination contents can be overwritten; quote destinations containing spaces. |
+
+Register names contain ASCII letters, digits, `_`, or `-`. The anonymous register is batch-local and starts empty on every call. Named registers persist for the session and are published only after their writes land. Operations run top-to-bottom across sections, so a cut in an earlier section can feed a later paste. Repeating a paste does not consume its register.
+
+Only body-bearing `PUT ...:` headers take body rows. Every body row is `+TEXT`; `+` alone inserts a blank line. The body is final content, never a unified-diff before/after pair. Literal content beginning with `-` or `+` is written as `+-...` or `++...`. `CUT`, register-backed `PUT`, `REM`, and `MV` take no body.
+
+### Block anchors
+
+Block forms resolve from the opening line through the tree-sitter node's end. Anchor the construct opener, never a closing delimiter, last visible line, blank line, or inner statement. A single-line node is rejected with guidance to use the corresponding explicit-line operation. `PUT >N*:` lowers to ordinary `PUT >N:` with a warning when no block resolves; replace/cut block forms fail instead of guessing.
+
+Leading decorators, attributes, and doc-comments may be separate syntax nodes. Anchor the first decorator when the parser groups it with the declaration; otherwise use an explicit range. Standalone line comments are not swept automatically. In Markdown, a heading's block includes its body and deeper subsections through the next heading of equal or higher level.
+
+Use tight ranges and separate non-adjacent changes. Do not use `edit` merely to reformat or restyle code; run the project's formatter after the substantive edit.
+
+## Examples
+
+Given:
 
 ```text
-[a.ts#0A3B]
-1:const X = "a";
-2:const Y = X;
-3:
-4:console.log(X);
-5:console.log(Y);
-6:export { X, Y };
+[greet.py#A1B2]
+1:@cache
+2:def greet(name):
+3:    print("Hello, " + name)
+4:
+5:greet("world")
 ```
 
-Replace line 1 with two lines:
+Replace the decorated function without touching its caller:
 
 ```text
-[a.ts#0A3B]
-SWAP 1.=1:
-+const X = "b";
-+export const Y = X;
+*** Begin Patch
+[greet.py#A1B2]
+PUT 1*:
++@cache
++def greet(name):
++    print(f"Hi, {name}")
+*** End Patch
 ```
 
-Insert below line 5:
+Move it to another previously-read file using a named register:
 
 ```text
-[a.ts#0A3B]
-INS.POST 5:
-+console.log(X + Y);
+*** Begin Patch
+[greet.py#A1B2]
+CUT 1* @fn
+[lib/greet.py#3C4D]
+PUT <1 @fn
+*** End Patch
 ```
 
-Insert above line 5:
+Rename after editing:
 
 ```text
-[a.ts#0A3B]
-INS.PRE 5:
-+console.log(X + Y);
+*** Begin Patch
+[greet.py#A1B2]
+PUT 5.=5:
++greet("team")
+MV lib/welcome.py
+*** End Patch
 ```
 
-Delete lines 4.=5 entirely and leave them in the clipboard:
+## Other wire contracts
 
-```text
-[a.ts#0A3B]
-CUT 4.=5
-```
+| Mode          | Parameters                                                                                        | Edit form                                                                                                                 |
+| ------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `replace`     | `path`, `old_string`, `new_string`, optional `replace_all`                                        | Replace quoted text in one file.                                                                                          |
+| `patch`       | `path`, `edits: Array<{ op?: "create" \| "delete" \| "update"; rename?: string; diff?: string }>` | Patch entries all target the top-level `path`; separate calls for different files.                                        |
+| `apply_patch` | `input`                                                                                           | Combined `*** Begin Patch` payload with `*** Add File`, `*** Update File`, `*** Move to`, and `*** Delete File` sections. |
+| `sloppy`      | `input`                                                                                           | `*** Edit File: path`, then `*** Find` plus `*** Replace`, `*** Insert Before`, or `*** Insert After`.                    |
 
-Insert at start and end of file:
+`sloppy` uses existing-text anchors, not snapshot tags. Find must identify one match unless the file header ends in ` all`; bare `*** Edit File:` continues the current target. Bodies are raw text, without diff prefixes or closing markers. `…` in Find captures omitted text; Replace re-emits those captures in order. Insert keeps the anchor and treats `…` literally. Every pair addresses the original file; matching/validation failures occur before writes.
 
-```text
-[a.ts#0A3B]
-INS.HEAD:
-+// header
-INS.TAIL:
-+// trailer
-```
+The mode prompts in `crates/pi-edit/prompts/` define the full syntax.
 
-Move line 4 from `src/a.ts` to after line 20 in `src/b.ts`:
-```text
-[src/a.ts#0A3B]
-CUT 4
-[src/b.ts#1F7C]
-PASTE.POST 20
-```
+`apply_patch` matches complete old/context lines in this order: exact, trailing
+whitespace trimmed, both ends trimmed, then Unicode punctuation normalized.
+It never uses substring or character-similarity matching, regardless of the
+fuzzy settings for other modes. Repeated context binds to the first match at
+or after the previous hunk; unmatched context rejects the entire envelope
+before any writes. Numeric prefixes in old and new lines remain literal text,
+not recovered line-number annotations.
 
-## Limits & Caps
-- File snapshot tags are exactly four uppercase-hex chars — content-derived hashes (`computeFileHash()`) recorded in the per-session snapshot store.
-- The visible mismatch report shows 2 lines of context on each side (`MISMATCH_CONTEXT`) in `packages/hashline/src/messages.ts`.
-- Stale-anchor recovery uses `fuzzFactor: 0` in `packages/hashline/src/recovery.ts`.
-- `HL_FILE_PREFIX` is `[`, `HL_FILE_SUFFIX` is `]`, `HL_PAYLOAD_REPLACE` is `+`, `HL_RANGE_SEP` is `.=`, `HL_FILE_HASH_SEP` is `#`, and line/clipboard hunk keyword constants are `SWAP` / `CUT` / `INS` / `PASTE` (`packages/hashline/src/format.ts`).
+An `*** Update File` followed only by `*** Move to:` renames a UTF-8 file
+without changing its bytes or permissions. An empty update without a move
+still rejects, as do missing sources and occupied destinations.
 
-## Errors
-- Missing section header:
-  - `input must begin with "[PATH#HASH]" on the first non-blank line for anchored edits; got: ...`
-- Missing tag for any section:
-  - `Missing hashline snapshot tag for <path>; use \`[<path>#tag]\` from your latest read/search output. To create a new file, use the write tool.`
-- Stray payload line:
-  - `line N: payload line has no preceding hunk header. Use \`SWAP N.=M:\`, \`CUT N.=M\`, or \`INS.PRE|POST|HEAD|TAIL:\` above the body. Got "...".`
-- Minus row (unless auto-piped as an unambiguous Markdown bullet — see Tolerated input shapes):
-  - ``line N: `-` rows are not valid; the range already names the lines being changed. For Markdown bullets or other literal `-` lines, prefix the literal row with `+`: `+- item`.``
-- Empty body-bearing hunk:
-  - `line N: \`INS\` needs at least one \`+TEXT\` body row.`
-  - `line N: \`SWAP.BLK N:\` needs at least one \`+TEXT\` body row. To delete a block, use \`CUT.BLK N\`.`
-- Unresolvable block anchor — `SWAP.BLK` / `CUT.BLK` only (apply / final-preview path; the streaming preview silently drops the op instead):
-  - `line N: \`SWAP.BLK X:\` could not resolve a syntactic block beginning on line X (unsupported language, blank/closer line, or parse error). Use \`SWAP X.=M:\` with explicit lines.` — followed by numbered context and, when available, a nearby block suggestion. `CUT.BLK X` produces the corresponding message with a `CUT X.=M` fallback.
-  - `INS.BLK.POST X:` and `PASTE.BLK.POST X` never reach this error when no block resolves — they lower to plain `INS.POST X:` / `PASTE.POST X` with a warning.
-- Clipboard operation errors:
-  - `line N: \`CUT N.=M\` captures + deletes lines and takes no body rows. To replace lines with new content, use \`SWAP N.=M:\`.`
-  - `line N: \`PASTE\` inserts the clipboard content and takes no \`+\` body rows. To insert literal text, use \`INS\`.`
-  - `line N: \`PASTE\` found nothing in the clipboard. Ops run top-to-bottom across the whole patch (sections included): put \`CUT N.=M\` or \`CUT.BLK N\` above the \`PASTE\`.`
-- Range out of order:
-  - `line N: range A.=B ends before it starts.`
-- Overlapping hunks on the same anchor:
-  - `line N: anchor line X is already targeted by another hunk on line Y. Issue ONE hunk per range; payload is only the final desired content, never a before/after pair.`
-- apply_patch / unified-diff contamination:
-  - `line N: apply_patch sentinel "*** …" is not valid in hashline. File sections start with \`[path#HASH]\` (no \`Update File:\` / \`Add File:\` keyword). Use \`SWAP N.=M:\`, \`CUT N.=M\`, or \`INS.PRE|POST|HEAD|TAIL:\` ops.`
-  - `line N: unified-diff hunk header (\`@@ -N,M +N,M @@\`) is not valid in hashline. Use \`SWAP N.=M:\`, \`CUT N.=M\`, or \`INS.PRE|POST|HEAD|TAIL:\` ops.`
-  - `line N: \`@@\`-bracketed hunk header "@@ …" is not valid in hashline. Drop the \`@@ ... @@\` brackets and write a verb header such as \`SWAP N.=M:\`.`
-  - `line N: hunk headers need a verb. Use \`SWAP N.=N:\` to replace, or \`CUT N\` to delete.`
-  - `line N: bare range hunk header "N M" is not valid. Hunk headers need a verb: write \`SWAP ${bareRange[1]}.=${bareRange[2]}:\` or \`CUT ${bareRange[1]}.=${bareRange[2]}\`.`
-- Out-of-range anchor:
-  - `Line N does not exist (file has M lines)`
-- Stale snapshot tag: the `Patcher` first attempts snapshot-based recovery. When recovery cannot prove a valid result it throws `MismatchError`, which distinguishes recognized-but-drifted hashes from never-recorded hashes. The error includes the current file hash plus context around each anchor.
-- No-op edit:
-  - `Edits to <path> parsed and applied cleanly, but produced no change: your body row(s) are byte-identical to the file at the targeted lines. The bug is somewhere else — re-read the file before issuing another edit. Do NOT widen the payload or add lines; verify the anchor first.`
-  - After `NOOP_HARD_LIMIT = 3` consecutive byte-identical no-ops of the same payload on the same file, the soft text result escalates to a `ToolError` (`STOP. Edits to <path> have been a byte-identical no-op N times in a row …`) from `packages/coding-agent/src/edit/hashline/noop-loop-guard.ts`.
-- Recovery failure is silent internally: if cache-based merge cannot prove a valid result, the mismatch error is surfaced unchanged.
+Envelope sections see the results of earlier sections in order. A move vacates
+its source before a later add, and subsequent updates can target the moved
+file. Preview and application validate this same virtual namespace before
+the first filesystem write; a later invalid section leaves all files unchanged.
 
-## Warnings
-- `Auto-prefixed bare body row(s) with +. Body rows must be +TEXT literal lines …` (`BARE_BODY_AUTO_PIPED_WARNING`)
-- `Auto-prefixed bare `- ` bullet row(s) as literal content …` (`MINUS_BULLET_AUTO_PIPED_WARNING`)
-- Recovery banners: `RECOVERY_EXTERNAL_WARNING`, `RECOVERY_SESSION_CHAIN_WARNING`, `RECOVERY_SESSION_REPLAY_WARNING` (`packages/hashline/src/messages.ts`).
+## Output and side effects
+
+Hashline applies in one tool call; it does not use the staged `xd://resolve` / `xd://reject` flow used by `ast_edit`.
+
+A successful hashline section returns a fresh `[path#TAG]` header, optional block-resolution and move lines, a compact post-edit preview when available, and a `Warnings:` block when recovery or normalization produced warnings. `EditToolDetails` can include the unified `diff`, `firstChangedLine`, diagnostics, operation (`update` or `delete` in hashline mode), path/move metadata, `oldText` / `newText`, `snapshotsPruned`, and per-file results. Multi-section input returns one aggregate result. Stored before/after snapshot text is capped at 32,768 characters per file and across a multi-file result; later entries may retain their diff but omit snapshot text.
+
+Native parse/match/application and writer failures return `isError: true` with their diagnostic text and `details.errorKind`, the engine's class of the failure: `unseen_lines`, `stale_tag`, `unknown_tag`, `other_file_tag` (a tag this session issued for another file), `missing_tag`, `header_only`, `out_of_range`, `ambiguous_boundary`, `no_change`, `file_not_found`, `parse`, `no_match`, `invalid_utf8`, `plan_mode`, `unresolved_url`, `io`, `write_failed`, or `apply` for the rest; a file's failure in a multi-file call keeps its own class, and `/session` counts failed edits by it. Native bridge failures may throw. Updates run through the ACP bridge or LSP writethrough, so configured formatting can change the persisted text. A newly introduced syntax parse failure does not roll back the edit: it produces a warning, or an additional repair note when `edit.autoRepair.enabled` successfully repairs it.
+
+The streaming renderer parses complete portions of an in-flight payload and computes read-only diffs. Streaming preview skips transient unresolved blocks, stale tags, and empty pastes rather than presenting partial input as a final failure. Execution re-reads and validates normally.
+
+For multi-section calls, every section is parsed and prepared before writes begin so syntax, anchor, and no-op failures fail fast. Files then write in order; an operating-system write failure can leave the already-landed prefix applied. Named-register session state is advanced only for that landed prefix.
+
+## Limits and validation
+
+- Snapshot tags are four uppercase hexadecimal characters derived from normalized file content and recorded in the session snapshot store.
+- A section with a placeholder tag (`#AUTO`, `#????`, a bare `#`) or no tag, and input that is only a header with no ops, are rejected without writing. Like an unknown-tag mismatch, the reply carries the file's current tag, plus anchored context when the section has anchors.
+- `read`/`grep` exposure matters: with `edit.enforceSeenLines=true` (default), edits targeting lines outside recorded visible ranges are rejected. Re-read elided or undisplayed ranges before editing them. When the store holds no read of the tagged content (new process, evicted snapshot), only anchors on lines longer than the narrowest display column cap (grep's 512 bytes, or a lower `tools.outputMaxColumns`) are rejected, since only those can have been shown cut.
+- Ranges are inclusive, must be ordered, and are bounded by a parser amplification limit of 100,000 expanded lines before the target file's actual bounds are checked.
+- Conflicting overlapping ranges are rejected. Exact repeated replacement ranges can coalesce to the later body with a warning; author one final-content hunk per range.
+- The rows a mismatch reply prints count as seen for a resend under the tag it hands back: content no retained snapshot holds starts from them, and a retained read's seen set gains them. A resend anchored elsewhere gets the seen-line rejection and reveal. Content recorded with no or an empty seen set (as `write` records) stays unrestricted.
+- Same-path sections are merged so their original line anchors apply together. Clipboard operations are rejected if interleaved same-path sections would make authored register order ambiguous.
+- Stale tags attempt snapshot-based recovery. Recovery applies only when the recorded snapshot chain proves a unique safe result; otherwise a mismatch with current context is returned. A recovery that shifts line numbers is also refused when a replacement body closely matches the current lines at its authored numbers but not the lines the shift targets (a heuristic for numbers read from the current file instead of the tagged read), or when it breaks the syntax of a file that parsed.
+- A single-section byte-identical edit returns a no-change diagnostic without writing; the third consecutive identical no-op is an error. In multi-section calls, any no-op rejects the batch before writes.
+- `edit.blockAutoGenerated=true` (default) rejects files recognized as generated. Plan mode permits updates only within writable roots and refuses all deletes/moves.
+- A target that is not a regular file (FIFO, socket, character or block device, including through a symlink) is refused in every mode: reading it in-process can block forever or never end.
+- File-backed mutable internal URLs can be edited. Read-only schemes and handler-owned writes (`agent://`, `proc://`, etc.) are refused; use `write` for those handlers. Partial/line selectors are not edit targets.
+- Approval uses the strictest write tier among all targets and move destinations.
+
+## Common failures
+
+- Missing/malformed `[PATH#TAG]`, unknown snapshot tag, or a path that no longer exists.
+- Anchor outside the file, outside the recorded seen-line ranges, in an elided region, or based on a stale snapshot that cannot be recovered safely.
+- Reversed or overlapping ranges.
+- Empty body for a body-backed `PUT`, body rows under a bodyless operation, unknown named register, or anonymous paste before an unambiguous anonymous cut.
+- Block anchor on an unsupported/invalid syntax tree, blank/closing line, or single-line node.
+- Unified-diff contamination (`@@`, apply-patch sentinels, `-old` rows) instead of hashline operations and final-content `+` rows.
+- `REM` / `MV` conflicts, invalid or same-source move destinations, or filesystem write failures.
+- A no-change section in a multi-section batch, or the third consecutive identical single-section no-op.
+- Non-regular target: `Cannot edit '<path>': it is a <kind>, not a regular file or directory.`
+
+The parser has limited recovery for common model slips (optional envelope, benign header noise, some bare rows and range spellings), and surfaces warnings when it repairs input. Callers SHOULD emit only the canonical grammar above; recovery behavior is not a second public syntax.

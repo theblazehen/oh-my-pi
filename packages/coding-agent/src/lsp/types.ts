@@ -1,5 +1,4 @@
-import type { ptree } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
+import { type } from "@oh-my-pi/omptype";
 import { TOOL_TIMEOUTS } from "../tools/tool-timeouts";
 
 // =============================================================================
@@ -18,18 +17,9 @@ export const lspSchema = type({
 	"timeout?": type.number
 		.atLeast(TOOL_TIMEOUTS.lsp.min)
 		.atMost(TOOL_TIMEOUTS.lsp.max)
-		.describe("Timeout in seconds (default 20; range 5–300)."),
+		.describe("Timeout in seconds; raises or lowers the default (range 5–300)."),
 	payload: "string?",
 });
-
-export type LspParams = typeof lspSchema.infer;
-
-export interface LspToolDetails {
-	serverName?: string;
-	action: string;
-	success: boolean;
-	request?: LspParams;
-}
 
 // =============================================================================
 // Core LSP Protocol Types
@@ -98,6 +88,7 @@ export interface PublishDiagnosticsParams {
 export interface TextEdit {
 	range: Range;
 	newText: string;
+	insertTextFormat?: 1 | 2;
 }
 
 export interface AnnotatedTextEdit extends TextEdit {
@@ -315,7 +306,7 @@ export interface LinterClient {
 	format(filePath: string, content: string): Promise<string>;
 
 	/** Get diagnostics for a file. Content should already be written to disk. */
-	lint(filePath: string): Promise<Diagnostic[]>;
+	lint(filePath: string, signal?: AbortSignal): Promise<Diagnostic[]>;
 
 	/** Dispose of any resources (e.g., LSP connection) */
 	dispose?(): void;
@@ -359,7 +350,14 @@ export interface ServerConfig {
 		statusRequestTimeoutMs?: number;
 	};
 	capabilities?: ServerCapabilities;
-	/** If true, this is a linter/formatter server (e.g., Biome) - used only for diagnostics/actions, not type intelligence */
+	/**
+	 * Marks a dedicated linter/formatter server (e.g. Biome, efm-langserver, ruff).
+	 * Ranked after other matching servers for single-server actions (definition, hover,
+	 * references, …), so it serves them only when no non-linter server claims the file; such
+	 * requests then fail with the server's own error if it does not implement the method.
+	 * Preferred over type-checkers when selecting the `formatOnWrite` formatter, so a
+	 * configured external formatter wins for file types a type-checker also claims.
+	 */
 	isLinter?: boolean;
 	/** Resolved absolute path to the command binary (set during config loading) */
 	resolvedCommand?: string;
@@ -371,12 +369,54 @@ export interface ServerConfig {
 }
 
 // =============================================================================
+// Transport
+// =============================================================================
+
+/** Minimal write sink for the server-bound byte stream (satisfied by `Bun.FileSink` and the mux link adapter). */
+export interface LspWriteSink {
+	write(data: string | Uint8Array): number | Promise<number>;
+	flush(): number | void | Promise<number | void>;
+}
+
+/**
+ * Byte transport carrying one LSP JSON-RPC link. Structurally satisfied by
+ * `ptree.ChildProcess<"pipe">` (local server spawn) and by the IPC link adapter
+ * in `mux/daemon.ts` (broker-shared server). `exited` may reject (ptree kill).
+ */
+export interface LspTransport {
+	readonly stdin: LspWriteSink;
+	readonly stdout: ReadableStream<Uint8Array>;
+	readonly exited: Promise<number>;
+	readonly exitCode: number | null;
+	readonly pid?: number;
+	/** Present and true on broker-shared mux links; `lsp reload` uses it to request a shared-server restart. */
+	readonly sharedMux?: boolean;
+	kill(): void;
+	peekStderr(): string;
+}
+
+// =============================================================================
 // Client State
 // =============================================================================
 
 export interface OpenFile {
 	version: number;
 	languageId: string;
+	/**
+	 * Hash of the document text last sent to the server, used to detect external
+	 * disk edits. Absent means the last-synced text is unknown, so the next
+	 * reconcile treats the document as dirty and resyncs from disk.
+	 */
+	syncedHash?: number | bigint;
+	/**
+	 * The disk text a reconcile last read: its stat stamp and text hash. While the stamp is
+	 * unchanged and `hash` equals `syncedHash`, the server already holds the disk text.
+	 */
+	disk?: { stamp: string; hash: number | bigint };
+	/** When an OMP operation last used this document; long-unused documents close before the next open. */
+	lastUsedAt: number;
+	/** When OMP last reopened this document (an idle close, or a diagnostics reopen); absent for a first open. */
+	reopenedAt?: number;
 }
 
 export interface PendingRequest {
@@ -394,27 +434,56 @@ export interface LspServerCapabilities {
 	documentSymbolProvider?: boolean;
 	workspaceSymbolProvider?: boolean;
 	diagnosticProvider?: boolean | Record<string, unknown>;
+	workspace?: { workspaceFolders?: { supported?: boolean; changeNotifications?: boolean | string } };
 	[key: string]: unknown;
+}
+
+/** Last busy and idle build-status notifications for a document, as client-wide sequence numbers. */
+export interface DocumentBuildStatus {
+	busySeq: number;
+	idleSeq: number;
 }
 
 export interface LspClient {
 	name: string;
 	cwd: string;
 	config: ServerConfig;
-	proc: ptree.ChildProcess<"pipe">;
+	proc: LspTransport;
 	requestId: number;
 	diagnostics: Map<string, PublishedDiagnostics>;
+	/** Diagnostics delivered via `textDocument/publishDiagnostics` notifications. */
+	publishedDiagnostics: Map<string, PublishedDiagnostics>;
+	/** Diagnostics delivered via `textDocument/diagnostic` pull requests. */
+	pulledDiagnostics: Map<string, PublishedDiagnostics>;
 	diagnosticsVersion: number;
+	/** Set once a publish echoes a document version, so a wait can identify the report for a reopen. */
+	publishesDocumentVersions?: boolean;
+	/**
+	 * Build state per document from clangd's `textDocument/clangd.fileStatus`, present once the
+	 * server sent one. Lets a diagnostics wait tell a finished rebuild from one still running.
+	 */
+	buildStatus?: Map<string, DocumentBuildStatus>;
+	/** Orders build-status notifications across documents. */
+	buildStatusSeq?: number;
 	/** Dynamic capability registrations keyed by the server-provided registration ID. */
 	dynamicCapabilityRegistrations?: Map<string, string>;
 	openFiles: Map<string, OpenFile>;
+	/**
+	 * Documents OMP closed and will reopen (for idleness, or mid diagnostics reopen),
+	 * with the last version the server saw. A reopen resumes past that version; absent
+	 * until the client closes one.
+	 */
+	idleClosedFiles?: Map<string, number>;
 	pendingRequests: Map<number | string, PendingRequest>;
-	messageBuffer: Uint8Array;
 	isReading: boolean;
+	/** rust-analyzer only: the crate manifests present at initialize ({@link listCargoManifests}). */
+	cargoManifests?: Promise<string | undefined>;
 	/** Lifecycle state: "connecting" until initialize completes, then "ready"; "error" on init failure or reader death. */
 	status: "connecting" | "ready" | "error";
 	serverCapabilities?: LspServerCapabilities;
 	lastActivity: number;
+	/** Wall-clock time when this server process started; absent only on external test doubles. */
+	startedAt?: number;
 	/** Serializes outbound JSON-RPC writes to the server process. */
 	writeQueue: Promise<void>;
 	/** Tracks active work-done progress tokens from the server */

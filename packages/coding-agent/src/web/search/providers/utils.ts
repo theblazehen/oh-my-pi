@@ -1,5 +1,7 @@
-import type { AgentStorage } from "../../../session/agent-storage";
-import { SearchProviderError, type SearchProviderId, type SearchSource } from "../../../web/search/types";
+import type { AgentStorageApi } from "../../../session/agent-storage";
+import { DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS, SearchProviderError } from "../../../web/search/types";
+import { SEARCH_PROVIDER_LABELS, type SearchProviderId, type SearchSource } from "../types";
+import { decodeBody, readBodyCapped } from "../../response-body";
 import { dateToAgeSeconds } from "../utils";
 
 /**
@@ -16,7 +18,7 @@ import { dateToAgeSeconds } from "../utils";
  * @param storageProviders - Provider names to look up in AgentStorage
  */
 export function findCredential(
-	storage: AgentStorage | null | undefined,
+	storage: AgentStorageApi | null | undefined,
 	envKey: string | null | undefined,
 	...storageProviders: string[]
 ): string | null {
@@ -44,16 +46,13 @@ export function findCredential(
 }
 
 /**
- * Default hard ceiling for a single web-search round-trip. 60s tolerates
- * legitimate slow LLM-mediated responses (anthropic web_search_20250305,
- * perplexity, gemini, codex) while still guaranteeing the session unfreezes
- * within a minute if Bun's `AbortSignal` fails to propagate on Windows.
- *
- * Pure search APIs (brave, exa, jina, tavily, searxng, synthetic, zai)
- * settle far faster in practice; reusing the same ceiling keeps the wiring
- * uniform without compromising correctness.
+ * The 60-second default tolerates legitimate slow LLM-mediated responses
+ * (Anthropic web_search_20250305, Perplexity, Gemini, Codex) while bounding
+ * Windows stalls when Bun's `AbortSignal` fails to propagate. Callers may
+ * configure a longer provider deadline, capped at five minutes by the
+ * dispatcher; pure search APIs typically settle far faster.
  */
-export const SEARCH_HARD_TIMEOUT_MS = 60_000;
+export const SEARCH_HARD_TIMEOUT_MS = DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS * 1_000;
 
 /**
  * Compose a caller-supplied {@link AbortSignal} with a hard timeout so an
@@ -125,4 +124,60 @@ export function classifyProviderHttpError(
 		return new SearchProviderError(provider, `${provider}: 403 forbidden`, status);
 	}
 	return null;
+}
+
+/**
+ * Collapse runs of whitespace in a loosely-typed provider field, returning
+ * `undefined` for missing/non-string/blank values. Shared so tab/newline
+ * folding cannot drift between providers.
+ */
+export function normalizeSearchText(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const text = value.replace(/\s+/g, " ").trim();
+	return text.length > 0 ? text : undefined;
+}
+
+/**
+ * Bare, deduplicated hosts from `site:` values (`github.com/anthropics` → `github.com`)
+ * for provider domain filters; path parts are enforced by the central lenient post-filter.
+ */
+export function siteHosts(sites: readonly string[]): string[] {
+	const hosts = new Set<string>();
+	for (const site of sites) {
+		const host = site.split("/", 1)[0];
+		if (host) hosts.add(host);
+	}
+	return [...hosts];
+}
+
+/**
+ * Read a provider response body up to a byte cap, truncating or throwing when
+ * the limit is exceeded. Shared so streaming-cap fixes land in one place.
+ */
+export async function readLimitedText(
+	response: Response,
+	provider: SearchProviderId,
+	maxBytes: number,
+	truncate = false,
+): Promise<string> {
+	const body = await readBodyCapped(response, maxBytes);
+	if (!body) return "";
+	if (body.truncated && !truncate) {
+		throw new SearchProviderError(provider, `${SEARCH_PROVIDER_LABELS[provider]} API response exceeded 2 MiB`, 500);
+	}
+	return decodeBody(body.bytes, response.headers.get("content-type") ?? "");
+}
+
+/**
+ * Parse a provider-supplied result URL, keeping only absolute http(s) URLs.
+ * Returns the normalized string, or `undefined` for anything else.
+ */
+export function normalizeHttpUrl(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	try {
+		const url = new URL(value);
+		return url.protocol === "http:" || url.protocol === "https:" ? url.toString() : undefined;
+	} catch {
+		return undefined;
+	}
 }

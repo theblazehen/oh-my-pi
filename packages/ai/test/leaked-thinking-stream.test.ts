@@ -15,6 +15,7 @@ import { getStreamingPartialJson, setStreamingPartialJson } from "@oh-my-pi/pi-a
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { wrapLeakedThinkingStream } from "@oh-my-pi/pi-ai/utils/leaked-thinking-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { withOfficialAnthropicEndpoint } from "./helpers";
 
 /** Minimal assistant message; `content`/`stopReason` overridden per event. */
 function msg(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
@@ -91,6 +92,8 @@ async function nextToolSnapshot(iterator: AsyncIterator<AssistantMessageEvent>):
 		};
 	}
 }
+
+withOfficialAnthropicEndpoint();
 
 describe("wrapLeakedThinkingStream", () => {
 	async function runLeakedText(chunks: readonly string[]): Promise<{
@@ -184,6 +187,107 @@ describe("wrapLeakedThinkingStream", () => {
 			});
 		}
 	}
+
+	// DeepSeek-R1 / Qwen3-Thinking chat templates prefill `<think>` into the
+	// prompt, so a host that does not split reasoning into its own field streams
+	// `reasoning</think>answer`: the healer sees no opener and the whole chain of
+	// thought used to land in the visible answer with a stray `</think>`.
+	describe("implied-open reasoning (template-prefilled `<think>`)", () => {
+		for (const { name, chunks } of [
+			{ name: "whole chunk", chunks: ["Let me think. 2 plus 2.\n</think>\n\nThe answer is 4."] },
+			{ name: "character stream", chunks: [..."Let me think. 2 plus 2.\n</think>\n\nThe answer is 4."] },
+			{ name: "close split across deltas", chunks: ["Let me think. 2 plus 2.\n</th", "ink>\n\nThe answer is 4."] },
+		]) {
+			it(`re-projects the leading text as a closed thinking block in ${name}`, async () => {
+				const { events, result } = await runLeakedText(chunks);
+				expect(result.content.map(b => b.type)).toEqual(["thinking", "text"]);
+				expect(thinks(result).map(b => b.thinking)).toEqual(["Let me think. 2 plus 2.\n"]);
+				expect(texts(result)).toEqual(["\n\nThe answer is 4."]);
+
+				// Wire contract for event-replaying consumers: the text block at index 0
+				// is closed, then replaced in place by a thinking block carrying the
+				// full reasoning, and the answer opens a fresh text block at index 1.
+				const boundary = events.findIndex(e => e.type === "thinking_start");
+				expect(boundary).toBeGreaterThan(0);
+				const [textEnd, thinkingStart, thinkingDelta, thinkingEnd, answerStart] = events.slice(boundary - 1);
+				expect(textEnd).toMatchObject({ type: "text_end", contentIndex: 0, content: "Let me think. 2 plus 2.\n" });
+				expect(thinkingStart).toMatchObject({ type: "thinking_start", contentIndex: 0 });
+				expect(thinkingStart?.type === "thinking_start" && thinkingStart.partial.content[0]?.type).toBe("thinking");
+				expect(thinkingDelta).toMatchObject({
+					type: "thinking_delta",
+					contentIndex: 0,
+					delta: "Let me think. 2 plus 2.\n",
+				});
+				expect(thinkingEnd).toMatchObject({ type: "thinking_end", contentIndex: 0 });
+				expect(answerStart).toMatchObject({ type: "text_start", contentIndex: 1 });
+			});
+		}
+
+		it("leaves an ordinary answer with no close tag as visible text", async () => {
+			const { result } = await runLeakedText(["The answer ", "is 4."]);
+			expect(result.content.map(b => b.type)).toEqual(["text"]);
+			expect(texts(result)).toEqual(["The answer is 4."]);
+		});
+
+		it("keeps a literal close tag inside inline code as visible text", async () => {
+			const { result } = await runLeakedText(["Qwen ends reasoning with `</think>` on its own line."]);
+			expect(result.content.map(b => b.type)).toEqual(["text"]);
+			expect(texts(result)).toEqual(["Qwen ends reasoning with `</think>` on its own line."]);
+		});
+
+		it("drops a stray close after an explicit reasoning block instead of re-projecting the answer", async () => {
+			const { result } = await runLeakedText(["<think>plan</think>answer</think> more"]);
+			expect(result.content.map(b => b.type)).toEqual(["thinking", "text"]);
+			expect(thinks(result).map(b => b.thinking)).toEqual(["plan"]);
+			expect(texts(result)).toEqual(["answer more"]);
+		});
+
+		it("drops a stray close when a native reasoning field already preceded the text", async () => {
+			const { result } = await runWrapper(inner => {
+				const thinking = { type: "thinking" as const, thinking: "structured reasoning" };
+				inner.push({ type: "start", partial: msg() });
+				inner.push({ type: "thinking_start", contentIndex: 0, partial: msg({ content: [thinking] }) });
+				inner.push({
+					type: "thinking_delta",
+					contentIndex: 0,
+					delta: "structured reasoning",
+					partial: msg({ content: [thinking] }),
+				});
+				inner.push({
+					type: "thinking_end",
+					contentIndex: 0,
+					content: "structured reasoning",
+					partial: msg({ content: [thinking] }),
+				});
+				const text = "answer</think> more";
+				inner.push({
+					type: "text_start",
+					contentIndex: 1,
+					partial: msg({ content: [thinking, { type: "text", text: "" }] }),
+				});
+				inner.push({
+					type: "text_delta",
+					contentIndex: 1,
+					delta: text,
+					partial: msg({ content: [thinking, { type: "text", text }] }),
+				});
+				inner.push({
+					type: "done",
+					reason: "stop",
+					message: msg({ content: [thinking, { type: "text", text }] }),
+				});
+			});
+			expect(result.content.map(b => b.type)).toEqual(["thinking", "text"]);
+			expect(thinks(result).map(b => b.thinking)).toEqual(["structured reasoning"]);
+			expect(texts(result)).toEqual(["answer more"]);
+		});
+
+		it("drops the close of an empty prefilled block without inventing a thinking block", async () => {
+			const { result } = await runLeakedText(["\n</think>\n", "The answer is 4."]);
+			expect(result.content.map(b => b.type)).toEqual(["text"]);
+			expect(texts(result)).toEqual(["\n\nThe answer is 4."]);
+		});
+	});
 
 	it("preserves text, thinking, and tool-call signatures across the split", async () => {
 		const leaked = "before ```thinking\nhmm\n``` after";
@@ -419,6 +523,58 @@ describe("wrapLeakedThinkingStream", () => {
 		expect(result.content.slice(1, 3)).toEqual(serverBlocks);
 	});
 
+	it("preserves complete Anthropic tool-search history through the custom-endpoint projector", async () => {
+		const firstThinking: ThinkingContent = {
+			type: "thinking",
+			thinking: "find the deferred tool",
+			thinkingSignature: "sig-1",
+		};
+		const serverBlocks: AnthropicServerToolContent[] = [
+			{
+				type: "anthropicServerTool",
+				block: {
+					type: "server_tool_use",
+					id: "srvtoolu_search",
+					name: "tool_search_tool_regex",
+					input: { pattern: "read" },
+				},
+			},
+			{
+				type: "anthropicServerTool",
+				block: {
+					type: "tool_search_tool_result",
+					tool_use_id: "srvtoolu_search",
+					content: {
+						type: "tool_search_tool_search_result",
+						tool_references: [{ type: "tool_reference", tool_name: "_read" }],
+					},
+				},
+			},
+		];
+		const secondThinking: ThinkingContent = {
+			type: "thinking",
+			thinking: "use the discovered tool",
+			thinkingSignature: "sig-2",
+		};
+		const call: ToolCall = {
+			type: "toolCall",
+			id: "toolu_read",
+			name: "_read",
+			arguments: { path: "notes.txt" },
+		};
+		const content: AssistantMessage["content"] = [firstThinking, ...serverBlocks, secondThinking, call];
+		const terminal = msg({ content, stopReason: "toolUse" });
+
+		const { result } = await runWrapper(inner => {
+			inner.push({ type: "start", partial: msg() });
+			inner.push({ type: "toolcall_start", contentIndex: 4, partial: terminal });
+			inner.push({ type: "toolcall_end", contentIndex: 4, toolCall: call, partial: terminal });
+			inner.push({ type: "done", reason: "toolUse", message: terminal });
+		});
+
+		expect(result.content).toEqual(content);
+	});
+
 	it("drops incomplete Anthropic web-search history instead of replaying orphan blocks", async () => {
 		const content: AssistantMessage["content"] = [
 			{
@@ -457,6 +613,66 @@ describe("wrapLeakedThinkingStream", () => {
 		});
 
 		expect(thinks(result).map(b => [b.thinking, b.thinkingSignature])).toEqual([["recovered reasoning", signature]]);
+	});
+
+	it("replays finalized signed reasoning once when deltas are absent or incomplete", async () => {
+		const text = "synthetic reasoning";
+		const signature = JSON.stringify({
+			type: "reasoning",
+			id: "rs_repro",
+			summary: [],
+			content: [{ type: "reasoning_text", text }],
+		});
+		const block: ThinkingContent = { type: "thinking", thinking: text, thinkingSignature: signature, summary: false };
+		for (const streamed of ["", "synthetic ", text]) {
+			const terminal = msg({ content: [block] });
+			const { events, result } = await runWrapper(inner => {
+				inner.push({ type: "start", partial: msg() });
+				inner.push({
+					type: "thinking_start",
+					contentIndex: 0,
+					partial: msg({ content: [{ type: "thinking", thinking: "" }] }),
+				});
+				if (streamed) {
+					inner.push({
+						type: "thinking_delta",
+						contentIndex: 0,
+						delta: streamed,
+						partial: msg({ content: [{ type: "thinking", thinking: streamed }] }),
+					});
+				}
+				inner.push({ type: "thinking_end", contentIndex: 0, content: text, partial: terminal });
+				inner.push({ type: "done", reason: "stop", message: terminal });
+			});
+
+			expect(result.content).toEqual([block]);
+			expect(events.filter(event => event.type === "thinking_delta").map(event => event.delta)).toEqual(
+				[streamed, text.slice(streamed.length)].filter(Boolean),
+			);
+			const end = events.find(event => event.type === "thinking_end");
+			expect(end?.type === "thinking_end" && end.content).toBe(text);
+		}
+	});
+
+	it("keeps a thinking block's summary state on every projection path", async () => {
+		const signature = JSON.stringify({ id: "rs_1", type: "reasoning", summary: [] });
+		const streamed = { type: "thinking" as const, thinking: "trace", summary: false };
+		const signedOnly = { type: "thinking" as const, thinking: "", thinkingSignature: signature, summary: true };
+		const terminal = { type: "thinking" as const, thinking: "late", thinkingSignature: signature, summary: false };
+		const { result } = await runWrapper(inner => {
+			inner.push({ type: "start", partial: msg() });
+			inner.push({ type: "thinking_delta", contentIndex: 0, delta: "trace", partial: msg({ content: [streamed] }) });
+			inner.push({ type: "thinking_end", contentIndex: 0, content: "trace", partial: msg({ content: [streamed] }) });
+			const withSigned = msg({ content: [streamed, signedOnly] });
+			inner.push({ type: "thinking_end", contentIndex: 1, content: "", partial: withSigned });
+			inner.push({ type: "done", reason: "stop", message: msg({ content: [streamed, signedOnly, terminal] }) });
+		});
+
+		expect(thinks(result).map(b => [b.thinking, b.summary])).toEqual([
+			["trace", false],
+			["", true],
+			["late", false],
+		]);
 	});
 
 	it("preserves native tool-call ids and streamed partial JSON while healing", async () => {
@@ -554,6 +770,54 @@ describe("wrapLeakedThinkingStream", () => {
 		expect(result.content).toEqual(content);
 	});
 
+	it("keeps a text signature that arrives after the block's last delta", async () => {
+		// Gemini signs a reply with an empty part after its last text chunk, so the
+		// signature is on the source block only from text_end on.
+		const signed: TextContent = { type: "text", text: "7919 is prime.", textSignature: "reply-sig" };
+		const { result } = await runWrapper(inner => {
+			inner.push({ type: "start", partial: msg() });
+			inner.push({ type: "text_start", contentIndex: 0, partial: msg({ content: [{ type: "text", text: "" }] }) });
+			inner.push({
+				type: "text_delta",
+				contentIndex: 0,
+				delta: "7919 is",
+				partial: msg({ content: [{ type: "text", text: "7919 is" }] }),
+			});
+			inner.push({
+				type: "text_delta",
+				contentIndex: 0,
+				delta: " prime.",
+				partial: msg({ content: [{ type: "text", text: signed.text }] }),
+			});
+			inner.push({ type: "text_end", contentIndex: 0, content: signed.text, partial: msg({ content: [signed] }) });
+			inner.push({ type: "done", reason: "stop", message: msg({ content: [signed] }) });
+		});
+
+		expect(result.content).toEqual([signed]);
+	});
+
+	it("signs the pieces of a healed reply the same whether its signature arrives early or at text_end", async () => {
+		const leaked = "before ```thinking\nhmm\n``` after";
+		const block = (textSignature?: string): AssistantMessage =>
+			msg({ content: [{ type: "text", text: leaked, ...(textSignature && { textSignature }) }] });
+		const project = (deltaSignature: string | undefined) =>
+			runWrapper(inner => {
+				inner.push({ type: "start", partial: msg() });
+				inner.push({ type: "text_delta", contentIndex: 0, delta: leaked, partial: block(deltaSignature) });
+				inner.push({ type: "text_end", contentIndex: 0, content: leaked, partial: block("sig") });
+				inner.push({ type: "done", reason: "stop", message: block("sig") });
+			});
+
+		const early = await project("sig");
+		const late = await project(undefined);
+		expect(late.result.content).toEqual(early.result.content);
+		expect(late.result.content.map(b => (b.type === "text" ? b.textSignature : b.type))).toEqual([
+			"sig",
+			"thinking",
+			"sig",
+		]);
+	});
+
 	it("passes clean text through unchanged and forwards native thinking", async () => {
 		const clean = "Just a normal answer.";
 		const cleanRun = await runWrapper(inner => {
@@ -620,6 +884,32 @@ describe("wrapLeakedThinkingStream", () => {
 		expect(texts(result)).toEqual(["Partial.", "Recovered."]);
 		expect(result.stopReason).toBe("error");
 	});
+
+	it("honours a provider's discarded content on an error event", async () => {
+		const { events, result } = await runWrapper(inner => {
+			inner.push({ type: "start", partial: msg() });
+			inner.push({
+				type: "thinking_delta",
+				contentIndex: 0,
+				delta: "looping reasoning that the provider discarded",
+				partial: msg({
+					content: [{ type: "thinking", thinking: "looping reasoning that the provider discarded" }],
+				}),
+			});
+			inner.push({
+				type: "error",
+				reason: "error",
+				error: msg({ content: [], stopReason: "error" }),
+			});
+		});
+
+		const terminal = events.at(-1);
+		expect(terminal?.type).toBe("error");
+		if (terminal?.type === "error") {
+			expect(terminal.error.content).toEqual([]);
+		}
+		expect(result.content).toEqual([]);
+	});
 });
 
 describe("leaked thinking healing through stream()", () => {
@@ -659,6 +949,43 @@ describe("leaked thinking healing through stream()", () => {
 		return Object.assign(fn, { preconnect: fetch.preconnect });
 	}
 
+	function anthropicThinkingFetch(): FetchImpl {
+		const body = [
+			sseFrame("message_start", {
+				type: "message_start",
+				message: { id: "msg_thinking_prefix", usage: { input_tokens: 5, output_tokens: 0 } },
+			}),
+			sseFrame("content_block_start", {
+				type: "content_block_start",
+				index: 0,
+				content_block: { type: "thinking", thinking: "Summary prefix" },
+			}),
+			sseFrame("content_block_delta", {
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "thinking_delta", thinking: " summary tail" },
+			}),
+			sseFrame("content_block_delta", {
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "signature_delta", signature: "sig_thinking" },
+			}),
+			sseFrame("content_block_stop", { type: "content_block_stop", index: 0 }),
+			sseFrame("message_delta", {
+				type: "message_delta",
+				delta: { stop_reason: "end_turn" },
+				usage: { input_tokens: 5, output_tokens: 4 },
+			}),
+			sseFrame("message_stop", { type: "message_stop" }),
+		].join("");
+		const fn = async (_input: string | URL | Request, _init?: RequestInit): Promise<Response> =>
+			new Response(body, {
+				status: 200,
+				headers: { "content-type": "text/event-stream", "request-id": "req_thinking_prefix" },
+			});
+		return Object.assign(fn, { preconnect: fetch.preconnect });
+	}
+
 	function anthropicModel(overrides: Partial<Model<"anthropic-messages">> = {}): Model<"anthropic-messages"> {
 		return buildModel({
 			id: "claude-sonnet-4-5",
@@ -677,6 +1004,53 @@ describe("leaked thinking healing through stream()", () => {
 
 	const leaked = "```thinking\nDeliberate.\n```\nFinal answer.";
 	const context: Context = { messages: [{ role: "user", content: "hi", timestamp: Date.now() }] };
+
+	/** OpenAI-compatible SSE whose `content` deltas carry the given strings, then `[DONE]`. */
+	function completionsContentFetch(deltas: readonly string[]): FetchImpl {
+		const chunk = (delta: Record<string, unknown>, finish: string | null = null): string =>
+			`data: ${JSON.stringify({
+				id: "chatcmpl-prefill",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: "qwen3-thinking",
+				choices: [{ index: 0, delta, finish_reason: finish }],
+			})}\n\n`;
+		const body = [
+			chunk({ role: "assistant", content: "" }),
+			...deltas.map(content => chunk({ content })),
+			chunk({}, "stop"),
+			"data: [DONE]\n\n",
+		].join("");
+		const fn = async (_input: string | URL | Request, _init?: RequestInit): Promise<Response> =>
+			new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+		return Object.assign(fn, { preconnect: fetch.preconnect });
+	}
+
+	// A local host serving a template that prefills `<think>` (DeepSeek-R1,
+	// Qwen3-Thinking) without splitting reasoning into a field streams the chain
+	// of thought inline, terminated only by `</think>`. Issue #10571's shape.
+	it("recovers template-prefilled reasoning from a local openai-completions host", async () => {
+		const model = buildModel({
+			id: "qwen3-thinking",
+			name: "Qwen3 Thinking",
+			api: "openai-completions",
+			provider: "localai",
+			baseUrl: "http://localhost:8080/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 32_000,
+			maxTokens: 8_192,
+		});
+		const result = await stream(model, context, {
+			apiKey: "test",
+			fetch: completionsContentFetch(["Let me think.", " 2 plus 2.\n</th", "ink>\n\nThe answer is 4."]),
+		}).result();
+
+		expect(result.content.map(b => b.type)).toEqual(["thinking", "text"]);
+		expect(thinks(result).map(b => b.thinking)).toEqual(["Let me think. 2 plus 2.\n"]);
+		expect(texts(result).join("").trim()).toBe("The answer is 4.");
+	});
 
 	it("leaves a leaked fence intact for the official Anthropic API", async () => {
 		// Official first-party endpoints return structured thinking and are exempt
@@ -709,6 +1083,25 @@ describe("leaked thinking healing through stream()", () => {
 			.join("");
 		expect(thinking).toContain("Deliberate.");
 		expect(texts(result).join("").trim()).toBe("Final answer.");
+	});
+
+	it("preserves thinking bytes from content_block_start through a non-official endpoint", async () => {
+		const result = await stream(
+			anthropicModel({ provider: "zai", baseUrl: "https://api.z.ai/api/anthropic" }),
+			context,
+			{
+				apiKey: "test",
+				fetch: anthropicThinkingFetch(),
+			},
+		).result();
+
+		expect(thinks(result)).toEqual([
+			{
+				type: "thinking",
+				thinking: "Summary prefix summary tail",
+				thinkingSignature: "sig_thinking",
+			},
+		]);
 	});
 
 	it("replays native web-search history on a custom Anthropic continuation", async () => {
@@ -906,5 +1299,72 @@ describe("leaked thinking healing through stream()", () => {
 				typeof block === "object" && block !== null && "type" in block ? block.type : undefined,
 			),
 		).toEqual(["thinking", "server_tool_use", "web_search_tool_result", "thinking", "text", "tool_use"]);
+	});
+
+	it("replays a chunked Gemini reply with its trailing signature and its own summary as a thought", async () => {
+		// Gemini signs a reply with an empty part after its last text chunk. That
+		// frame is held until the reply's last delta has left the wrapper, so the
+		// wrapper has projected the whole reply before the signature exists.
+		const parts = (finishReason: string | undefined, ...partList: Array<Record<string, unknown>>) => ({
+			candidates: [{ content: { role: "model", parts: partList }, ...(finishReason && { finishReason }) }],
+		});
+		const frames = [
+			parts(undefined, { text: "Checking divisors up to 88.", thought: true }),
+			parts(undefined, { text: "7919 is" }),
+			parts(undefined, { text: " prime." }),
+			parts("STOP", { text: "", thoughtSignature: "cmVwbHktc2ln" }),
+		];
+		const signatureFrame = Promise.withResolvers<void>();
+		const requests: Array<{ contents: unknown[] }> = [];
+		const geminiFetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				if (typeof init?.body !== "string") throw new Error("Expected JSON request body");
+				requests.push(JSON.parse(init.body));
+				let next = 0;
+				const body = new ReadableStream<Uint8Array>({
+					async pull(controller) {
+						if (next === frames.length - 1) await signatureFrame.promise;
+						if (next === frames.length) return controller.close();
+						controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(frames[next++])}\n\n`));
+					},
+				});
+				return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const model = buildModel({
+			id: "gemini-3-flash",
+			name: "Gemini 3 Flash",
+			api: "google-generative-ai",
+			provider: "google",
+			baseUrl: "",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 32_000,
+		});
+
+		const firstStream = stream(model, context, { apiKey: "test", fetch: geminiFetch });
+		for await (const event of firstStream) {
+			if (event.type === "text_delta" && event.delta.endsWith("prime.")) signatureFrame.resolve();
+		}
+		const first = await firstStream.result();
+		expect(first.content).toMatchObject([
+			{ type: "thinking", thinking: "Checking divisors up to 88." },
+			{ type: "text", text: "7919 is prime.", textSignature: "cmVwbHktc2ln" },
+		]);
+
+		const next: Context = {
+			messages: [...context.messages, first, { role: "user", content: "And 7921?", timestamp: 2 }],
+		};
+		await stream(model, next, { apiKey: "test", fetch: geminiFetch }).result();
+		expect(requests[1]?.contents[1]).toEqual({
+			role: "model",
+			parts: [
+				{ thought: true, text: "Checking divisors up to 88." },
+				{ text: "7919 is prime.", thoughtSignature: "cmVwbHktc2ln" },
+			],
+		});
 	});
 });

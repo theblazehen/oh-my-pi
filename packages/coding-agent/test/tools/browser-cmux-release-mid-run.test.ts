@@ -1,6 +1,6 @@
 /**
  * Regression test for issue #4499: closing a cmux-backend tab while a
- * `browser({ action: "run" })` call is in flight rejected an orphaned
+ * `tab.run(...)` helper call (internally a run action) is in flight rejected an orphaned
  * `Promise.withResolvers()` promise created in `runInTabWithSnapshot`. The
  * cmux branch originally awaited `runCmuxCode(...)` directly and never
  * awaited/`.catch`ed the local `promise`; only `pending.reject` was stashed
@@ -23,7 +23,7 @@
  *    immediately instead of blocking to the run's timeout.
  * 2. When the in-flight run is doing work that does NOT make another cmux
  *    socket request (e.g. `await wait(60_000)`), releasing the tab still
- *    unwinds the run — proving `closeAc.signal` reaches `waitForBrowserRun`
+ *    unwinds the run — proving `closeAc.signal` reaches `waitForRun`
  *    and the facade proxies, not just the outer race. (Reviewer feedback
  *    from PR #4502.)
  */
@@ -32,6 +32,7 @@ import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CmuxKind } from "@oh-my-pi/pi-coding-agent/tools/browser/cmux/rpc";
 import { CmuxSocketClient } from "@oh-my-pi/pi-coding-agent/tools/browser/cmux/socket-client";
 import { acquireBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
@@ -42,6 +43,8 @@ import {
 	runInTab,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { encodeRawPng } from "@oh-my-pi/pi-coding-agent/utils/png-encode";
+import * as logger from "@oh-my-pi/pi-utils/logger";
 
 function makeKind(socketSuffix: string): CmuxKind {
 	return {
@@ -52,17 +55,18 @@ function makeKind(socketSuffix: string): CmuxKind {
 }
 
 function makeSession(cwd: string, screenshotDir?: string): ToolSession {
-	// Minimal shape: `runInTab` reads `cwd`, `settings.get("browser.screenshotDir")`,
+	// Minimal shape: `runInTab` reads `cwd`, the `browser.screenshotDir` setting,
 	// and `getActiveModel?.()`. Everything else is untouched by this flow.
 	return {
 		cwd,
 		hasUI: false,
-		settings: { get: (key: string) => (key === "browser.screenshotDir" ? screenshotDir : undefined) },
+		settings: Settings.isolated({ "browser.screenshotDir": screenshotDir }),
 		getSessionFile: () => null,
 	} as unknown as ToolSession;
 }
 
 async function drainAllTabs(): Promise<void> {
+	// oxlint-disable-next-line unicorn/no-useless-spread -- releasing tabs mutates the map
 	for (const name of [...getTabsMapForTest().keys()]) {
 		await releaseTab(name, { kill: false }).catch(() => undefined);
 	}
@@ -218,7 +222,7 @@ describe("browser tab-supervisor — cmux tab close mid-run (#4499)", () => {
 
 			const session = makeSession("/tmp");
 			// The user code awaits `wait(60_000)` — which drives
-			// `waitForBrowserRun(60_000, signal)` -> `untilAborted(signal,
+			// `waitForRun(60_000, signal)` -> `untilAborted(signal,
 			// () => Bun.sleep(60_000))` INSIDE the runtime. Nothing hits the
 			// cmux socket, so on `main` the reviewer's exact scenario applies:
 			// even after `pending.reject` unblocks the caller, `runCmuxCode`
@@ -251,7 +255,7 @@ describe("browser tab-supervisor — cmux tab close mid-run (#4499)", () => {
 			// the map. This is the wire the reviewer asked us to check: the
 			// tab-close event must reach the cmux run body, not only the
 			// awaiting caller. Its `.signal.aborted` is the observable proof
-			// that `waitForBrowserRun` / cmux socket calls will unwind
+			// that `waitForRun` / cmux socket calls will unwind
 			// synchronously (via `untilAborted`) instead of blocking to the
 			// 60_000ms timeout.
 			const pendingBeforeRelease = [...(tabBeforeRelease?.pending.values() ?? [])];
@@ -284,6 +288,171 @@ describe("browser tab-supervisor — cmux tab close mid-run (#4499)", () => {
 		} finally {
 			process.removeListener("unhandledRejection", onUnhandled);
 		}
+	});
+
+	it("logs a user continuation rejection after its cmux run ends", async () => {
+		spyOn(CmuxSocketClient.prototype, "connect").mockResolvedValue(undefined);
+		spyOn(CmuxSocketClient.prototype, "close").mockImplementation(() => undefined);
+		const continuationStarted = Promise.withResolvers<void>();
+		const continuationGate = Promise.withResolvers<void>();
+		const globals = globalThis as typeof globalThis & {
+			__ompLateRejectionStarted?: () => void;
+			__ompLateRejectionGate?: Promise<void>;
+		};
+		globals.__ompLateRejectionStarted = continuationStarted.resolve;
+		globals.__ompLateRejectionGate = continuationGate.promise;
+
+		try {
+			spyOn(CmuxSocketClient.prototype, "request").mockImplementation(
+				async (method: string): Promise<Record<string, unknown>> => {
+					switch (method) {
+						case "browser.open_split":
+							return { surface_id: "surface-late-rejection", url: "about:blank" };
+						case "browser.url.get":
+							return { url: "about:blank" };
+						case "browser.snapshot":
+							return { page: { html: "" } };
+						case "browser.eval":
+							return { value: "" };
+						default:
+							return {};
+					}
+				},
+			);
+			const warningLogged = Promise.withResolvers<void>();
+			const warn = spyOn(logger, "warn").mockImplementation(message => {
+				if (message === "Unhandled rejection after browser run ended") warningLogged.resolve();
+			});
+			const browser = await acquireBrowser(makeKind("late-rejection"), { cwd: "/tmp" });
+			await acquireTab("late-rejection", browser, {
+				timeoutMs: 5_000,
+				ownerSessionId: "session-late-rejection",
+			});
+
+			const result = await runInTab("late-rejection", {
+				code: `
+					const guestStarted = Promise.withResolvers();
+					void tab.title().then(async () => {
+						guestStarted.resolve();
+						globalThis.__ompLateRejectionStarted();
+						await globalThis.__ompLateRejectionGate;
+						throw new Error("late cmux continuation failed");
+					});
+					await guestStarted.promise;
+					return "completed";
+				`,
+				timeoutMs: 5_000,
+				session: makeSession("/tmp"),
+			});
+			expect(result.returnValue).toBe("completed");
+			await continuationStarted.promise;
+			continuationGate.resolve();
+
+			await warningLogged.promise;
+			expect(warn).toHaveBeenCalledWith("Unhandled rejection after browser run ended", {
+				runId: expect.any(String),
+				error: "late cmux continuation failed",
+			});
+		} finally {
+			continuationGate.resolve();
+			delete globals.__ompLateRejectionStarted;
+			delete globals.__ompLateRejectionGate;
+		}
+	});
+
+	it("fails a browser error rethrown through a native promise combinator", async () => {
+		spyOn(CmuxSocketClient.prototype, "connect").mockResolvedValue(undefined);
+		spyOn(CmuxSocketClient.prototype, "close").mockImplementation(() => undefined);
+		spyOn(CmuxSocketClient.prototype, "request").mockImplementation(
+			async (method: string): Promise<Record<string, unknown>> => {
+				switch (method) {
+					case "browser.open_split":
+						return { surface_id: "surface-combinator-rejection", url: "about:blank" };
+					case "browser.url.get":
+						return { url: "about:blank" };
+					case "browser.snapshot":
+						return { page: { html: "" } };
+					case "browser.eval":
+						return { value: "" };
+					case "browser.navigate":
+						throw new Error("navigation failed");
+					default:
+						return {};
+				}
+			},
+		);
+		const browser = await acquireBrowser(makeKind("combinator-rejection"), { cwd: "/tmp" });
+		await acquireTab("combinator-rejection", browser, {
+			timeoutMs: 5_000,
+			ownerSessionId: "session-combinator-rejection",
+		});
+
+		const run = runInTab("combinator-rejection", {
+			code: `
+				void Promise.all([
+					tab.goto("https://example.test"),
+				]).catch(reason => {
+					throw reason;
+				});
+				await wait(60_000);
+				return "incorrect success";
+			`,
+			timeoutMs: 5_000,
+			session: makeSession("/tmp"),
+		});
+
+		await expect(run).rejects.toThrow("Unhandled rejection (missing await?): navigation failed");
+	});
+
+	it("aborts the cmux run facade before draining floated continuations", async () => {
+		spyOn(CmuxSocketClient.prototype, "connect").mockResolvedValue(undefined);
+		spyOn(CmuxSocketClient.prototype, "close").mockImplementation(() => undefined);
+		const delayedTitleStarted = Promise.withResolvers<void>();
+		const delayedTitleGate = Promise.withResolvers<Record<string, unknown>>();
+		let titleRequestCount = 0;
+		const navigatedUrls: string[] = [];
+		spyOn(CmuxSocketClient.prototype, "request").mockImplementation(
+			async (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
+				switch (method) {
+					case "browser.open_split":
+						return { surface_id: "surface-drain-abort", url: "about:blank" };
+					case "browser.url.get":
+						return { url: "about:blank" };
+					case "browser.snapshot":
+						return { page: { html: "" } };
+					case "browser.eval":
+						if (params.script === "document.title" && ++titleRequestCount > 1) {
+							delayedTitleStarted.resolve();
+							return await delayedTitleGate.promise;
+						}
+						return { value: "ready" };
+					case "browser.navigate":
+						navigatedUrls.push(String(params.url));
+						return { url: params.url };
+					default:
+						return {};
+				}
+			},
+		);
+		const browser = await acquireBrowser(makeKind("drain-abort"), { cwd: "/tmp" });
+		await acquireTab("drain-abort", browser, {
+			timeoutMs: 5_000,
+			ownerSessionId: "session-drain-abort",
+		});
+
+		const result = await runInTab("drain-abort", {
+			code: `
+				void tab.title().then(() => tab.goto("https://late.example"));
+				return "completed";
+			`,
+			timeoutMs: 5_000,
+			session: makeSession("/tmp"),
+		});
+		expect(result.returnValue).toBe("completed");
+		await delayedTitleStarted.promise;
+		delayedTitleGate.resolve({ value: "ready" });
+		for (let i = 0; i < 8; i++) await Promise.resolve();
+		expect(navigatedUrls).toEqual([]);
 	});
 
 	it("ignores the daemon screenshot path when no screenshot directory is configured", async () => {
@@ -379,5 +548,53 @@ describe("browser tab-supervisor — cmux tab close mid-run (#4499)", () => {
 		} finally {
 			await fs.rm(screenshotDir, { recursive: true, force: true });
 		}
+	});
+
+	it.each([
+		// The 2000x20 capture is padded to the vision limits, so the note maps each axis.
+		{ name: "measured", width: { value: 1000 }, note: "multiply x by 0.98" },
+		{ name: "missing", width: { value: "" }, note: "scale to CSS pixels could not be read" },
+		{ name: "failed", width: new Error("eval failed"), note: "scale to CSS pixels could not be read" },
+	])("screenshot coordinate note with $name viewport width", async ({ width, note }) => {
+		spyOn(CmuxSocketClient.prototype, "connect").mockResolvedValue(undefined);
+		spyOn(CmuxSocketClient.prototype, "close").mockImplementation(() => undefined);
+		// A 2x capture of a 1000 CSS px wide viewport.
+		const png = encodeRawPng(new Uint8Array(2000 * 20 * 3), 2000, 20, 3).toBase64();
+		spyOn(CmuxSocketClient.prototype, "request").mockImplementation(
+			async (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
+				switch (method) {
+					case "browser.open_split":
+						return { surface_id: "surface-screenshot-scale", url: "about:blank" };
+					case "browser.url.get":
+						return { url: "about:blank" };
+					case "browser.snapshot":
+						return { page: { html: "" } };
+					case "browser.eval":
+						if (params.script !== "window.innerWidth") return { value: "" };
+						if (width instanceof Error) throw width;
+						return width;
+					case "browser.screenshot":
+						return { png_base64: png };
+					default:
+						return {};
+				}
+			},
+		);
+
+		const browser = await acquireBrowser(makeKind("screenshot-scale"), { cwd: "/tmp" });
+		await acquireTab("screenshot-scale", browser, {
+			timeoutMs: 5_000,
+			ownerSessionId: "session-screenshot-scale",
+		});
+
+		const result = await runInTab("screenshot-scale", {
+			code: "return await tab.screenshot();",
+			timeoutMs: 5_000,
+			session: makeSession("/tmp"),
+		});
+		const text = result.displays.flatMap(block => (block.type === "text" ? [block.text] : [])).join("\n");
+		expect(text).toContain(note);
+		expect(result.displays.filter(block => block.type === "image")).toHaveLength(1);
+		if (typeof result.returnValue === "string") await fs.rm(result.returnValue);
 	});
 });

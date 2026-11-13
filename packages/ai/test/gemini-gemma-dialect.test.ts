@@ -83,17 +83,6 @@ describe("gemini dialect (Pythonic tool_code)", () => {
 		expect(calls[1]!.arguments).toEqual({ path: "out", content: "foo(,bar" });
 	});
 
-	it("parses parallel calls written as a [a, b] list", () => {
-		const calls = parsedCalls(
-			"gemini",
-			'```tool_code\n[default_api.read(path="a"), default_api.write(path="b", content="c")]\n```',
-		);
-		expect(calls).toEqual([
-			{ name: "read", arguments: { path: "a" } },
-			{ name: "write", arguments: { path: "b", content: "c" } },
-		]);
-	});
-
 	it("preserves prose outside the fence", () => {
 		const text = visibleText(scan("gemini", 'before\n```tool_code\ndefault_api.read(path="a")\n```\nafter'));
 		expect(text).toContain("before");
@@ -121,11 +110,11 @@ describe("gemini dialect (Pythonic tool_code)", () => {
 		]);
 	});
 
-	it("renders examples without a fence or print wrapper", () => {
+	it("renders a single call fenced with the default_api prefix", () => {
 		const definition = getDialectDefinition("gemini");
-		expect(definition.renderToolCall(call("read", { path: "a.ts" }), { example: true })).toBe('read(path="a.ts")');
-		expect(definition.renderAssistantToolCalls([call("read", { path: "a.ts" })], { example: true })).toBe(
-			'read(path="a.ts")',
+		expect(definition.renderToolCall(call("read", { path: "a.ts" }))).toBe('default_api.read(path="a.ts")');
+		expect(definition.renderAssistantToolCalls([call("read", { path: "a.ts" })])).toBe(
+			'```tool_code\ndefault_api.read(path="a.ts")\n```',
 		);
 	});
 
@@ -163,17 +152,6 @@ describe("gemma dialect (token-delimited call:NAME{…})", () => {
 			'<|tool_call>call:f{b:true,z:null,n:3,arr:[<|"|>a<|"|>,<|"|>b<|"|>],obj:{k:<|"|>v<|"|>}}<tool_call|>',
 		);
 		expect(calls[0]!.arguments).toEqual({ b: true, z: null, n: 3, arr: ["a", "b"], obj: { k: "v" } });
-	});
-
-	it("parses consecutive blocks as parallel calls", () => {
-		const calls = parsedCalls(
-			"gemma",
-			'<|tool_call>call:read{path:<|"|>a<|"|>}<tool_call|><|tool_call>call:write{path:<|"|>b<|"|>}<tool_call|>',
-		);
-		expect(calls).toEqual([
-			{ name: "read", arguments: { path: "a" } },
-			{ name: "write", arguments: { path: "b" } },
-		]);
 	});
 
 	it("yields the same call when streamed character by character", () => {

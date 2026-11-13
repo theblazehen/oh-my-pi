@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import {
+	isClipboardTerminalLocal,
 	readImageFromClipboard,
 	readMacFileUrlsFromClipboard,
 	readTextFromClipboard,
 } from "@oh-my-pi/pi-coding-agent/utils/clipboard";
-import * as native from "@oh-my-pi/pi-natives";
+import * as native from "@oh-my-pi/pi-natives/clipboard";
 import type { Subprocess } from "bun";
 
 type SpawnOptions = Bun.SpawnOptions.SpawnOptions<
@@ -14,14 +15,15 @@ type SpawnOptions = Bun.SpawnOptions.SpawnOptions<
 >;
 
 type SpawnCall = { cmd: string[]; options: SpawnOptions };
-
-function streamOf(text: string): ReadableStream<Uint8Array> {
-	const body = new Response(text).body;
-	if (!body) throw new Error("Failed to create response stream.");
-	return body;
+type SpawnOutput = string | Uint8Array;
+type SpawnOutputSource = SpawnOutput | SpawnOutput[] | ((cmd: string[]) => SpawnOutput);
+function streamOf(body: SpawnOutput): ReadableStream<Uint8Array> {
+	const stream = new Response(body).body;
+	if (!stream) throw new Error("Failed to create response stream.");
+	return stream;
 }
 
-function fakeProcess(stdout: string, exitCode = 0): Subprocess {
+function fakeProcess(stdout: SpawnOutput, exitCode = 0): Subprocess {
 	return {
 		pid: 1,
 		stdout: streamOf(stdout),
@@ -32,14 +34,17 @@ function fakeProcess(stdout: string, exitCode = 0): Subprocess {
 	} as unknown as Subprocess;
 }
 
-function spyPowershell(calls: SpawnCall[], stdout: string, exitCode = 0) {
+function spySpawn(calls: SpawnCall[], stdout: SpawnOutputSource, exitCode: number | number[] = 0) {
 	function mockSpawn(opts: SpawnOptions & { cmd: string[] }): Subprocess;
 	function mockSpawn(cmd: string[], opts?: SpawnOptions): Subprocess;
 	function mockSpawn(first: string[] | (SpawnOptions & { cmd: string[] }), second?: SpawnOptions): Subprocess {
 		const cmd = Array.isArray(first) ? first : first.cmd;
 		const options = Array.isArray(first) ? (second ?? ({} as SpawnOptions)) : (first as SpawnOptions);
 		calls.push({ cmd, options });
-		return fakeProcess(stdout, exitCode);
+		const output =
+			typeof stdout === "function" ? stdout(cmd) : Array.isArray(stdout) ? (stdout[calls.length - 1] ?? "") : stdout;
+		const code = Array.isArray(exitCode) ? (exitCode[calls.length - 1] ?? 0) : exitCode;
+		return fakeProcess(output, code);
 	}
 	return vi.spyOn(Bun, "spawn").mockImplementation(mockSpawn);
 }
@@ -86,7 +91,7 @@ describe("readImageFromClipboard on WSL", () => {
 		process.env.WAYLAND_DISPLAY = "wayland-0";
 
 		const calls: SpawnCall[] = [];
-		spyPowershell(calls, RED_1X1_PNG_BASE64);
+		spySpawn(calls, RED_1X1_PNG_BASE64);
 		const nativeSpy = vi.spyOn(native, "readImageFromClipboard");
 
 		const image = await readImageFromClipboard();
@@ -106,7 +111,7 @@ describe("readImageFromClipboard on WSL", () => {
 		process.env.WSL_INTEROP = "/run/WSL/1_interop";
 		process.env.WAYLAND_DISPLAY = "wayland-0";
 
-		spyPowershell([], "");
+		spySpawn([], "");
 		const nativeSpy = vi.spyOn(native, "readImageFromClipboard").mockResolvedValue(null);
 
 		const image = await readImageFromClipboard();
@@ -120,7 +125,7 @@ describe("readImageFromClipboard on WSL", () => {
 		process.env.WSL_DISTRO_NAME = "Ubuntu";
 		process.env.DISPLAY = ":0";
 
-		spyPowershell([], "noise", 1);
+		spySpawn([], "noise", 1);
 		const nativeSpy = vi.spyOn(native, "readImageFromClipboard").mockResolvedValue(null);
 
 		await readImageFromClipboard();
@@ -132,7 +137,7 @@ describe("readImageFromClipboard on WSL", () => {
 		process.env.WSL_DISTRO_NAME = "Ubuntu";
 		// No DISPLAY / WAYLAND_DISPLAY — arboard would reject, so we must short-circuit.
 
-		spyPowershell([], "");
+		spySpawn([], "");
 		const nativeSpy = vi.spyOn(native, "readImageFromClipboard");
 
 		expect(await readImageFromClipboard()).toBeNull();
@@ -151,25 +156,21 @@ describe("readImageFromClipboard dispatch", () => {
 		expect(nativeSpy).not.toHaveBeenCalled();
 	});
 
-	it("uses the PowerShell bridge on native Windows when arboard has no image payload", async () => {
+	it("trusts the native no-image answer on Windows without spawning PowerShell", async () => {
+		// Regression: a text-only clipboard used to wait ~1s on a cold
+		// powershell.exe GetImage() before Ctrl+V could paste the text.
 		setPlatform("win32");
-		const calls: SpawnCall[] = [];
-		spyPowershell(calls, RED_1X1_PNG_BASE64);
+		const spawnSpy = vi.spyOn(Bun, "spawn");
 		vi.spyOn(native, "readImageFromClipboard").mockResolvedValue(null);
 
-		const image = await readImageFromClipboard();
-
-		expect(calls).toHaveLength(1);
-		expect(calls[0]?.cmd[0]).toBe("powershell.exe");
-		expect(image?.mimeType).toBe("image/png");
-		expect(Array.from(image!.data.subarray(0, 8))).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-		expect(calls[0]?.cmd).toContain("-Sta");
+		expect(await readImageFromClipboard()).toBeNull();
+		expect(spawnSpy).not.toHaveBeenCalled();
 	});
 
 	it("falls back to PowerShell when native Windows image conversion fails", async () => {
 		setPlatform("win32");
 		const calls: SpawnCall[] = [];
-		spyPowershell(calls, RED_1X1_PNG_BASE64);
+		spySpawn(calls, RED_1X1_PNG_BASE64);
 		vi.spyOn(native, "readImageFromClipboard").mockRejectedValue(
 			new Error("The clipboard image could not be converted to the appropriate format."),
 		);
@@ -193,6 +194,41 @@ describe("readImageFromClipboard dispatch", () => {
 		expect(spawnSpy).not.toHaveBeenCalled();
 		expect(nativeSpy).toHaveBeenCalledTimes(1);
 	});
+
+	it("treats a throwing native image read as no image on linux with a display", async () => {
+		// Regression: an xclip-written text-only selection makes arboard's
+		// image read throw ("Unknown error ... incorrect type received from
+		// clipboard") instead of reporting no image. readImageFromClipboard
+		// must not propagate that — the smart-paste text fallback depends on
+		// a null return.
+		setPlatform("linux");
+		process.env.DISPLAY = ":0";
+		vi.spyOn(native, "readImageFromClipboard").mockRejectedValue(
+			new Error("Unknown error while interacting with the clipboard: incorrect type received from clipboard"),
+		);
+
+		expect(await readImageFromClipboard()).toBeNull();
+	});
+
+	it.each(["image/png", "image/jpeg", "image/gif", "image/webp"] as const)(
+		"reads %s bytes through wl-paste before the native bridge on Wayland-only Linux",
+		async mimeType => {
+			setPlatform("linux");
+			process.env.WAYLAND_DISPLAY = "wayland-0";
+			const data = Uint8Array.from([0x89, 0x50, 0x4e, 0x47]);
+			const calls: SpawnCall[] = [];
+			spySpawn(calls, [`text/plain\n${mimeType}\n`, data]);
+			const nativeSpy = vi.spyOn(native, "readImageFromClipboard");
+
+			const image = await readImageFromClipboard();
+
+			expect(calls).toHaveLength(2);
+			expect(calls[0]?.cmd).toEqual(["wl-paste", "--list-types"]);
+			expect(calls[1]?.cmd).toEqual(["wl-paste", "--type", mimeType]);
+			expect(image).toEqual({ data, mimeType });
+			expect(nativeSpy).not.toHaveBeenCalled();
+		},
+	);
 
 	it("returns null on Termux without spawning anything", async () => {
 		setPlatform("linux");
@@ -219,7 +255,7 @@ describe("readMacFileUrlsFromClipboard", () => {
 	it("splits osascript output into one path per non-empty line on darwin", async () => {
 		setPlatform("darwin");
 		const calls: SpawnCall[] = [];
-		spyPowershell(calls, "/Users/me/Pictures/photo.png\n/Users/me/Pictures/clip.jpg\n\n");
+		spySpawn(calls, "/Users/me/Pictures/photo.png\n/Users/me/Pictures/clip.jpg\n\n");
 
 		const paths = await readMacFileUrlsFromClipboard();
 
@@ -235,17 +271,55 @@ describe("readMacFileUrlsFromClipboard", () => {
 
 	it("returns an empty list when osascript exits non-zero (e.g. binary missing)", async () => {
 		setPlatform("darwin");
-		spyPowershell([], "", 127);
+		spySpawn([], "", 127);
 
 		expect(await readMacFileUrlsFromClipboard()).toEqual([]);
 	});
 });
 
 describe("readTextFromClipboard", () => {
+	it("falls back to xsel when xclip is unavailable on X11", async () => {
+		setPlatform("linux");
+		process.env.DISPLAY = ":0";
+		const calls: SpawnCall[] = [];
+		spySpawn(calls, ["", "from xsel"], [1, 0]);
+
+		expect(await readTextFromClipboard()).toBe("from xsel");
+		expect(calls.map(call => call.cmd)).toEqual([
+			["xclip", "-selection", "clipboard", "-o"],
+			["xsel", "--clipboard", "--output"],
+		]);
+	});
+
+	it("uses the xsel fallback when wl-paste fails in a mixed Wayland/X11 session", async () => {
+		setPlatform("linux");
+		process.env.WAYLAND_DISPLAY = "wayland-0";
+		process.env.DISPLAY = ":0";
+		const calls: SpawnCall[] = [];
+		spySpawn(calls, ["", "", "from xsel"], [1, 1, 0]);
+
+		expect(await readTextFromClipboard()).toBe("from xsel");
+		expect(calls.map(call => call.cmd)).toEqual([
+			["wl-paste", "--type", "text", "--no-newline"],
+			["xclip", "-selection", "clipboard", "-o"],
+			["xsel", "--clipboard", "--output"],
+		]);
+	});
+
+	it("requests UTF-8-capable text instead of the first Wayland MIME offer", async () => {
+		setPlatform("linux");
+		process.env.WAYLAND_DISPLAY = "wayland-0";
+		const calls: SpawnCall[] = [];
+		spySpawn(calls, cmd => (cmd.includes("text") ? "已提交75个样本" : "<strong>formatted text</strong>"));
+
+		expect(await readTextFromClipboard()).toBe("已提交75个样本");
+		expect(calls.map(call => call.cmd)).toEqual([["wl-paste", "--type", "text", "--no-newline"]]);
+	});
+
 	it("returns pbpaste stdout on darwin without touching execSync", async () => {
 		setPlatform("darwin");
 		const calls: SpawnCall[] = [];
-		spyPowershell(calls, "hello from pbpaste");
+		spySpawn(calls, "hello from pbpaste");
 
 		expect(await readTextFromClipboard()).toBe("hello from pbpaste");
 		expect(calls).toHaveLength(1);
@@ -254,7 +328,7 @@ describe("readTextFromClipboard", () => {
 
 	it("returns an empty string when the subprocess exits non-zero", async () => {
 		setPlatform("darwin");
-		spyPowershell([], "", 1);
+		spySpawn([], "", 1);
 
 		expect(await readTextFromClipboard()).toBe("");
 	});
@@ -297,7 +371,48 @@ describe("readTextFromClipboard", () => {
 			clearInterval(timer);
 		}
 		// If the read blocked the loop, ticks would stay at 0. A yielding
-		// implementation fires several ticks in the ~80ms window.
-		expect(ticks).toBeGreaterThanOrEqual(2);
+		// implementation must turn the loop to resolve the 80ms sleep, which
+		// fires the expired interval at least once — even under heavy parallel
+		// test load, where wall-clock tick counts are unreliable.
+		expect(ticks).toBeGreaterThanOrEqual(1);
+	});
+
+	it("reads Windows text natively with LF newlines and no PowerShell spawn", async () => {
+		setPlatform("win32");
+		const spawnSpy = vi.spyOn(Bun, "spawn");
+		vi.spyOn(native, "readTextFromClipboard").mockResolvedValue("line one\r\nline two");
+
+		expect(await readTextFromClipboard()).toBe("line one\nline two");
+		expect(spawnSpy).not.toHaveBeenCalled();
+	});
+
+	it("returns an empty string when the Windows clipboard holds no text", async () => {
+		setPlatform("win32");
+		const spawnSpy = vi.spyOn(Bun, "spawn");
+		vi.spyOn(native, "readTextFromClipboard").mockResolvedValue(null);
+
+		expect(await readTextFromClipboard()).toBe("");
+		expect(spawnSpy).not.toHaveBeenCalled();
+	});
+
+	it("falls back to PowerShell when the native Windows text read fails", async () => {
+		setPlatform("win32");
+		const calls: SpawnCall[] = [];
+		spySpawn(calls, "from powershell\r\n");
+		vi.spyOn(native, "readTextFromClipboard").mockRejectedValue(new Error("Failed to access clipboard"));
+
+		expect(await readTextFromClipboard()).toBe("from powershell\n");
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.cmd[0]).toBe("powershell.exe");
+	});
+});
+
+describe("isClipboardTerminalLocal", () => {
+	it("never trusts the system clipboard over SSH, even with a forwarded-looking display", () => {
+		const ssh = { SSH_CONNECTION: "10.0.0.2 50000 10.0.0.1 22" };
+		// A tmux session can keep a stale forward whose port a later SSH session now owns.
+		expect(isClipboardTerminalLocal({ ...ssh, DISPLAY: "localhost:10.0" })).toBe(false);
+		expect(isClipboardTerminalLocal({ ...ssh, DISPLAY: ":0", WAYLAND_DISPLAY: "wayland-0" })).toBe(false);
+		expect(isClipboardTerminalLocal({ DISPLAY: ":0" })).toBe(true);
 	});
 });

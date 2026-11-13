@@ -7,11 +7,23 @@ import { createOpenAIResponsesHistoryPayload } from "@oh-my-pi/pi-ai/utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { createCodexModel } from "./helpers";
 
-// Literal Harmony analysis-channel marker. openai-codex/gpt-5.x reject any
+// Literal Harmony analysis-channel marker. openai-codex/gpt-oss reject any
 // request whose input carries this reserved control-token spelling as data
 // (invalid_prompt / "Request blocked"), permanently poisoning the session.
 const MARKER = "<|channel|>analysis";
 const ESCAPED = "<\\|channel\\|>analysis";
+// JSON-encoded spelling of ESCAPED as it appears inside a `function_call.arguments`
+// document (the JSON-preserving escape doubles the backslash).
+const ESCAPED_JSON = "<\\\\|channel\\\\|>analysis";
+
+const ZERO_USAGE = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
 
 function harmonyPoisonedContext(): { context: Context; user: UserMessage; toolResult: ToolResultMessage } {
 	const user: UserMessage = {
@@ -24,15 +36,8 @@ function harmonyPoisonedContext(): { context: Context; user: UserMessage; toolRe
 		content: [{ type: "toolCall", id: "call_1", name: "grep", arguments: { pattern: "channel" } }],
 		api: "openai-codex-responses",
 		provider: "openai-codex",
-		model: "gpt-5.6-sol",
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
+		model: "gpt-oss-120b",
+		usage: ZERO_USAGE,
 		stopReason: "stop",
 		timestamp: 0,
 	};
@@ -52,6 +57,8 @@ function collectWireText(items: ResponseInput): string {
 	const parts: string[] = [];
 	for (const item of items) {
 		if ("output" in item && typeof item.output === "string") parts.push(item.output);
+		if ("arguments" in item && typeof item.arguments === "string") parts.push(item.arguments);
+		if ("input" in item && typeof item.input === "string") parts.push(item.input);
 		if ("content" in item) {
 			const content = item.content;
 			if (typeof content === "string") {
@@ -70,7 +77,7 @@ function collectWireText(items: ResponseInput): string {
 
 describe("issue #6913: Harmony control-token escaping at the request boundary", () => {
 	it("escapes markers in codex user text and tool results without mutating persisted history", () => {
-		const model = createCodexModel("gpt-5.6-sol");
+		const model = createCodexModel("gpt-oss-120b");
 		const { context, user, toolResult } = harmonyPoisonedContext();
 
 		const wire = collectWireText(convertCodexResponsesMessages(model, context));
@@ -85,8 +92,8 @@ describe("issue #6913: Harmony control-token escaping at the request boundary", 
 
 	it("escapes markers on the shared openai-responses builder for harmony models", () => {
 		const model = buildModel({
-			id: "gpt-5.6",
-			name: "gpt-5.6",
+			id: "gpt-oss-120b",
+			name: "gpt-oss-120b",
 			api: "openai-responses",
 			provider: "openai",
 			baseUrl: "https://api.openai.com/v1",
@@ -128,12 +135,12 @@ describe("issue #6913: Harmony control-token escaping at the request boundary", 
 		expect(wire).toContain(MARKER);
 	});
 
-	it("detects Harmony via the wire model id for deployment/catalog aliases", () => {
-		// Opaque local id, gpt-5.4 on the wire (Azure-style alias). The gate must
-		// resolve `requestModelId`, not the non-Harmony local id.
+	it("uses resolved gpt-oss identity for deployment/catalog aliases", () => {
+		// The catalog id carries lineage while requestModelId is an opaque Azure
+		// deployment name. The request boundary consumes the resolved identity.
 		const model = buildModel({
-			id: "my-azure-deployment",
-			requestModelId: "gpt-5.4",
+			id: "gpt-oss-120b",
+			requestModelId: "my-azure-deployment",
 			name: "my-azure-deployment",
 			api: "openai-responses",
 			provider: "azure",
@@ -156,8 +163,8 @@ describe("issue #6913: Harmony control-token escaping at the request boundary", 
 
 	it("escapes replayed native-history input items carrying a raw marker", () => {
 		const model = buildModel({
-			id: "gpt-5.6",
-			name: "gpt-5.6",
+			id: "gpt-oss-120b",
+			name: "gpt-oss-120b",
 			api: "openai-responses",
 			provider: "openai",
 			baseUrl: "https://api.openai.com/v1",
@@ -195,8 +202,8 @@ describe("issue #6913: Harmony control-token escaping at the request boundary", 
 
 	it("escapes replayed EasyInputMessage items that omit the type field", () => {
 		const model = buildModel({
-			id: "gpt-5.6",
-			name: "gpt-5.6",
+			id: "gpt-oss-120b",
+			name: "gpt-oss-120b",
 			api: "openai-responses",
 			provider: "openai",
 			baseUrl: "https://api.openai.com/v1",
@@ -229,5 +236,119 @@ describe("issue #6913: Harmony control-token escaping at the request boundary", 
 
 		expect(wire).toContain(ESCAPED);
 		expect(wire).not.toContain(MARKER);
+	});
+
+	it("escapes model-authored tool-call arguments in replayed codex assistant history", () => {
+		const model = createCodexModel("gpt-oss-120b");
+		// The model wrote an article *about* Harmony: its own stored function_call
+		// arguments legitimately contain reserved control-token spellings.
+		const storedArguments = JSON.stringify({ path: "post.md", content: `intro ${MARKER} outro` });
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call_w", name: "write", arguments: { path: "post.md" } }],
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			model: "gpt-oss-120b",
+			usage: ZERO_USAGE,
+			stopReason: "stop",
+			timestamp: 0,
+			providerPayload: createOpenAIResponsesHistoryPayload("openai-codex", [
+				{ type: "function_call", call_id: "call_w", name: "write", arguments: storedArguments },
+			]),
+		};
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call_w",
+			toolName: "write",
+			isError: false,
+			content: [{ type: "text", text: "wrote post.md" }],
+			timestamp: 0,
+		};
+
+		const items = convertCodexResponsesMessages(model, { messages: [assistant, toolResult] });
+		expect(collectWireText(items)).not.toContain(MARKER);
+
+		// Arguments must stay a valid JSON document that decodes to the inert spelling.
+		let argumentsOnWire = "";
+		for (const item of items) {
+			if (item.type === "function_call") argumentsOnWire = item.arguments;
+		}
+		expect(argumentsOnWire).toContain(ESCAPED_JSON);
+		expect(JSON.parse(argumentsOnWire).content).toContain(ESCAPED);
+	});
+
+	it("escapes assistant fallback text and tool-call arguments for harmony models", () => {
+		const model = createCodexModel("gpt-oss-120b");
+		// No native providerPayload — the block re-encode path used by
+		// full-transcript retries and cross-provider fallback.
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: `draft ${MARKER} section` },
+				{ type: "toolCall", id: "call_2", name: "write", arguments: { content: `body ${MARKER}` } },
+			],
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			model: "gpt-oss-120b",
+			usage: ZERO_USAGE,
+			stopReason: "stop",
+			timestamp: 0,
+		};
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call_2",
+			toolName: "write",
+			isError: false,
+			content: [{ type: "text", text: "ok" }],
+			timestamp: 0,
+		};
+
+		const wire = collectWireText(convertCodexResponsesMessages(model, { messages: [assistant, toolResult] }));
+		expect(wire).toContain(ESCAPED);
+		expect(wire).toContain(ESCAPED_JSON);
+		expect(wire).not.toContain(MARKER);
+	});
+
+	it("leaves model-authored arguments untouched for non-harmony models", () => {
+		const model = buildModel({
+			id: "claude-sonnet-4",
+			name: "claude-sonnet-4",
+			api: "openai-responses",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200000,
+			maxTokens: 64000,
+		});
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call_2", name: "write", arguments: { content: `body ${MARKER}` } }],
+			api: "openai-responses",
+			provider: "openrouter",
+			model: "claude-sonnet-4",
+			usage: ZERO_USAGE,
+			stopReason: "stop",
+			timestamp: 0,
+		};
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call_2",
+			toolName: "write",
+			isError: false,
+			content: [{ type: "text", text: "ok" }],
+			timestamp: 0,
+		};
+
+		const wire = collectWireText(
+			buildResponsesInput({
+				model,
+				context: { messages: [assistant, toolResult] },
+				strictResponsesPairing: false,
+				supportsImageDetailOriginal: false,
+			}),
+		);
+		expect(wire).toContain(MARKER);
 	});
 });

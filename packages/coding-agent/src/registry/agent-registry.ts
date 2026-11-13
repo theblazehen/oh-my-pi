@@ -3,75 +3,214 @@
  * every subagent), keyed by stable id.
  *
  * Tracks each agent's status and (when live) its AgentSession so peers can be
- * addressed by id (`hub`, `task resume`, `history://`). Sessions are
+ * addressed by id (`agent://`, `task resume`, `history://`). Sessions are
  * registered explicitly at creation; finished agents stay registered as
  * `idle` (live) or `parked` (session disposed, ref + sessionFile retained for
  * revival) and are only removed on explicit release/teardown.
  */
 
-import type { AgentSession } from "../session/agent-session";
-import { oneLineLabel } from "../task/types";
+import { logger } from "@oh-my-pi/pi-utils";
+import type { AgentSessionHandle } from "../session/agent-session-handle";
+import { AgentAwaits, type AgentAwaitsApi } from "./agent-awaits";
+import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
 
-export const MAIN_AGENT_ID = "Main";
+import { MAIN_AGENT_ID, type AgentStatus, type AgentMetricsSummary } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
+export { MAIN_AGENT_ID };
+export type { AgentStatus, AgentMetricsSummary };
 
-/**
- * - `running`: a turn is in flight.
- * - `idle`: live AgentSession in memory, awaiting work. Finished agents are
- *   `idle`, not removed.
- * - `parked`: session disposed; AgentRef + sessionFile retained, revivable.
- * - `aborted`: hard-killed, terminal.
- */
-export type AgentStatus = "running" | "idle" | "parked" | "aborted";
 /**
  * - `main`/`sub`: the user-facing agent tree (driving agent + task subagents).
  * - `advisor`: a passive review transcript persisted like a subagent for usage
  *   attribution and Agent Hub observability, but never a peer — hidden from
- *   agent-facing rosters (`hub`, `history://`) and not messageable/revivable.
+ *   agent-facing rosters (`proc://`, `history://`) and not messageable/revivable.
  */
 export type AgentKind = "main" | "sub" | "advisor";
 
+/**
+ * Run lifecycle milestones, stamped as they happen and scoped to the CURRENT
+ * run: they are cleared when the ref re-enters `running` for a follow-up or
+ * wake turn. Launch is the ref's `createdAt`; these are the post-launch
+ * boundaries the parent needs to tell a genuinely working agent from one whose
+ * accepted result never terminalized.
+ */
+export interface AgentRunLifecycle {
+	/** When the run produced its final response (an accepted terminal `yield`). */
+	responseAt?: number;
+	/** When the run's final result was accepted by its driver. */
+	acceptedAt?: number;
+	/** When the ref last left `running` for a terminal status. */
+	terminalAt?: number;
+}
+
+/** Historical identity and telemetry that remain available after the live session is disposed. */
+export interface AgentHistorySummary {
+	agent?: string;
+	modelRole?: string;
+	resolvedModel?: string;
+	/** Whether the last resolved model was selected by retry fallback routing. */
+	resolvedModelIsFallback?: boolean;
+	metrics?: AgentMetricsSummary;
+	/** Cumulative own-session assistant and model_usage cost, excluding nested task results. */
+	directCost?: number;
+	readOnly?: boolean;
+	/** Durable task output artifact, when the executor wrote one. */
+	outputPath?: string;
+	/** Captured isolated-worktree patch, when patch capture succeeded. */
+	patchPath?: string;
+	/** Isolated branch identity, when branch-mode capture succeeded. */
+	branchName?: string;
+	/** Captured nested-repo patches (`<id>.nested-<n>-<path>.patch`), one per nested repository the agent changed. */
+	nestedPatchPaths?: string[];
+}
+
 export interface AgentRef {
 	id: string;
+	/** Unique per ref object, minted by the owning registry; `register`/`reopen` mint a new one. */
+	readonly generation: number;
 	displayName: string;
 	kind: AgentKind;
 	parentId?: string;
 	status: AgentStatus;
 	/** Null exactly when parked/aborted. */
-	session: AgentSession | null;
+	session: AgentSessionHandle | null;
 	sessionFile: string | null;
 	createdAt: number;
 	lastActivity: number;
 	/** Short gist of what the agent is currently doing (latest intent or tool), for the work-aware roster. Display-only. */
 	activity?: string;
+	/** Persisted identity and telemetry restored after the live observer is gone. */
+	history?: AgentHistorySummary;
+	/** Run lifecycle milestones (launch is {@link createdAt}). */
+	lifecycle?: AgentRunLifecycle;
 }
 
-export type AgentRefExpectation = AgentRef | AgentSession;
+export type AgentRefExpectation = AgentRef | AgentSessionHandle;
+
+const kMintedRef = Symbol("agent-registry.ref");
+
+/** Whether `value` is a ref object minted by an {@link AgentRegistry} on this thread (thread bridges encode these). */
+export function isMintedAgentRef(value: unknown): value is AgentRef {
+	return typeof value === "object" && value !== null && Reflect.get(value, kMintedRef) === true;
+}
+
+/**
+ * Whether messaging `ref` resumes it: a live `idle` agent, or a `parked` or
+ * killed one whose transcript is on disk. Task summaries use it to tell the
+ * parent to resume a stopped agent instead of redoing its work.
+ */
+export function isResumable(ref: AgentRef | undefined): boolean {
+	if (ref?.status === "idle") return true;
+	return (ref?.status === "parked" || ref?.status === "aborted") && ref.sessionFile !== null;
+}
 
 export type RegistryEvent =
 	| { type: "registered"; ref: AgentRef }
 	| { type: "status_changed"; ref: AgentRef }
+	| { type: "metadata_changed"; ref: AgentRef }
 	| { type: "removed"; ref: AgentRef };
 
-type RegistryListener = (event: RegistryEvent) => void;
+/** Listener for {@link AgentRegistryApi.onChange}. */
+export type RegistryListener = (event: RegistryEvent) => void;
 
 export interface RegisterInput {
 	id: string;
 	displayName: string;
 	kind: AgentKind;
 	parentId?: string;
-	session: AgentSession | null;
+	session: AgentSessionHandle | null;
 	sessionFile?: string | null;
 	status?: AgentStatus;
+	/** Last persisted task summary, when restoring a historical agent. */
+	activity?: string;
+	/** Original registration timestamp, when known from persisted history. */
+	createdAt?: number;
+	/** Last transcript activity timestamp, when known from persisted history. */
+	lastActivity?: number;
+	/** Persisted identity and telemetry restored after the live observer is gone. */
+	history?: AgentHistorySummary;
+	/** Run lifecycle milestones restored from persisted history, when known. */
+	lifecycle?: AgentRunLifecycle;
 }
 
-export class AgentRegistry {
-	static #global: AgentRegistry | undefined;
+/** Public surface of the process-global agent registry, implemented locally on main and by a proxy in workers. */
+export interface AgentRegistryApi {
+	/** Which of these agents are blocked until others finish. */
+	readonly awaits: AgentAwaitsApi;
+	/** Register (or replace) the ref for `input.id`; always mints a new generation. */
+	register(input: RegisterInput): AgentRef;
+	/** Register an absent id, or reuse the exact detached `parked` ref `expected`. */
+	registerIfAvailable(input: RegisterInput, expected: AgentRef | null): AgentRef | undefined;
+	/** Start a fresh `parked` generation for the killed ref `expected`. */
+	reopen(id: string, expected: AgentRef): AgentRef | undefined;
+	/** Attach transcript-derived identity and telemetry without changing lifecycle state. */
+	setHistory(id: string, history: AgentHistorySummary, expectedSessionFile?: string): boolean;
+	/** Transition `id` to `status` when it still matches `expected`. */
+	setStatus(id: string, status: AgentStatus, expected?: AgentRefExpectation): boolean;
+	/** Record that the current run handed over its final result. */
+	markResultAccepted(id: string, expected?: AgentRefExpectation, responseAt?: number): boolean;
+	/** Accepted-but-running refs whose run already finished. */
+	staleAcceptedRuns(): AgentRef[];
+	/** Record a short activity gist for the work-aware roster. */
+	setActivity(id: string, activity: string): void;
+	/** Attach a live session to `id` when it still matches `expected`. */
+	attachSession(
+		id: string,
+		session: AgentSessionHandle,
+		sessionFile?: string | null,
+		expected?: AgentRefExpectation,
+	): boolean;
+	/** Detach the live session of `id` when it still matches `expected`. */
+	detachSession(id: string, expected?: AgentRefExpectation): boolean;
+	/** Remove `id` when it still matches `expected`. */
+	unregister(id: string, expected?: AgentRefExpectation): boolean;
+	/** The current ref for `id`. */
+	get(id: string): AgentRef | undefined;
+	/** Every registered ref. */
+	list(): AgentRef[];
+	/** Every alive non-advisor agent except `id`. */
+	listVisibleTo(id: string): AgentRef[];
+	/** Whether a ref's claimed running state is corroborated by its attached live session. */
+	isRunning(ref: AgentRef): boolean;
+	/**
+	 * Mirror a session's run-state notifications into ref `id`; returns the unsubscribe function.
+	 * A session that does not expose `subscribeRunState` (a minimal restorable shape) reports none.
+	 */
+	syncSessionStatus(id: string, session: AgentSessionHandle): () => void;
+	/** Subscribe to registry events; returns the unsubscribe function. */
+	onChange(listener: RegistryListener): () => void;
+}
 
-	static global(): AgentRegistry {
+/**
+ * Subscribe to a session's authoritative run-state transitions when it exposes
+ * them. Revival must work with a minimal restorable session shape (and with
+ * handles built before `subscribeRunState` existed), so a session without that
+ * method simply reports no transitions instead of breaking the revive; the
+ * ref's status then stays whatever the caller set, exactly as `isRunning`
+ * treats a ref whose session cannot corroborate it.
+ */
+export function subscribeSessionRunState(
+	session: AgentSessionHandle,
+	listener: (state: "running" | "idle") => void,
+): () => void {
+	const subscribe = (session as Partial<AgentSessionHandle>).subscribeRunState;
+	if (typeof subscribe !== "function") return () => {};
+	return subscribe.call(session, listener);
+}
+
+export class AgentRegistry implements AgentRegistryApi {
+	static #global: AgentRegistryApi | undefined;
+
+	/** The installed registry; lazily a local {@link AgentRegistry} unless a worker installed a proxy. */
+	static global(): AgentRegistryApi {
 		if (!AgentRegistry.#global) {
 			AgentRegistry.#global = new AgentRegistry();
 		}
 		return AgentRegistry.#global;
+	}
+
+	/** Install the process-global registry. Worker bootstrap only. */
+	static installGlobal(registry: AgentRegistryApi): void {
+		AgentRegistry.#global = registry;
 	}
 
 	/** Reset the global registry. Test-only. */
@@ -81,51 +220,180 @@ export class AgentRegistry {
 
 	readonly #refs = new Map<string, AgentRef>();
 	readonly #listeners = new Set<RegistryListener>();
+	/** Last generation minted for a ref object of this registry. */
+	#generation = 0;
+	/** Which of these agents are blocked until others finish. */
+	readonly awaits: AgentAwaitsApi = new AgentAwaits();
 
 	#matchesExpected(ref: AgentRef, expected?: AgentRefExpectation): boolean {
 		return expected === undefined || ref === expected || ref.session === expected;
+	}
+
+	#rejectStatusUpdate(id: string, status: AgentStatus, reason: string): false {
+		logger.debug("Agent registry status update rejected", { id, status, reason });
+		return false;
 	}
 
 	register(input: RegisterInput): AgentRef {
 		const now = Date.now();
 		const ref: AgentRef = {
 			id: input.id,
+			generation: ++this.#generation,
 			displayName: input.displayName,
 			kind: input.kind,
 			parentId: input.parentId,
 			status: input.status ?? "running",
 			session: input.session,
 			sessionFile: input.sessionFile ?? null,
-			createdAt: now,
-			lastActivity: now,
+			createdAt: input.createdAt ?? now,
+			lastActivity: input.lastActivity ?? now,
+			activity: input.activity,
+			history: input.history,
+			lifecycle: input.lifecycle,
 		};
+		Object.defineProperty(ref, kMintedRef, { value: true });
 		this.#refs.set(ref.id, ref);
 		this.#emit({ type: "registered", ref });
 		return ref;
 	}
 
 	/**
-	 * Register a new id only when it is absent, or reuse the exact ref a parked
-	 * revival was authorized to revive. A missing expected ref is a failed CAS:
-	 * callers must never claim an id after its prior generation disappeared.
+	 * Register a new id only when it is absent, or reuse the exact detached
+	 * `parked` ref a revival was authorized to revive. A missing, replaced, or
+	 * terminal expected ref is a failed CAS: delayed revivers must never claim an
+	 * id after its prior generation disappeared or was hard-killed.
 	 */
 	registerIfAvailable(input: RegisterInput, expected: AgentRef | null): AgentRef | undefined {
 		const current = this.#refs.get(input.id);
 		if (expected === null) return current ? undefined : this.register(input);
-		return current === expected ? current : undefined;
+		return current === expected && current.status === "parked" && !current.session ? current : undefined;
+	}
+
+	/**
+	 * Start a fresh `parked` generation for a killed (`aborted`, detached) ref so
+	 * {@link AgentLifecycleManager.ensureLive} can rebuild it from its transcript.
+	 * The killed ref object is retired, not mutated, so delayed work bound to it
+	 * still fails every expected-ref check. Returns undefined when `expected` is
+	 * no longer this id's detached tombstone.
+	 */
+	reopen(id: string, expected: AgentRef): AgentRef | undefined {
+		const current = this.#refs.get(id);
+		if (current !== expected || current.status !== "aborted" || current.session) return undefined;
+		return this.register({
+			id,
+			displayName: current.displayName,
+			kind: current.kind,
+			parentId: current.parentId,
+			session: null,
+			sessionFile: current.sessionFile,
+			status: "parked",
+			createdAt: current.createdAt,
+			history: current.history,
+		});
+	}
+
+	/** Attach transcript-derived identity and telemetry without changing lifecycle state. */
+	setHistory(id: string, history: AgentHistorySummary, expectedSessionFile?: string): boolean {
+		const ref = this.#refs.get(id);
+		if (!ref || (expectedSessionFile !== undefined && ref.sessionFile !== expectedSessionFile)) return false;
+		const definedHistory = Object.fromEntries(
+			Object.entries(history).filter(([, value]) => value !== undefined),
+		) as AgentHistorySummary;
+		const previousDirectCost = ref.history?.directCost;
+		const incomingDirectCost = definedHistory.directCost;
+		// Both writes are cumulative snapshots of this exact transcript. A delayed
+		// scan must not replace a newer park-time snapshot; unscoped updates retain
+		// their normal last-write semantics.
+		if (
+			expectedSessionFile !== undefined &&
+			typeof previousDirectCost === "number" &&
+			Number.isFinite(previousDirectCost) &&
+			previousDirectCost >= 0 &&
+			typeof incomingDirectCost === "number" &&
+			Number.isFinite(incomingDirectCost) &&
+			incomingDirectCost >= 0
+		) {
+			definedHistory.directCost = Math.max(previousDirectCost, incomingDirectCost);
+		}
+		ref.history = { ...ref.history, ...definedHistory };
+		this.#emit({ type: "metadata_changed", ref });
+		return true;
 	}
 
 	setStatus(id: string, status: AgentStatus, expected?: AgentRefExpectation): boolean {
 		const ref = this.#refs.get(id);
-		if (!ref || !this.#matchesExpected(ref, expected)) return false;
+		if (!ref) return this.#rejectStatusUpdate(id, status, "missing-ref");
+		if (!this.#matchesExpected(ref, expected)) {
+			return this.#rejectStatusUpdate(id, status, "session-ownership-changed");
+		}
+		// `aborted` is terminal for its generation: delayed progress/revival work
+		// from the killed ref must never transition it back to a live status. A
+		// deliberate revival goes through `reopen`, which mints a new ref.
+		if (ref.status === "aborted") {
+			return status === "aborted" || this.#rejectStatusUpdate(id, status, "aborted-is-terminal");
+		}
 		if (ref.status === status) return true;
+		const leftRunning = ref.status === "running";
 		ref.status = status;
 		// Activity describes current work; it is meaningless once the agent
 		// leaves `running`, so drop it to avoid showing stale work in rosters.
 		if (status !== "running") ref.activity = undefined;
 		ref.lastActivity = Date.now();
+		if (status === "running") {
+			// Milestones are run-scoped. A ref reused by a follow-up or wake
+			// turn must not carry the previous run's response/acceptance into
+			// the new run, or a later yield-less turn would look accepted.
+			ref.lifecycle = undefined;
+		} else if (leftRunning) {
+			ref.lifecycle = { ...ref.lifecycle, terminalAt: ref.lastActivity };
+		}
 		this.#emit({ type: "status_changed", ref });
 		return true;
+	}
+
+	/**
+	 * Record that this agent's run produced and handed over its final result,
+	 * and terminalize the ref when no turn is in flight. Acceptance is the
+	 * executor's run boundary: the result is settled, so a ref still `running`
+	 * with nothing streaming is a missed terminal transition the parent's
+	 * `wait` would otherwise keep blocking on. A ref with a genuinely
+	 * streaming session (a wake turn started at the boundary) stays `running`
+	 * and is surfaced by {@link staleAcceptedRuns} instead.
+	 *
+	 * Milestones are run-scoped: `responseAt` is the CURRENT call's response
+	 * time (never a previous run's, which {@link setStatus} cleared when the
+	 * ref re-entered `running`).
+	 *
+	 * Returns false when the id is gone, aborted, or no longer owned by
+	 * `expected`; those cases must not stamp a newer generation.
+	 */
+	markResultAccepted(id: string, expected?: AgentRefExpectation, responseAt?: number): boolean {
+		const ref = this.#refs.get(id);
+		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
+		const now = Date.now();
+		ref.lifecycle = {
+			...ref.lifecycle,
+			responseAt: responseAt ?? now,
+			acceptedAt: now,
+		};
+		if (ref.status === "running" && ref.session?.isStreaming !== true) {
+			this.setStatus(id, "idle", ref);
+		} else {
+			this.#emit({ type: "metadata_changed", ref });
+		}
+		return true;
+	}
+
+	/**
+	 * Accepted-but-running refs: the run's final result was handed over but the
+	 * ref never left `running`, and no turn is in flight. This is the lifecycle
+	 * leak the `proc://` running-agents roster reports so the parent can cancel it
+	 * instead of waiting on a run that already finished.
+	 */
+	staleAcceptedRuns(): AgentRef[] {
+		return this.list().filter(
+			ref => ref.status === "running" && ref.lifecycle?.acceptedAt !== undefined && !this.isRunning(ref),
+		);
 	}
 
 	/**
@@ -154,14 +422,23 @@ export class AgentRegistry {
 
 	attachSession(
 		id: string,
-		session: AgentSession,
+		session: AgentSessionHandle,
 		sessionFile?: string | null,
 		expected?: AgentRefExpectation,
 	): boolean {
 		const ref = this.#refs.get(id);
-		if (!ref || !this.#matchesExpected(ref, expected)) return false;
+		// Never attach a late-created session to a hard-killed tombstone. This
+		// closes the race between a parked reviver claiming the ref and finishing
+		// createAgentSession after an explicit kill.
+		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
 		ref.session = session;
-		if (sessionFile !== undefined) ref.sessionFile = sessionFile;
+		if (sessionFile !== undefined) {
+			// A replacement transcript starts a new cumulative-cost identity.
+			if (ref.sessionFile !== sessionFile && ref.history?.directCost !== undefined) {
+				ref.history = { ...ref.history, directCost: undefined };
+			}
+			ref.sessionFile = sessionFile;
+		}
 		ref.lastActivity = Date.now();
 		return true;
 	}
@@ -198,6 +475,19 @@ export class AgentRegistry {
 		return this.list().filter(
 			ref => ref.id !== id && ref.kind !== "advisor" && (ref.status === "running" || ref.status === "idle"),
 		);
+	}
+
+	/** Whether a ref's claimed running state is corroborated by its attached live session. */
+	isRunning(ref: AgentRef): boolean {
+		if (ref.status !== "running") return false;
+		return ref.session?.isStreaming === true;
+	}
+
+	/** Mirror a session's authoritative run-state notifications into its owned registry ref. */
+	syncSessionStatus(id: string, session: AgentSessionHandle): () => void {
+		return subscribeSessionRunState(session, status => {
+			this.setStatus(id, status, session);
+		});
 	}
 
 	onChange(listener: RegistryListener): () => void {

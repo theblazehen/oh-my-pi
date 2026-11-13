@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { searchSearXNG } from "@oh-my-pi/pi-coding-agent/web/search/providers/searxng";
 import { SearchProviderError } from "@oh-my-pi/pi-coding-agent/web/search/types";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -121,6 +122,51 @@ describe("SearXNG web search provider", () => {
 		expect(captured.url?.searchParams.get("language")).toBeNull();
 	});
 
+	it("sends configured category and safe-search filters and preserves instant answers", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "searxng-filters-"));
+		try {
+			await Bun.write(
+				path.join(agentDir, "config.yml"),
+				["searxng:", "  endpoint: https://searx.example.org", "  categories: news", "  safesearch: 2", ""].join(
+					"\n",
+				),
+			);
+			await Settings.init({ agentDir });
+
+			const captured: { url?: URL } = {};
+			const fetchMock: FetchImpl = input => {
+				captured.url = new URL(input.toString());
+				return Promise.resolve(
+					new Response(
+						JSON.stringify({
+							results: [{ title: "r", url: "https://example.com", snippet: "Fallback snippet" }],
+							answers: [
+								"  Forty-two  ",
+								{ template: "answer/legacy.html", answer: "Legacy answer" },
+								{
+									template: "answer/translations.html",
+									translations: [{ text: "Hallo" }, { text: "Guten Tag" }],
+								},
+							],
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					),
+				);
+			};
+
+			const response = await searchSearXNG({ query: "filtered answers", fetch: fetchMock });
+
+			expect(captured.url?.searchParams.get("categories")).toBe("news");
+			expect(captured.url?.searchParams.get("safesearch")).toBe("2");
+			expect(response.answer).toBe("Forty-two\n\nLegacy answer\n\nHallo\nGuten Tag");
+			expect(response.sources[0]?.snippet).toBe("Fallback snippet");
+		} finally {
+			// Settings.init opens <agentDir>/agent.db; Windows cannot delete an open database.
+			AgentStorage.close();
+			await removeWithRetries(agentDir);
+		}
+	});
+
 	it("reads Basic auth credentials from nested config.yml settings", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "searxng-settings-"));
 		try {
@@ -153,6 +199,7 @@ describe("SearXNG web search provider", () => {
 				`Basic ${Buffer.from("alice:s3cret", "utf-8").toString("base64")}`,
 			);
 		} finally {
+			AgentStorage.close();
 			await removeWithRetries(agentDir);
 		}
 	});
@@ -293,6 +340,36 @@ describe("SearXNG web search provider", () => {
 		expect(captured.headers?.get("Authorization")).toBe("Bearer bearer-token");
 	});
 
+	it("falls back to SEARXNG_ENDPOINT/SEARXNG_TOKEN when config.yml leaves them blank or null", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "searxng-blank-"));
+		try {
+			await Bun.write(path.join(agentDir, "config.yml"), ["searxng:", '  endpoint: ""', "  token:", ""].join("\n"));
+			await Settings.init({ agentDir });
+			process.env.SEARXNG_ENDPOINT = "https://searx-env.example.org";
+			process.env.SEARXNG_TOKEN = "env-token";
+
+			const captured: { url?: URL; headers?: Headers } = {};
+			const fetchMock: FetchImpl = (input, init) => {
+				captured.url = new URL(input.toString());
+				captured.headers = new Headers(init?.headers);
+				return Promise.resolve(
+					new Response(JSON.stringify({ results: [] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+				);
+			};
+
+			await searchSearXNG({ query: "blank config", fetch: fetchMock });
+
+			expect(captured.url?.origin).toBe("https://searx-env.example.org");
+			expect(captured.headers?.get("Authorization")).toBe("Bearer env-token");
+		} finally {
+			AgentStorage.close();
+			await removeWithRetries(agentDir);
+		}
+	});
+
 	it("resolves engine shortcuts via /config into canonical names for the engines parameter", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "searxng-engines-"));
 		try {
@@ -337,6 +414,7 @@ describe("SearXNG web search provider", () => {
 			const searchUrl = requested.find(url => url.pathname === "/search");
 			expect(searchUrl?.searchParams.get("engines")).toBe("duckduckgo,brave,unknown");
 		} finally {
+			AgentStorage.close();
 			await removeWithRetries(agentDir);
 		}
 	});
@@ -370,6 +448,7 @@ describe("SearXNG web search provider", () => {
 			const searchUrl = requested.find(url => url.pathname === "/search");
 			expect(searchUrl?.searchParams.get("engines")).toBe("ddg,brave");
 		} finally {
+			AgentStorage.close();
 			await removeWithRetries(agentDir);
 		}
 	});

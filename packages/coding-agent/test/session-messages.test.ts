@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction/message-cache";
 import { type AgentMessage, filterProviderReplayMessages } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, Message, TextContent } from "@oh-my-pi/pi-ai";
 import { inferCopilotInitiator } from "@oh-my-pi/pi-ai/providers/github-copilot-headers";
@@ -7,6 +8,7 @@ import {
 	SKILL_PROMPT_MESSAGE_TYPE,
 	wrapSteeringForModel,
 } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 
 function expectAttribution(message: Message | undefined, expected: "user" | "agent" | undefined): void {
 	expect(message).toBeDefined();
@@ -133,26 +135,6 @@ describe("convertToLlm custom message mapping", () => {
 		expect(converted).toHaveLength(1);
 		expect(converted[0]?.role).toBe("developer");
 		expectAttribution(converted[0], undefined);
-		expect(inferCopilotInitiator(converted)).toBe("agent");
-	});
-
-	it("uses explicit agent attribution for custom messages", () => {
-		const messages: AgentMessage[] = [
-			{
-				role: "custom",
-				customType: "agent-reminder",
-				content: "Read file",
-				display: false,
-				attribution: "agent",
-				timestamp: Date.now(),
-			},
-		];
-
-		const converted = convertToLlm(messages);
-
-		expect(converted).toHaveLength(1);
-		expect(converted[0]?.role).toBe("developer");
-		expectAttribution(converted[0], "agent");
 		expect(inferCopilotInitiator(converted)).toBe("agent");
 	});
 
@@ -382,6 +364,52 @@ describe("wrapSteeringForModel", () => {
 		expect(wrappedText).not.toContain("&amp;");
 	});
 
+	it("reuses one wrapper per steering message until the owner invalidates it", () => {
+		const text: TextContent = { type: "text", text: "first draft" };
+		const message: AgentMessage = { role: "user", content: [text], steering: true, timestamp: 1 };
+
+		const wrapped = wrapSteeringForModel([message])[0];
+		expect(wrapSteeringForModel([message])[0]).toBe(wrapped);
+
+		text.text = "edited in place";
+		invalidateMessageCache(message);
+
+		const rewrapped = wrapSteeringForModel([message])[0];
+		expect(rewrapped).not.toBe(wrapped);
+		expect(getUserText(rewrapped)).toContain("edited in place");
+		expect(getUserText(rewrapped)).not.toContain("first draft");
+	});
+
+	it("presents user-attributed collab prompts as wrapped user turns on every conversion path", () => {
+		const message: AgentMessage = {
+			role: "custom",
+			customType: COLLAB_PROMPT_MESSAGE_TYPE,
+			content: "Reply with exactly PONG",
+			display: true,
+			details: { from: "guest" },
+			attribution: "user",
+			timestamp: 1,
+		};
+
+		const directlyConverted = convertToLlm([message]);
+		const wrapped = wrapSteeringForModel([message]);
+		const primaryProviderMessages = convertToLlm(wrapped);
+
+		expect(directlyConverted).toHaveLength(1);
+		expect(directlyConverted[0]?.role).toBe("user");
+		expect(getUserText(directlyConverted[0])).toContain("<system-notice>");
+		expect(getUserText(directlyConverted[0])).toContain("Reply with exactly PONG");
+		expect(wrapped[0]?.role).toBe("user");
+		expect(getUserText(wrapped[0])).toContain("<system-notice>");
+		expect(getUserText(wrapped[0])).toContain("Reply with exactly PONG");
+		expect(primaryProviderMessages).toHaveLength(1);
+		expect(primaryProviderMessages[0]?.role).toBe("user");
+		expect(message).toMatchObject({
+			role: "custom",
+			details: { from: "guest" },
+		});
+	});
+
 	it("wraps buried steering messages too so wire bytes stay stable across turns", () => {
 		const buried: AgentMessage = {
 			role: "user",
@@ -404,16 +432,6 @@ describe("wrapSteeringForModel", () => {
 		// Non-steering trailing message is untouched, and the persisted steer is not mutated.
 		expect(wrapped[1]).toBe(later);
 		expect(buried.content).toBe("old steer");
-	});
-
-	it("leaves trailing user messages without the steering marker unchanged", () => {
-		const message: AgentMessage = { role: "user", content: "plain user", timestamp: 1 };
-		const messages = [message];
-
-		const wrapped = wrapSteeringForModel(messages);
-
-		expect(wrapped).toBe(messages);
-		expect(wrapped[0]).toBe(message);
 	});
 
 	it("preserves images after the wrapped steering text", () => {

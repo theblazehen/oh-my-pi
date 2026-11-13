@@ -1,5 +1,5 @@
-import { type } from "arktype";
-import { securityFindingSchema, securityScanBundleSchema, securityScanPlanSchema, securityScanSchema } from "./schemas";
+import { type } from "@oh-my-pi/omptype";
+import { getSecurityContractSchemas } from "./schemas";
 import type { SecurityFinding, SecurityScan, SecurityScanBundle, SecurityScanPlan } from "./types";
 
 function schemaError(label: string, errors: type.errors): Error {
@@ -7,24 +7,31 @@ function schemaError(label: string, errors: type.errors): Error {
 }
 
 export function parseSecurityFinding(value: unknown): SecurityFinding {
+	const { securityFindingSchema } = getSecurityContractSchemas();
 	const result = securityFindingSchema(value);
 	if (result instanceof type.errors) throw schemaError("Security finding", result);
 	return result as SecurityFinding;
 }
 
 export function parseSecurityScan(value: unknown): SecurityScan {
+	const { securityScanSchema } = getSecurityContractSchemas();
 	const result = securityScanSchema(value);
 	if (result instanceof type.errors) throw schemaError("Security scan", result);
 	return result as SecurityScan;
 }
 
 export function parseSecurityScanPlan(value: unknown): SecurityScanPlan {
+	const { securityScanPlanSchema } = getSecurityContractSchemas();
 	const result = securityScanPlanSchema(value);
 	if (result instanceof type.errors) throw schemaError("Security scan plan", result);
+	if (result.model.provider !== result.account.provider) {
+		throw new Error("Security scan authentication provider mismatch");
+	}
 	return result as SecurityScanPlan;
 }
 
 export function parseSecurityScanBundle(value: unknown): SecurityScanBundle {
+	const { securityScanBundleSchema } = getSecurityContractSchemas();
 	const result = securityScanBundleSchema(value);
 	if (result instanceof type.errors) throw schemaError("Security scan bundle", result);
 	const bundle = result as SecurityScanBundle;

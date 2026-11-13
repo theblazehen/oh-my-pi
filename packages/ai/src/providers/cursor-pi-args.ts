@@ -9,7 +9,7 @@
  *
  * Kept apart from `cursor/exec-modern.ts` on purpose: these are pure
  * string/path functions with no protobuf coupling, while that module pulls in
- * `@bufbuild/protobuf` and the generated `agent_pb` graph. The legacy shim is
+ * the generated cursor protobuf graph. The legacy shim is
  * compiled into the bundled virtual module registry, so importing it from a
  * nested path would drag the whole exec implementation in with it — and
  * `./providers/*` is a single-segment wildcard export that cannot serve a
@@ -22,29 +22,109 @@
 import * as path from "node:path";
 
 /**
+ * `xd://` tool-device URLs reject path selectors (`selectors: "none"`).
+ * Appending `:raw` makes `parseXdUrl` treat `tool:raw` as the device name and
+ * miss the mount (`No such tool: xd://wiki_observe:raw`).
+ */
+export function isXdDevicePath(readPath: string): boolean {
+	return readPath.trim().toLowerCase().startsWith("xd://");
+}
+
+/**
  * A `pi_read` range composed onto the path as `read`'s inline `:raw:N+K`
  * selector.
  *
- * `read` exposes no range kwargs, so an uncomposed range reads the whole file.
- * `offset` is a 1-indexed start clamped like the reference's
- * `Math.max(0, offset - 1)` over 0-indexed lines; `limit` is a line count.
- * `null` marks a present `limit: 0` — zero lines, which no selector expresses
- * and which must not degrade into a whole-file read.
+ * `read` exposes no range kwargs; `offset` and `limit` are composed onto the
+ * path. A negative offset needs the source line count and is resolved by the
+ * coding-agent bridge before calling this helper. `limit: 0` has no selector
+ * representation and returns `null`.
  *
- * The range is `raw` because a plain `:N+K` deliberately pads with one leading
- * and three trailing context lines: helpful for a human reading a snippet,
- * wrong for a caller that asked for exactly `limit` lines from `offset`. The
- * wire result is an opaque `output` string, so the hashline and line-number
- * gutter that `raw` also drops carry nothing the frame's contract needs.
- * A range-free read keeps the ordinary form — whole-file reads want them.
+ * Range selectors are raw because plain ranges add context lines. Cursor
+ * numbers the returned text itself, so it cannot use read's hashline gutter.
+ * Use [`cursorExecReadPath`] for a range-free read, which also needs `:raw`.
+ *
+ * Device URLs cannot take path selectors, so a ranged `xd://` read keeps the
+ * bare path and reads the whole device doc.
  */
 export function piReadPath(readPath: string, offset?: number, limit?: number): string | null {
 	if (limit !== undefined && Math.floor(limit) <= 0) return null;
 	const start = offset !== undefined ? Math.max(1, Math.floor(offset)) : undefined;
 	const count = limit !== undefined ? Math.floor(limit) : undefined;
 	if (start === undefined && count === undefined) return readPath;
-	if (start === undefined) return `${readPath}:raw:1+${count}`;
-	return count === undefined ? `${readPath}:raw:${start}-` : `${readPath}:raw:${start}+${count}`;
+	if (isXdDevicePath(readPath)) return readPath;
+	const base = readPath.split(":").some(chunk => chunk.toLowerCase() === "raw") ? readPath : `${readPath}:raw`;
+	if (start === undefined) return `${base}:1+${count}`;
+	return count === undefined ? `${base}:${start}-` : `${base}:${start}+${count}`;
+}
+
+const READ_RANGE_CHUNK_RE = /^L?(\d+)(?:(\.\.|[-+])L?(\d+)?)?$/i;
+
+function isReadRangeList(value: string): boolean {
+	return value.split(",").every(chunk => {
+		const match = READ_RANGE_CHUNK_RE.exec(chunk);
+		if (!match) return false;
+		const start = Number.parseInt(match[1]!, 10);
+		if (start < 1) return false;
+		const separator = match[2];
+		if (!separator) return true;
+		const end = match[3] ? Number.parseInt(match[3], 10) : undefined;
+		if (separator === "+") return end !== undefined && end >= 1;
+		return end === undefined || end >= start;
+	});
+}
+
+/**
+ * Whether a read path ends in an OMP line selector, including compound `raw`
+ * forms. Cursor uses this only to describe the operation already executed by
+ * the coding-agent read tool; the selector remains embedded in the path.
+ */
+export function piReadPathHasRange(readPath: string): boolean {
+	const chunks = readPath.split(":");
+	const last = chunks.at(-1);
+	if (last && isReadRangeList(last)) return true;
+	if (last?.toLowerCase() !== "raw") return false;
+	const preceding = chunks.at(-2);
+	return preceding !== undefined && isReadRangeList(preceding);
+}
+
+/**
+ * Force a Cursor exec read onto `read`'s verbatim `:raw` selector.
+ *
+ * Native `editToolCall` (StrReplace) materializes via `readArgs` then
+ * `writeArgs`. The server treats the read result as file bytes and writes
+ * them back. A hashline-formatted native read (`[path#TAG]` + `LINE:`
+ * prefixes) poisons that cycle: the write would persist the markup.
+ * `:raw` is the existing selector that drops both. A path that already
+ * carries `raw` is left alone; a range-only selector gets `raw` inserted
+ * so the range still applies without the gutter.
+ *
+ * Skipped for `xd://` devices: they advertise `selectors: "none"`, so a
+ * forced `:raw` is not peeled and becomes part of the device name.
+ */
+export function cursorRawReadPath(readPath: string): string {
+	if (isXdDevicePath(readPath)) return readPath;
+	const chunks = readPath.split(":");
+	if (chunks.some(chunk => chunk.toLowerCase() === "raw")) return readPath;
+	if (piReadPathHasRange(readPath)) {
+		const last = chunks.pop()!;
+		// Beside `raw` a bare `N` is that one line; the range-only `N` meant "from N".
+		const range = /^L?\d+$/i.test(last) ? `${last}-` : last;
+		return `${chunks.join(":")}:raw:${range}`;
+	}
+	return `${readPath}:raw`;
+}
+
+/**
+ * Raw selector for a Cursor exec read, including edit-owned materialization.
+ *
+ * Compose a requested window before forcing `:raw` on whole-file reads. The
+ * caller drops `offset`/`limit` after composing so the handler cannot append
+ * another selector.
+ */
+export function cursorExecReadPath(readPath: string, offset?: number, limit?: number): string | null {
+	const ranged = piReadPath(readPath, offset, limit);
+	if (ranged === null) return null;
+	return cursorRawReadPath(ranged);
 }
 
 /**
@@ -61,6 +141,7 @@ export function piReadPath(readPath: string, offset?: number, limit?: number): s
 export function piReadDisplayPath(readPath: string, offset?: number, limit?: number): string {
 	const composed = piReadPath(readPath, offset, limit);
 	if (composed !== null) return composed;
+	if (isXdDevicePath(readPath)) return readPath;
 	const start = offset !== undefined ? Math.max(1, Math.floor(offset)) : 1;
 	return `${readPath}:raw:${start}+0`;
 }
@@ -132,4 +213,66 @@ export function piLimit(limit: number | undefined): number | undefined {
  */
 export function piTimeout(timeout: number | undefined): number | undefined {
 	return timeout !== undefined && timeout >= 0 ? timeout : undefined;
+}
+
+/**
+ * Convert a legacy `ShellArgs`/`ShellStreamArgs` timeout into bash-tool seconds.
+ *
+ * Cursor states that budget in milliseconds — its own `ShellTimeout` result
+ * echoes it as `timeout_ms`, and `hard_timeout` documents the same unit — while
+ * the bash tool takes seconds and rejects anything past 3600, so forwarding the
+ * raw value turned a model-requested 15 s into `requested 15000s`. Sub-second
+ * budgets round up: 0 seconds means "no deadline" to the bash tool.
+ */
+export function shellTimeoutSeconds(timeoutMs: number | undefined): number | undefined {
+	if (!timeoutMs || timeoutMs <= 0) return undefined;
+	return Math.max(1, Math.round(timeoutMs / 1000));
+}
+
+/** The bash tool's deadline when its `timeout` is omitted. */
+const BASH_DEFAULT_DEADLINE_SECONDS = 300;
+/** The longest deadline the bash tool accepts; it clamps a longer one and annotates the result. */
+const BASH_MAX_DEADLINE_SECONDS = 3600;
+
+/**
+ * The bash-tool kill deadline, in seconds, for a Cursor `ShellArgs`/`ShellStreamArgs` frame.
+ *
+ * Cursor's `timeout` carries the model's `block_until_ms`, which Cursor's Shell tool documents as
+ * how long to block before moving the command to the background, not as a kill deadline; the kill
+ * deadline is `hard_timeout`. Without one, a short wait (`block_until_ms: 5000` on a build) must not
+ * kill the command: the deadline stays the bash default (`undefined`), raised to the wait only when
+ * the wait is longer.
+ *
+ * Cursor's native Shell sends a 24 h `hard_timeout` on every call. Both budgets stop at the bash
+ * ceiling here, so the tool does not clamp them itself and append a clamp notice to every result.
+ */
+export function shellDeadlineSeconds(args: { timeout: number; hardTimeout?: number }): number | undefined {
+	const hardSeconds = shellTimeoutSeconds(args.hardTimeout);
+	if (hardSeconds !== undefined) return Math.min(hardSeconds, BASH_MAX_DEADLINE_SECONDS);
+	const waitSeconds = shellTimeoutSeconds(args.timeout);
+	return waitSeconds !== undefined && waitSeconds > BASH_DEFAULT_DEADLINE_SECONDS
+		? Math.min(waitSeconds, BASH_MAX_DEADLINE_SECONDS)
+		: undefined;
+}
+
+/**
+ * Drop keys whose value is `undefined` so optional local-tool kwargs stay
+ * absent rather than present-as-undefined.
+ *
+ * The Cursor exec bridge historically wrote forms like
+ * `cwd: workingDirectory || undefined` and
+ * `case: caseInsensitive === true ? false : undefined`. ArkType rejects a
+ * present `undefined` on an optional field (`was undefined`) even though
+ * omitting the key is valid — which flooded Cursor sessions with bash/grep
+ * validation errors for otherwise fine frames.
+ */
+export function omitUndefinedArgs<T extends Record<string, unknown>>(
+	args: T,
+): { [K in keyof T]?: Exclude<T[K], undefined> } {
+	const out: Record<string, unknown> = {};
+	for (const key of Object.keys(args)) {
+		const value = args[key];
+		if (value !== undefined) out[key] = value;
+	}
+	return out as { [K in keyof T]?: Exclude<T[K], undefined> };
 }

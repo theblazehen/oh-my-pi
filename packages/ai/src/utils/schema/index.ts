@@ -1,8 +1,10 @@
 export * from "./adapt";
+export * from "./allowlist";
 export * from "./compatibility";
 export * from "./dereference";
 export * from "./draft";
 export * from "./equality";
+export * from "./foundation-models";
 export * from "./fields";
 export * from "./json-schema-validator";
 export * from "./meta-validator";
@@ -12,4 +14,3 @@ export * from "./strict-tool-validation";
 export * from "./types";
 export * from "./typescript";
 export * from "./wire";
-export * from "./zod-decontaminate";

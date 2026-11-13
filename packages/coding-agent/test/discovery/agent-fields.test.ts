@@ -1,9 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import { Effort } from "@oh-my-pi/pi-ai";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { parseAgentFields } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
-import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
+import { resolveBuiltinToolPlan, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 
 describe("parseAgentFields", () => {
+	test("rejects the reserved `main` and `sub` agent definition names", () => {
+		expect(parseAgentFields({ name: "main", description: "desc" })).toBeNull();
+		expect(parseAgentFields({ name: " Main ", description: "desc" })).toBeNull();
+		expect(parseAgentFields({ name: "sub", description: "desc" })).toBeNull();
+		expect(parseAgentFields({ name: " Sub ", description: "desc" })).toBeNull();
+	});
+
 	test("parses blocking from boolean frontmatter", () => {
 		const fields = parseAgentFields({
 			name: "reviewer",
@@ -77,24 +86,53 @@ describe("parseAgentFields", () => {
 		expect(fields?.thinkingLevel).toBeUndefined();
 	});
 
-	test("lowercases tool names", () => {
-		const fields = parseAgentFields({
-			name: "reviewer",
-			description: "desc",
-			tools: ["Read", "Search"],
-		});
-
-		expect(fields?.tools).toEqual(["read", "grep", "yield"]);
+	test("keeps an explicitly empty tools list distinct from an absent one", () => {
+		expect(parseAgentFields({ name: "quiet", description: "desc", tools: [] })?.tools).toEqual([]);
+		expect(parseAgentFields({ name: "quiet", description: "desc" })?.tools).toBeUndefined();
+		expect(parseAgentFields({ name: "quiet", description: "desc", tools: null })?.tools).toBeUndefined();
 	});
 
-	test("maps legacy search and find tool names", () => {
+	test.each([
+		["empty string", ""],
+		["non-string scalar", 42],
+		["non-string array", [1, 2]],
+	])("treats %s tools as an empty built-in allowlist", (_label, tools) => {
+		expect(parseAgentFields({ name: "quiet", description: "desc", tools })?.tools).toEqual([]);
+	});
+
+	test("keeps string entries in mixed tools arrays and normalizes aliases", () => {
+		expect(
+			parseAgentFields({ name: "reader", description: "desc", tools: [1, "Read", true, "Search"] })?.tools,
+		).toEqual(["read", "grep"]);
+	});
+
+	test("gives a malformed tools declaration only the required child yield tool, not default built-ins", async () => {
+		const fields = parseAgentFields({ name: "quiet", description: "desc", tools: 42 });
+		if (!fields) throw new Error("agent fields did not parse");
+		const session: ToolSession = {
+			cwd: "/tmp",
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "",
+			settings: Settings.isolated(),
+			taskDepth: 1,
+			requireYieldTool: true,
+			enableLsp: false,
+			skipPythonPreflight: true,
+		};
+
+		const plan = await resolveBuiltinToolPlan(session, fields.tools);
+		expect(plan.names).toEqual(["yield"]);
+	});
+
+	test("maps legacy search alias to grep and keeps find canonical", () => {
 		const fields = parseAgentFields({
 			name: "reviewer",
 			description: "desc",
 			tools: ["Find", "Glob", "Search", "Grep"],
 		});
 
-		expect(fields?.tools).toEqual(["glob", "grep", "yield"]);
+		expect(fields?.tools).toEqual(["find", "glob", "grep"]);
 	});
 
 	test("parses autoloadSkills from array frontmatter", () => {
@@ -180,5 +218,22 @@ describe("parseAgentFields", () => {
 	test("ignores empty and absent prewalk values", () => {
 		expect(parseAgentFields({ name: "worker", description: "desc", prewalk: "  " })?.prewalk).toBeUndefined();
 		expect(parseAgentFields({ name: "worker", description: "desc" })?.prewalk).toBeUndefined();
+	});
+	test("parses advisor from boolean frontmatter and boolean strings", () => {
+		expect(parseAgentFields({ name: "worker", description: "desc", advisor: true })?.advisor).toBe(true);
+		expect(parseAgentFields({ name: "worker", description: "desc", advisor: false })?.advisor).toBe(false);
+		expect(parseAgentFields({ name: "worker", description: "desc", advisor: "true" })?.advisor).toBe(true);
+		expect(parseAgentFields({ name: "worker", description: "desc", advisor: "false" })?.advisor).toBe(false);
+	});
+
+	test("parses advisor model pattern strings and ignores empty/absent values", () => {
+		expect(parseAgentFields({ name: "worker", description: "desc", advisor: " moonshot/k3 " })?.advisor).toBe(
+			"moonshot/k3",
+		);
+		expect(parseAgentFields({ name: "worker", description: "desc", advisor: "@smol:high" })?.advisor).toBe(
+			"@smol:high",
+		);
+		expect(parseAgentFields({ name: "worker", description: "desc", advisor: "  " })?.advisor).toBeUndefined();
+		expect(parseAgentFields({ name: "worker", description: "desc" })?.advisor).toBeUndefined();
 	});
 });

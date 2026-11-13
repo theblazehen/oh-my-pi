@@ -8,12 +8,16 @@ packages/*/dist/
 packages/*/dist-chrome/
 packages/*/dist-firefox/
 target/
+.xwin-cache/
 *.tsbuildinfo
 *.node
 *.b64.js
+/result
+/result-*
 
 # Environment
 .env
+.venv
 
 # Editors
 .vscode/
@@ -40,6 +44,11 @@ coverage/
 .nyc_output/
 packages/ai/test/.temp-images/
 
+# SQLite databases a run leaves in its agent dir (auth.db, models.db, ...)
+*.db
+*.db-shm
+*.db-wal
+
 # Project specific
 !.omp/
 .omp/plugins/
@@ -59,12 +68,11 @@ pi-*.html
 .close_issue.sh
 
 # Generated files
-packages/coding-agent/src/export/html/tool-views.generated.js
+packages/coding-agent/export-assets/
 packages/natives/npm/
-packages/coding-agent/src/utils/mupdf-wasm.wasm
 /runs/
-python/omp-rpc/src/omp_rpc.egg-info/
-python/omp-rpc/build/
+sdk/python/omp-rpc/src/omp_rpc.egg-info/
+sdk/python/omp-rpc/build/
 # parallel-agent worktrees
 .wt/
 CPU*.md
@@ -87,4 +95,7 @@ packages/coding-agent/bench/boot-baseline.json
 /bazel-out
 /bazel-testlogs
 /bazel-pi
+/bazel-oh-my-pi
 /.bazelrc.user
+
+.parity/

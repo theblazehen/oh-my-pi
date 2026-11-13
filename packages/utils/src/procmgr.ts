@@ -2,10 +2,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import type { Subprocess } from "bun";
-import { getAgentDir, MAIN_CONFIG_FILENAMES } from "./dirs";
+import { getAgentDir, getProjectDir, MAIN_CONFIG_FILENAMES } from "./dirs";
 import { $env, filterChildShellEnv } from "./env";
+import { isExecutable } from "./executable";
 import { $which } from "./which";
 
+export { isExecutable };
 export interface ShellConfig {
 	shell: string;
 	args: string[];
@@ -18,27 +20,31 @@ export interface ShellConfigOptions {
 	/** File path or runtime layer that supplied the active shell setting. */
 	configSource?: string;
 }
-let cachedShellConfig: ShellConfig | null = null;
-
+/** Auto-resolved shell (no custom path); kept until {@link refreshShellConfigCache}. */
+let cachedDefaultShellConfig: ShellConfig | null = null;
+/** Config for the most recent custom `shellPath`; never served once the path is cleared. */
+let cachedCustomShellConfig: ShellConfig | null = null;
 /**
- * Check if a shell binary is executable.
+ * The child-shell environment {@link refreshShellConfigCache} last captured. Unset
+ * until the first refresh, so spawn environments are built from the live environment.
  */
-export function isExecutable(path: string): boolean {
-	try {
-		fs.accessSync(path, fs.constants.X_OK);
-		return true;
-	} catch {
-		return false;
-	}
-}
+let capturedChildShellEnv: Record<string, string> | undefined;
+/**
+ * Project whose dotenv values the spawn environment filters out: the one current
+ * when it was first built or captured.
+ * That is normally the launch project, whose dotenv files Bun and omp load into
+ * `process.env`; a later session in another project must not receive them.
+ */
+let spawnEnvProjectDir: string | undefined;
 
 /**
  * Build the spawn environment (cached).
  */
 function buildSpawnEnv(shell: string): Record<string, string> {
 	const noCI = $env.PI_BASH_NO_CI || $env.CLAUDE_BASH_NO_CI;
+	spawnEnvProjectDir ??= getProjectDir();
 	return {
-		...filterChildShellEnv(Bun.env),
+		...(capturedChildShellEnv ?? filterChildShellEnv(Bun.env, spawnEnvProjectDir)),
 		SHELL: shell,
 		GIT_EDITOR: "true",
 		GPG_TTY: "not a tty",
@@ -50,12 +56,19 @@ function buildSpawnEnv(shell: string): Record<string, string> {
 
 /**
  * Get shell args for the resolved shell.
- * cmd.exe takes `/c`; POSIX shells take `-c`, with `-l` unless
- * PI_BASH_NO_LOGIN / CLAUDE_BASH_NO_LOGIN is set.
+ * cmd.exe takes `/c`; PowerShell (powershell.exe / pwsh) takes
+ * `-NoLogo -Command`, with `-NoProfile` when PI_BASH_NO_LOGIN /
+ * CLAUDE_BASH_NO_LOGIN is set (profile scripts are PowerShell's login-shell
+ * analog); POSIX shells take `-c`, with `-l` unless the same env is set.
+ *
+ * Exported for tests; `env` overrides the process env gate.
  */
-function getShellArgs(shell: string): string[] {
+export function getShellArgs(shell: string, env: Record<string, string | undefined> = $env): string[] {
 	if (isCmdShell(shell)) return ["/c"];
-	const noLogin = $env.PI_BASH_NO_LOGIN || $env.CLAUDE_BASH_NO_LOGIN;
+	const noLogin = env.PI_BASH_NO_LOGIN || env.CLAUDE_BASH_NO_LOGIN;
+	if (isPowerShell(shell)) {
+		return noLogin ? ["-NoLogo", "-NoProfile", "-Command"] : ["-NoLogo", "-Command"];
+	}
 	return noLogin ? ["-c"] : ["-l", "-c"];
 }
 
@@ -63,6 +76,23 @@ function getShellArgs(shell: string): string[] {
 export function isCmdShell(shell: string): boolean {
 	const basename = shell.replace(/\\/g, "/").split("/").pop()?.toLowerCase();
 	return basename === "cmd.exe" || basename === "cmd";
+}
+
+/**
+ * Whether the shell is Windows PowerShell or PowerShell Core (pwsh). Spawn
+ * paths must use `-Command`: passing the POSIX `-l -c` pair makes PowerShell
+ * parse `-l` as the command and fail with `The term '-l' is not recognized`.
+ */
+export function isPowerShell(shell: string): boolean {
+	const basename = shell.replace(/\\/g, "/").split("/").pop()?.toLowerCase();
+	return basename === "powershell.exe" || basename === "powershell" || basename === "pwsh.exe" || basename === "pwsh";
+}
+
+const POSIX_SHELL_PATTERN = /(?:^|[\\/])(?:sh|bash|dash|ash|ksh|zsh)(?:\.exe)?$/i;
+
+/** Whether the executable is a known shell whose command language uses POSIX quoting. */
+export function isPosixShell(shell: string): boolean {
+	return POSIX_SHELL_PATTERN.test(shell);
 }
 
 /**
@@ -112,7 +142,7 @@ export function resolveBasicShell(): string | undefined {
  * Resolve the external shell to advertise on Windows.
  *
  * A host bash is OPTIONAL: bash tool commands always execute in the embedded
- * brush-core shell. The resolved binary only serves the spawn-a-shell paths
+ * bash engine (pi-shell). The resolved binary only serves the spawn-a-shell paths
  * (interactive PTY sessions, ACP client terminals, SHELL env), so this
  * prefers a real Git Bash when one exists and otherwise falls back to
  * cmd.exe — it never fails.
@@ -163,6 +193,9 @@ export function resolveWindowsShell(env: Record<string, string | undefined> = Bu
  *    {@link resolveWindowsShell}) — never fails
  * 3. On Unix: $SHELL if bash/zsh, then fallback paths
  * 4. Fallback: sh
+ *
+ * Custom and auto-resolved configs are cached separately, so clearing
+ * `shellPath` mid-process immediately falls back to the platform default.
  */
 export function getShellConfig(customShellPath?: string, options: ShellConfigOptions = {}): ShellConfig {
 	const configSource = options.configSource ?? path.join(getAgentDir(), MAIN_CONFIG_FILENAMES[0]);
@@ -173,36 +206,56 @@ export function getShellConfig(customShellPath?: string, options: ShellConfigOpt
 		if (!fs.existsSync(customShellPath)) {
 			throw new Error(`Custom shell path not found: ${customShellPath}\nPlease update shellPath in ${configSource}`);
 		}
-		if (cachedShellConfig?.shell !== customShellPath) {
-			cachedShellConfig = buildConfig(customShellPath);
+		if (cachedCustomShellConfig?.shell !== customShellPath) {
+			cachedCustomShellConfig = buildConfig(customShellPath);
 		}
-		return cachedShellConfig;
+		return cachedCustomShellConfig;
 	}
-	if (cachedShellConfig) {
-		return cachedShellConfig;
-	}
+	cachedDefaultShellConfig ??= buildConfig(resolveDefaultShell());
+	return cachedDefaultShellConfig;
+}
 
+/**
+ * Capture the current process environment for child shells and drop both cached
+ * shell configs, so the next {@link getShellConfig} builds the spawn environment
+ * from that capture. Call right after code that changed `process.env` in a way
+ * child shells must see, such as extension session lifecycle handlers exporting
+ * session-scoped variables; later writes reach child shells only at the next call.
+ */
+export function refreshShellConfigCache(): void {
+	spawnEnvProjectDir ??= getProjectDir();
+	capturedChildShellEnv = filterChildShellEnv(Bun.env, spawnEnvProjectDir);
+	cachedDefaultShellConfig = null;
+	cachedCustomShellConfig = null;
+}
+
+/**
+ * Test-only: forget the capture and both cached shell configs, so the next
+ * {@link getShellConfig} builds from the live environment again. Production code
+ * MUST NOT call this; the capture's lifecycle is owned by {@link refreshShellConfigCache}.
+ */
+export function __resetShellConfigCacheForTests(): void {
+	capturedChildShellEnv = undefined;
+	spawnEnvProjectDir = undefined;
+	cachedDefaultShellConfig = null;
+	cachedCustomShellConfig = null;
+}
+
+/** Platform shell discovery used when no custom `shellPath` is configured. */
+function resolveDefaultShell(): string {
 	if (process.platform === "win32") {
-		cachedShellConfig = buildConfig(resolveWindowsShell());
-		return cachedShellConfig;
+		return resolveWindowsShell();
 	}
 
 	// Unix: prefer user's shell from $SHELL if it's bash/zsh and executable
 	const userShell = Bun.env.SHELL;
 	const isValidShell = userShell && (userShell.includes("bash") || userShell.includes("zsh"));
 	if (isValidShell && isExecutable(userShell)) {
-		cachedShellConfig = buildConfig(userShell);
-		return cachedShellConfig;
+		return userShell;
 	}
 
 	// 4. Fallback: use basic shell
-	const basicShell = resolveBasicShell();
-	if (basicShell) {
-		cachedShellConfig = buildConfig(basicShell);
-		return cachedShellConfig;
-	}
-	cachedShellConfig = buildConfig("sh");
-	return cachedShellConfig;
+	return resolveBasicShell() ?? "sh";
 }
 
 /**

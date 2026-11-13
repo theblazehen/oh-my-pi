@@ -1,15 +1,16 @@
 /**
  * Manage bundled task agents.
  */
+
 import { Args, Command, Flags, renderCommandHelp } from "@oh-my-pi/pi-utils/cli";
 import { type AgentsAction, type AgentsCommandArgs, runAgentsCommand } from "../cli/agents-cli";
-import { initTheme } from "../modes/theme/theme";
+import { agentsHelp as commandHelp } from "../cli/command-help";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 
 const ACTIONS: AgentsAction[] = ["unpack"];
 
 export default class Agents extends Command {
-	static description = "Manage bundled task agents";
-
+	static description = commandHelp.description;
 	static args = {
 		action: Args.string({
 			description: "Agents action",

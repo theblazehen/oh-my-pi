@@ -1,5 +1,5 @@
 /**
- * Gemini thinking-loop guard.
+ * Thinking-loop guard.
  *
  * Gemini models (notably `gemini-3.5-flash` via OpenRouter) occasionally fall
  * into a degenerate reasoning loop: they re-emit the same paragraph intent over
@@ -8,15 +8,20 @@
  * or answering. The runaway is *not* byte-identical, so a cheap verbatim
  * tail-repeat check alone misses it.
  *
- * This guard watches the streamed `thinking` deltas and, on a match, terminates
- * the stream with a synthetic `error` {@link AssistantMessage} that carries
- * **no observable content**. An empty-content `stopReason: "error"` message tagged
- * with `AIError.Flag.ThinkingLoop` lets result consumers and `AgentSession` discard
- * the runaway and re-sample instead of committing garbage transcript.
+ * This guard watches streamed deltas and, on a match, terminates the stream with
+ * a synthetic `error` {@link AssistantMessage} whose terminal content is empty.
+ * Deltas emitted before enough evidence accumulates may already be observable to
+ * a live streaming consumer; the empty terminal prevents the failed attempt from
+ * being committed or replayed. Tagged with `AIError.Flag.ThinkingLoop`, the
+ * result lets `AgentSession` discard the runaway and re-sample.
  *
- * Three failure shapes are detected:
- * 1. **Verbatim tail repetition** — a short unit repeated back-to-back (e.g.
- *    "🌊 🌊 🌊 …"). Caught from a rolling 250-char tail.
+ * Four failure shapes are detected:
+ * 1. **Exact suffix cycles** — a byte-identical unit repeated back-to-back,
+ *    including long cycles such as the observed 311-character Kiro runaway.
+ *    This bounded detector applies to every model the guard covers. A cycle
+ *    spanning a line break repeats whole lines — reasoning summarizers restate
+ *    one status line ("Still writing the parser...") while hidden work runs —
+ *    so it needs the long-cycle floor, not the short-stutter one.
  * 2. **Near-duplicate segments** — paragraphs that normalize to the same
  *    word-trigram fingerprint. Caught with a Jaccard window over recent
  *    paragraphs. Thresholds were calibrated on a real loop transcript plus
@@ -28,14 +33,27 @@
  *    vocabulary and name nothing concrete. Caught by a run of low-novelty,
  *    anchor-free segments; a segment naming a path/identifier resets the run, so
  *    genuine but vocabulary-repetitive work (per-file templates) is spared.
+ * 4. **Gemini summary-header runaway** — handled separately by
+ *    {@link GeminiHeaderRunDetector}.
  *
- * Scope is narrow: guarded Gemini/DeepSeek streams before any tool call. Native
- * thinking is checked first; assistant text can also be checked for providers
- * that surface reasoning as visible prose. On a hit the failed turn is emitted as
- * an empty retryable stream-stall error; result-awaiting callers (`complete`,
- * `completeSimple`) re-sample it a few times and then let a stubborn loop cook
- * through one unguarded pass. Disable detection with `PI_NO_THINKING_LOOP_GUARD=1`.
+ * The semantic heuristics (2, 3) judge prose only: code-shaped lines are dropped
+ * before analysis because legitimate code repeats one keyword skeleton with
+ * different literals, and numeric tokens are stripped during normalization.
+ *
+ * Scope: the `thinking-loop-guard` catalog axis picks the level per model line
+ * ({@link loopGuardLevel}): exact cycles by default, plus semantic heuristics
+ * for Gemini, DeepSeek, and Grok, and no guard for Claude. Thinking stays armed
+ * after a tool call starts — xAI/Grok can keep emitting `thinking_delta` after
+ * `toolcall_start`, and those deltas count as stream progress so the idle
+ * watchdog never fires. Visible assistant text still latches the thinking
+ * detector off. Native thinking is checked first; assistant text can also be
+ * checked for providers that surface reasoning as visible prose. On a hit the
+ * failed turn is emitted as an empty retryable stream-stall error;
+ * result-awaiting callers (`complete`, `completeSimple`) re-sample at most
+ * three guarded attempts and then fail closed. Disable detection with
+ * `PI_NO_THINKING_LOOP_GUARD=1`.
  */
+import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import type { Api, AssistantMessage, Model, StreamOptions } from "../types";
@@ -46,12 +64,24 @@ import { AssistantMessageEventStream } from "./event-stream";
  *  classifiers treat it as a transient (retryable) stop without bespoke rules. */
 export const THINKING_LOOP_ERROR_MARKER = "Thinking loop detected";
 
-/** Rolling tail (chars) inspected for verbatim back-to-back repetition. */
-const VERBATIM_TAIL_WINDOW = 250;
-/** Minimum total repeated chars before a verbatim run counts as a loop. */
-const VERBATIM_MIN_REPEATED_CHARS = 180;
-/** Longest unit length probed for a verbatim repeat. */
-const VERBATIM_MAX_UNIT = 60;
+/** Rolling tail retained for exact suffix-cycle detection. */
+const EXACT_TAIL_WINDOW = 4096;
+/** Longest exact cycle length considered. */
+const EXACT_MAX_UNIT = 1024;
+/** New characters between scans. Large deltas are scanned immediately. */
+const EXACT_CHECK_STRIDE = 128;
+/** Short cycles need four repeats covering at least this many characters. */
+const EXACT_SHORT_MAX_UNIT = 60;
+const EXACT_SHORT_MIN_REPEATED_CHARS = 180;
+/** Long cycles need at least three repeats covering at least this many chars.
+ *  Short cycles that span a line break need it too: those repeat whole lines,
+ *  which summarizer status lines do legitimately. */
+const EXACT_LONG_MIN_REPEATED_CHARS = 1024;
+/** Repeated characters before a punctuation-only run counts as a loop. Matches
+ *  {@link EXACT_LONG_MIN_REPEATED_CHARS}: a model that has emitted a kilobyte of
+ *  one punctuation cycle back-to-back is degenerate, while the short separators
+ *  real output produces (table rules, dividers) never reach it. */
+const EXACT_PUNCTUATION_MIN_REPEATED_CHARS = EXACT_LONG_MIN_REPEATED_CHARS;
 
 /** Char cap for an unterminated segment; forces a flush so a wall-of-text loop
  *  (no blank lines / headings) still segments. */
@@ -94,45 +124,29 @@ const LEX_STALL_MIN_RUN = 8;
 const CONCRETE_ANCHOR =
 	/`[^`]+`|\b\w{2,}\.[a-zA-Z]\w{0,4}\b|[\w-]+(?:\/[\w-]+){2,}|\b\w+_\w+\b|\b[a-z]+[A-Z]\w*\b|\b[A-Z][a-z]+[A-Z]\w*\b/g;
 
-const OPENAI_COMPAT_GUARDED_APIS: Partial<Record<Api, true>> = {
-	"openai-completions": true,
-	"openai-responses": true,
-	"azure-openai-responses": true,
-	"openai-codex-responses": true,
-};
+/** A whole line shaped like code rather than prose: a fence marker, an indented
+ *  line that is not a nested list item, or a line ending in a block, statement,
+ *  or markup delimiter. Classified per line rather than by fence state because Gemini
+ *  thought summaries routinely end inside an unclosed fence; tracking fences
+ *  would hide every later prose paragraph from the heuristics. */
+const CODE_LINE = /^(?:[ \t]*```.*|(?: {2,}|\t)(?![ \t]*(?:[-*+]|\d+[.)])[ \t]).*|.*[{}[\](;,>][ \t]*)$/gm;
 
 /**
- * True when `model` is a Gemini model whose native thinking stream surfaces the
- * "thought summary" titles this module's header guard counts.
- *
- * OpenAI-compat transports can serve Gemini under an arbitrary provider/id, so they
- * carry the explicit `compat.enableGeminiThinkingLoopGuard` flag; direct Gemini
- * transports carry a clearly shaped id/provider, so a string match is sufficient.
+ * How much of the loop guard runs on a stream: `off` none, `exact` only
+ * exact suffix cycles, `semantic` exact cycles plus the near-duplicate and
+ * progress-lexicon paragraph heuristics.
  */
-export function isGeminiThinkingModel(model: Model<Api>): boolean {
-	if (OPENAI_COMPAT_GUARDED_APIS[model.api]) {
-		const compat = model.compat as { enableGeminiThinkingLoopGuard?: boolean } | undefined;
-		return compat?.enableGeminiThinkingLoopGuard === true;
-	}
-	return /gemini/i.test(`${model.provider}/${model.id}`);
-}
+export type LoopGuardLevel = "off" | "exact" | "semantic";
 
 /**
- * True when `model` should be guarded for thinking/response loops (Gemini & DeepSeek).
- *
- * OpenAI-compat transports can serve Gemini or DeepSeek under an arbitrary provider/id.
- * Direct Gemini/DeepSeek transports carry a clearly shaped id/provider, so a string match
- * is sufficient.
+ * Loop-guard level for a model stream. `PI_NO_THINKING_LOOP_GUARD=1` and
+ * `loopGuard.enabled: false` turn it off; otherwise the model line's
+ * `thinking-loop-guard` catalog axis decides, and unassigned lines get `exact`.
  */
-export function isLoopGuardedModel(model: Model<Api>, options?: StreamOptions): boolean {
-	if (options?.loopGuard?.enabled === false) return false;
-	const isDeepseek = /deepseek/i.test(`${model.provider}/${model.id}`);
-	return isGeminiThinkingModel(model) || isDeepseek;
-}
-
-/** @deprecated Use isLoopGuardedModel instead. */
-export function isGeminiThinkingLoopModel(model: Model<Api>): boolean {
-	return isLoopGuardedModel(model);
+export function loopGuardLevel(model: Model<Api>, options?: StreamOptions): LoopGuardLevel {
+	if (process.env.PI_NO_THINKING_LOOP_GUARD === "1" || options?.loopGuard?.enabled === false) return "off";
+	const level = resolveCatalogPolicy(model).thinkingLoopGuard;
+	return level === "off" || level === "semantic" ? level : "exact";
 }
 
 /**
@@ -141,8 +155,10 @@ export function isGeminiThinkingLoopModel(model: Model<Api>): boolean {
  * is responsible for stopping after the first hit.
  */
 export class ThinkingLoopDetector {
-	/** Rolling char tail for verbatim repeat detection. */
+	/** Rolling char tail for exact suffix-cycle detection. */
 	#tail = "";
+	/** Total characters received when the exact detector last scanned. */
+	#exactScannedAt = 0;
 	/** Pending thinking text not yet split into completed segments. */
 	#pending = "";
 	/** Fingerprints of the most recent substantial segments (≤ SEGMENT_WINDOW). */
@@ -159,17 +175,26 @@ export class ThinkingLoopDetector {
 	 *  path/identifier every paragraph is still caught. */
 	#anchorWindow: Set<string>[] = [];
 
+	constructor(private readonly semanticHeuristics = true) {}
+
 	push(delta: string): string | null {
 		if (!delta) return null;
 
-		// 1. Verbatim back-to-back repetition over the rolling tail.
+		// 1. Exact suffix cycles. Scan at a bounded cadence rather than doing
+		// quadratic work for every token-sized delta.
 		this.#tail += delta;
-		if (this.#tail.length > VERBATIM_TAIL_WINDOW) this.#tail = this.#tail.slice(-VERBATIM_TAIL_WINDOW);
-		const verbatim = detectVerbatimRepetition(this.#tail);
-		if (verbatim) {
-			const [unit, times] = verbatim;
-			return `repeated "${unit.trim()}" ${times}× back-to-back`;
+		if (this.#tail.length > EXACT_TAIL_WINDOW) this.#tail = this.#tail.slice(-EXACT_TAIL_WINDOW);
+		this.#exactScannedAt += delta.length;
+		if (this.#exactScannedAt >= EXACT_CHECK_STRIDE || delta.length >= EXACT_CHECK_STRIDE) {
+			this.#exactScannedAt = 0;
+			const exact = detectExactSuffixCycle(this.#tail);
+			if (exact) {
+				const [unit, times] = exact;
+				return `repeated an exact ${unit.length}-character cycle ${times}× back-to-back`;
+			}
 		}
+
+		if (!this.semanticHeuristics) return null;
 
 		// 2. Near-duplicate paragraph loop. Append, then drain completed segments.
 		this.#pending += delta;
@@ -187,7 +212,7 @@ export class ThinkingLoopDetector {
 				return null;
 			}
 			// An over-long segment is chunked so each piece stays comparable.
-			for (let rest = raw; rest.length > 0; ) {
+			for (let rest = raw; rest.length > 0;) {
 				const chunk = rest.length > SEGMENT_CHAR_CAP ? rest.slice(0, SEGMENT_CHAR_CAP) : rest;
 				rest = rest.slice(chunk.length);
 				const hit = this.#consumeSegment(chunk);
@@ -200,7 +225,14 @@ export class ThinkingLoopDetector {
 	 *  terminator). Called when the thinking block ends so the final segment —
 	 *  which may be the one that completes a duplicate cluster — is not dropped. */
 	flush(): string | null {
-		if (!this.#pending) return null;
+		// A stream can end before the next cadence boundary. Force one final exact
+		// check even when semantic heuristics are disabled and #pending is empty.
+		const exact = detectExactSuffixCycle(this.#tail);
+		if (exact) {
+			const [unit, times] = exact;
+			return `repeated an exact ${unit.length}-character cycle ${times}× back-to-back`;
+		}
+		if (!this.semanticHeuristics || !this.#pending) return null;
 		let rest = this.#pending;
 		this.#pending = "";
 		while (rest.length > 0) {
@@ -215,9 +247,13 @@ export class ThinkingLoopDetector {
 	#consumeSegment(raw: string): string | null {
 		// Reasoning-summarizer titles ("**Maintaining Momentum**", "## Heading")
 		// are per-thought formatting, not chain-of-thought; their ever-changing
-		// wording would otherwise mask a loop by inflating novelty. Strip them
-		// before analysis (a title-only segment then falls below the length gate).
-		const segment = raw.replace(/^[ \t]*#{1,6}[ \t].*$/gm, "").replace(/^[ \t]*\*{2,3}.+?\*{2,3}[ \t]*$/gm, "");
+		// wording would otherwise mask a loop by inflating novelty. Strip them and
+		// code lines before analysis (a title- or code-only segment then falls below
+		// the length gate).
+		const segment = raw
+			.replace(CODE_LINE, "")
+			.replace(/^[ \t]*#{1,6}[ \t].*$/gm, "")
+			.replace(/^[ \t]*\*{2,3}.+?\*{2,3}[ \t]*$/gm, "");
 		const normalized = normalizeSegment(segment);
 		if (normalized.length < SEGMENT_MIN_NORM_CHARS) return null;
 
@@ -297,7 +333,7 @@ export class ThinkingLoopDetector {
  * real narration runaway burns dozens-to-hundreds of titles, so this still trips
  * fast on the actual pathology.
  */
-export const GEMINI_HEADER_RUNAWAY_THRESHOLD = 24;
+export const GEMINI_HEADER_RUNAWAY_THRESHOLD = 36;
 
 /**
  * True when a single trimmed line is a Gemini reasoning-summary title: a markdown
@@ -360,7 +396,7 @@ export class GeminiHeaderRunDetector {
 /**
  * Wrap a provider stream with the loop guard. `controller` is the guard's own
  * abort handle: aborting it (after wiring it into the provider's signal via
- * {@link withGeminiThinkingLoopGuard}) tears down the upstream once a loop
+ * {@link withThinkingLoopGuard}) tears down the upstream once a loop
  * trips.
  */
 export function guardThinkingLoopStream(
@@ -370,28 +406,65 @@ export function guardThinkingLoopStream(
 	options?: StreamOptions,
 ): AssistantMessageEventStream {
 	const outer = new AssistantMessageEventStream();
-	const thinkingDetector = new ThinkingLoopDetector();
-	const textDetector = new ThinkingLoopDetector();
+	const semanticHeuristics = loopGuardLevel(model, options) === "semantic";
+	const thinkingDetector = new ThinkingLoopDetector(semanticHeuristics);
+	const textDetector = new ThinkingLoopDetector(semanticHeuristics);
 	const checkAssistantContent = options?.loopGuard?.checkAssistantContent !== false;
 
 	void (async () => {
 		let thinkingArmed = true;
 		let textArmed = checkAssistantContent;
+		let textStarted = false;
+		// The provider's latest snapshot of this attempt, and when (wall clock,
+		// like its `timestamp`) its first delta arrived: the guard reports the
+		// attempt that tripped, not the wrapper's lifetime around retries. The
+		// attempt's start is kept as a value: providers that retry may reset
+		// the same output object's `timestamp` in place.
+		let snapshot: AssistantMessage | undefined;
+		let attemptStart: number | undefined;
+		let firstDeltaAt: number | undefined;
 		try {
 			for await (const event of inner) {
+				const next = "partial" in event ? event.partial : event.type === "done" ? event.message : undefined;
+				if (next) {
+					if (next.timestamp !== attemptStart) {
+						attemptStart = next.timestamp;
+						firstDeltaAt = undefined;
+					}
+					snapshot = next;
+				}
+				if (
+					firstDeltaAt === undefined &&
+					(event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta")
+				) {
+					firstDeltaAt = Date.now();
+				}
 				let detail: string | null = null;
-				if (thinkingArmed && event.type === "thinking_delta") {
-					detail = thinkingDetector.push(event.delta);
-				} else if (thinkingArmed && event.type === "thinking_end") {
-					detail = thinkingDetector.flush();
-					thinkingArmed = false;
-				} else if (event.type === "text_start" || event.type === "text_delta") {
-					thinkingArmed = false;
-					if (textArmed && event.type === "text_delta") {
+				if (event.type === "thinking_delta") {
+					// Re-arm after thinking_end / toolcall_start unless visible answer
+					// text has already latched the detector off. Grok/xAI Responses can
+					// keep reasoning after the first toolcall_start; those deltas still
+					// count as stream progress while the TUI sits on a streamed preview.
+					if (!textStarted) {
+						thinkingArmed = true;
+						detail = thinkingDetector.push(event.delta);
+					}
+				} else if (event.type === "thinking_end") {
+					if (thinkingArmed) {
+						detail = thinkingDetector.flush();
+					}
+				} else if (event.type === "text_start") {
+					// Responses emits this as soon as an empty message item is added.
+					// No visible answer text yet — do not latch the thinking detector.
+				} else if (event.type === "text_delta") {
+					if (event.delta.length > 0) {
+						thinkingArmed = false;
+						textStarted = true;
+					}
+					if (textArmed) {
 						detail = textDetector.push(event.delta);
 					}
 				} else if (event.type === "toolcall_start" || event.type === "toolcall_delta") {
-					thinkingArmed = false;
 					textArmed = false;
 				} else if (event.type === "done") {
 					if (thinkingArmed) {
@@ -413,7 +486,7 @@ export function guardThinkingLoopStream(
 					outer.push({
 						type: "error",
 						reason: "error",
-						error: buildThinkingLoopError(model, detail),
+						error: buildThinkingLoopError(model, detail, snapshot, firstDeltaAt),
 					});
 					return;
 				}
@@ -436,31 +509,45 @@ export function guardThinkingLoopStream(
 }
 
 /**
- * Apply the loop guard around a provider dispatch. For non-guarded models
- * (or when disabled) this is a transparent pass-through. For guarded models it injects a
- * guard abort signal into the provider call so a detected loop tears down the
- * upstream, then wraps the returned stream. The guard only raises the retryable
- * stall; bounding the re-samples and the final cook pass lives in the
- * result-awaiting caller.
+ * Apply the loop guard around a provider dispatch at the model's
+ * {@link loopGuardLevel}; `off` dispatches unwrapped. The guard injects an
+ * abort signal into the provider call so a detected loop tears down the
+ * upstream, then wraps the returned stream. Bounding result-path re-samples
+ * lives in the result-awaiting caller.
  */
-export function withGeminiThinkingLoopGuard<
+export function withThinkingLoopGuard<
 	O extends { signal?: AbortSignal; loopGuard?: { enabled?: boolean; checkAssistantContent?: boolean } },
 >(
 	model: Model<Api>,
 	options: O | undefined,
 	dispatch: (options: O | undefined) => AssistantMessageEventStream,
 ): AssistantMessageEventStream {
-	if (process.env.PI_NO_THINKING_LOOP_GUARD === "1" || !isLoopGuardedModel(model, options)) {
-		return dispatch(options);
-	}
+	if (loopGuardLevel(model, options) === "off") return dispatch(options);
 	const controller = new AbortController();
 	const caller = options?.signal;
 	const signal = caller ? AbortSignal.any([caller, controller.signal]) : controller.signal;
-	const merged = { ...(options ?? {}), signal } as O;
+	const merged = { ...options, signal } as O;
 	return guardThinkingLoopStream(dispatch(merged), model, controller, options);
 }
 
-function buildThinkingLoopError(model: Model<Api>, detail: string): AssistantMessage {
+/**
+ * The loop-abort error for one attempt. It keeps what the provider had
+ * reported for that attempt when the guard tripped (usage so far, start time,
+ * response id, and timing a finished snapshot already carries); otherwise
+ * duration and time to first delta run from the attempt's own start, since
+ * the provider's timers stop with the abort.
+ */
+function buildThinkingLoopError(
+	model: Model<Api>,
+	detail: string,
+	snapshot: AssistantMessage | undefined,
+	firstDeltaAt: number | undefined,
+): AssistantMessage {
+	const now = Date.now();
+	const duration = snapshot ? (snapshot.duration ?? now - snapshot.timestamp) : undefined;
+	const ttft =
+		snapshot?.ttft ??
+		(snapshot && firstDeltaAt !== undefined ? Math.max(0, firstDeltaAt - snapshot.timestamp) : undefined);
 	return {
 		role: "assistant",
 		// Empty content is load-bearing: loop-guard output is replay garbage, even
@@ -470,49 +557,82 @@ function buildThinkingLoopError(model: Model<Api>, detail: string): AssistantMes
 		api: model.api,
 		provider: model.provider,
 		model: model.id,
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
+		// Cloned: the provider keeps mutating its output while it tears down.
+		usage: snapshot?.usage
+			? structuredClone(snapshot.usage)
+			: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
 		stopReason: "error",
 		// "stream stall" makes the transport/session retry classifiers treat this
 		// as a transient (retryable) failure with no bespoke rule.
 		errorMessage: `${THINKING_LOOP_ERROR_MARKER}: the model repeated near-identical content (${detail}). Treating as a stream stall and retrying.`,
 		errorId: AIError.create(AIError.Flag.ThinkingLoop),
-		timestamp: Date.now(),
+		...(snapshot?.responseId && { responseId: snapshot.responseId }),
+		...(duration !== undefined && { duration }),
+		...(ttft !== undefined && { ttft }),
+		timestamp: snapshot?.timestamp ?? now,
 	};
 }
 
+/** Reused Z-array scratch; scans are synchronous, so one buffer suffices. */
+const exactZ = new Uint16Array(EXACT_MAX_UNIT + 1);
+
 /**
- * Detect a short unit repeated back-to-back at the tail (verbatim loop). Only a
- * unit carrying a letter or pictographic emoji counts — runs of digits,
- * whitespace or punctuation are legitimate in tabular / hex / numeric output.
+ * Detect an exact cycle at the text suffix. A Z-array over the reversed tail
+ * finds every possible suffix period in linear time without substring churn.
+ * The reversal is virtual (indexed from the end) and only `z[1..maxUnit]` is
+ * computed — the period check reads nothing past it, and each `z[i]` reads
+ * only `z[i - left]` with `i - left < i`, which is already filled. Short
+ * cycles retain the original 180-character/four-repeat sensitivity; long
+ * cycles and short ones spanning a line break require at least three repeats
+ * and 1024 repeated characters.
+ *
+ * A unit carrying a letter or an emoji matches at those thresholds. A unit with
+ * neither, such as the `?!?!` run a stuck model emits, matches only once it has
+ * repeated for {@link EXACT_PUNCTUATION_MIN_REPEATED_CHARS} characters, and never
+ * when it holds only digits and whitespace: padding, indentation and zero-filled
+ * hexdumps or literals are ordinary output at any length.
  */
-function detectVerbatimRepetition(text: string): [unit: string, count: number] | null {
-	if (text.length < VERBATIM_MIN_REPEATED_CHARS) return null;
-	const windowSize = Math.min(text.length, VERBATIM_TAIL_WINDOW);
-	const searchSpace = text.slice(-windowSize);
-
-	for (let len = 2; len <= VERBATIM_MAX_UNIT; len++) {
-		if (searchSpace.length < len * 4) continue;
-		const unit = searchSpace.slice(-len);
-		if (!/[\p{L}\p{Extended_Pictographic}]/u.test(unit)) continue;
-
-		let count = 0;
-		let pos = searchSpace.length;
-		while (pos >= len) {
-			if (searchSpace.slice(pos - len, pos) === unit) {
-				count++;
-				pos -= len;
-			} else {
-				break;
-			}
+function detectExactSuffixCycle(text: string): [unit: string, count: number] | null {
+	const n = text.length;
+	if (n < EXACT_SHORT_MIN_REPEATED_CHARS) return null;
+	const last = n - 1;
+	const maxUnit = Math.min(EXACT_MAX_UNIT, Math.floor(n / 3));
+	const z = exactZ;
+	let left = 0;
+	let right = 0;
+	for (let i = 1; i <= maxUnit; i++) {
+		let zi = i <= right ? Math.min(right - i + 1, z[i - left]) : 0;
+		while (i + zi < n && text.charCodeAt(last - zi) === text.charCodeAt(last - i - zi)) zi++;
+		z[i] = zi;
+		if (i + zi - 1 > right) {
+			left = i;
+			right = i + zi - 1;
 		}
-		if (count >= 4 && len * count >= VERBATIM_MIN_REPEATED_CHARS) return [unit, count];
+	}
+
+	for (let len = 2; len <= maxUnit; len++) {
+		const count = 1 + Math.floor(z[len] / len);
+		const minCount = len <= EXACT_SHORT_MAX_UNIT ? 4 : 3;
+		if (count < minCount) continue;
+		const unit = text.slice(-len);
+		if (/\p{L}|\p{Extended_Pictographic}/u.test(unit)) {
+			// `unit` is one whole period, so it holds a newline iff the cycle does.
+			const minChars =
+				len <= EXACT_SHORT_MAX_UNIT && !unit.includes("\n")
+					? EXACT_SHORT_MIN_REPEATED_CHARS
+					: EXACT_LONG_MIN_REPEATED_CHARS;
+			if (len * count >= minChars) return [unit, count];
+			continue;
+		}
+		if (/^[\p{N}\s]*$/u.test(unit)) continue;
+		if (len * count >= EXACT_PUNCTUATION_MIN_REPEATED_CHARS) return [unit, count];
 	}
 	return null;
 }

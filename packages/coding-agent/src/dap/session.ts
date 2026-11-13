@@ -219,6 +219,30 @@ function truncateOutput(session: DapSession, output: string): void {
 	}
 }
 
+/**
+ * Drain a `runInTerminal` debuggee's stdout into the session output buffer.
+ *
+ * `ptree.spawn` always pipes stdout and only eagerly drains stderr; the exposed
+ * stdout stream must be consumed or Bun buffers it unboundedly in this process
+ * (a chatty debuggee grows omp toward OOM). The reverse-request path has no
+ * terminal surface here, so route the child's stdout through {@link
+ * truncateOutput}: this bounds memory at `MAX_OUTPUT_BYTES` and surfaces the
+ * program's output to the agent, mirroring the adapter's own `output` events.
+ * Runs in the background for the child's lifetime; a killed child or closed pipe
+ * ends the loop quietly.
+ */
+async function drainTerminalStdout(stream: ReadableStream<Uint8Array>, session: DapSession): Promise<void> {
+	const decoder = new TextDecoder();
+	try {
+		for await (const chunk of stream) {
+			truncateOutput(session, decoder.decode(chunk, { stream: true }));
+		}
+		truncateOutput(session, decoder.decode());
+	} catch {
+		// Child killed or pipe closed mid-stream; nothing more to surface.
+	}
+}
+
 function summarizeBreakpointCount(breakpoints: Map<string, DapBreakpointRecord[]>): number {
 	let total = 0;
 	for (const entries of breakpoints.values()) {
@@ -253,7 +277,7 @@ function buildSummary(session: DapSession): DapSessionSummary {
 		exitCode: session.exitCode,
 		needsConfigurationDone: session.needsConfigurationDone && !session.configurationDoneSent,
 		parentSessionId: session.parentSessionId,
-		childSessionIds: session.childSessionIds.size > 0 ? [...session.childSessionIds] : undefined,
+		childSessionIds: session.childSessionIds.size > 0 ? Array.from(session.childSessionIds) : undefined,
 	};
 }
 
@@ -298,7 +322,7 @@ export class DapSessionManager {
 			session.needsConfigurationDone = session.capabilities.supportsConfigurationDoneRequest === true;
 			const launchArguments: DapLaunchArguments = {
 				...options.adapter.launchDefaults,
-				...(options.extraLaunchArguments ?? {}),
+				...options.extraLaunchArguments,
 				program: options.program,
 				cwd: options.cwd,
 				...(options.args !== undefined ? { args: options.args } : {}),
@@ -369,6 +393,10 @@ export class DapSessionManager {
 				timeoutMs,
 			);
 			session.needsConfigurationDone = session.capabilities.supportsConfigurationDoneRequest === true;
+			if (options.adapter.attachDefaults.skipAttachRequest === true) {
+				await this.#completeConfigurationHandshake(session, signal, timeoutMs);
+				return buildSummary(session);
+			}
 			const attachArguments: DapAttachArguments = {
 				...options.adapter.attachDefaults,
 				cwd: options.cwd,
@@ -484,7 +512,7 @@ export class DapSessionManager {
 						);
 					} catch (error) {
 						logger.warn("Failed to synchronize breakpoint request with child debug session", {
-							sessionId: session.id,
+							debugSessionId: session.id,
 							command,
 							error: toErrorMessage(error),
 						});
@@ -503,7 +531,7 @@ export class DapSessionManager {
 		const session = this.#touchActiveSession();
 		const sourcePath = normalizePath(file);
 		const root = this.#getRootSession(session);
-		const current = [...(root.breakpoints.get(sourcePath) ?? [])].filter(entry => entry.line !== line);
+		const current = Array.from(root.breakpoints.get(sourcePath) ?? []).filter(entry => entry.line !== line);
 		current.push({ verified: false, line, condition });
 		current.sort((left, right) => left.line - right.line);
 		const args = {
@@ -537,7 +565,7 @@ export class DapSessionManager {
 		const session = this.#touchActiveSession();
 		const sourcePath = normalizePath(file);
 		const root = this.#getRootSession(session);
-		const current = [...(root.breakpoints.get(sourcePath) ?? [])].filter(entry => entry.line !== line);
+		const current = Array.from(root.breakpoints.get(sourcePath) ?? []).filter(entry => entry.line !== line);
 		const args = {
 			source: { path: sourcePath, name: path.basename(sourcePath) },
 			breakpoints: current.map<DapSourceBreakpoint>(entry => ({
@@ -986,7 +1014,7 @@ export class DapSessionManager {
 				// of degrading a cancelled call into a successful partial result.
 				if (signal?.aborted) throw error;
 				logger.warn("Failed to list threads for debug session", {
-					sessionId: target.id,
+					debugSessionId: target.id,
 					error: toErrorMessage(error),
 				});
 				continue;
@@ -1112,7 +1140,7 @@ export class DapSessionManager {
 	async #terminateSessionTree(session: DapSession, signal?: AbortSignal, timeoutMs: number = 30_000): Promise<void> {
 		session.status = "terminated";
 		try {
-			for (const childId of [...session.childSessionIds]) {
+			for (const childId of Array.from(session.childSessionIds)) {
 				const child = this.#sessions.get(childId);
 				if (child) {
 					await this.#terminateSessionTree(child, signal, timeoutMs);
@@ -1133,7 +1161,8 @@ export class DapSessionManager {
 
 	#startCleanupTimer(): void {
 		if (this.#cleanupLoopPromise) return;
-		this.#cleanupLoopPromise = this.#runCleanupLoop();
+		// The manager serves every session in the process; its sweep names none.
+		this.#cleanupLoopPromise = logger.withoutContext(() => this.#runCleanupLoop());
 	}
 
 	async #runCleanupLoop(): Promise<void> {
@@ -1231,7 +1260,7 @@ export class DapSessionManager {
 				session.breakpoints.set(sourcePath, this.#mapSourceBreakpoints(entries, response?.breakpoints));
 			} catch (error) {
 				logger.warn("Failed to bind source breakpoints in child debug session", {
-					sessionId: session.id,
+					debugSessionId: session.id,
 					sourcePath,
 					error: toErrorMessage(error),
 				});
@@ -1253,7 +1282,7 @@ export class DapSessionManager {
 				session.functionBreakpoints = this.#mapFunctionBreakpoints(root.functionBreakpoints, response?.breakpoints);
 			} catch (error) {
 				logger.warn("Failed to bind function breakpoints in child debug session", {
-					sessionId: session.id,
+					debugSessionId: session.id,
 					error: toErrorMessage(error),
 				});
 			}
@@ -1269,7 +1298,7 @@ export class DapSessionManager {
 				session.instructionBreakpoints = root.instructionBreakpoints.map(entry => ({ ...entry }));
 			} catch (error) {
 				logger.warn("Failed to bind instruction breakpoints in child debug session", {
-					sessionId: session.id,
+					debugSessionId: session.id,
 					error: toErrorMessage(error),
 				});
 			}
@@ -1285,7 +1314,7 @@ export class DapSessionManager {
 				session.dataBreakpoints = root.dataBreakpoints.map(entry => ({ ...entry }));
 			} catch (error) {
 				logger.debug("Failed to bind data breakpoints in child debug session", {
-					sessionId: session.id,
+					debugSessionId: session.id,
 					error: toErrorMessage(error),
 				});
 			}
@@ -1293,12 +1322,12 @@ export class DapSessionManager {
 	}
 
 	async #ensureLaunchSlot(): Promise<void> {
-		for (const session of [...this.#sessions.values()]) {
+		for (const session of Array.from(this.#sessions.values())) {
 			if (session.status === "terminated" || !session.client.isAlive()) {
 				this.#disposeSession(session);
 			}
 		}
-		const root = [...this.#sessions.values()].find(session => !session.parentSessionId);
+		const root = Array.from(this.#sessions.values()).find(session => !session.parentSessionId);
 		if (!root) return;
 		throw new Error(`Debug session ${root.id} is still active. Terminate it before launching another.`);
 	}
@@ -1356,6 +1385,9 @@ export class DapSessionManager {
 				},
 				detached: true,
 			});
+			// Consume the child's stdout — ptree pipes it but drains only stderr,
+			// so an unconsumed stream buffers unboundedly in this process.
+			void drainTerminalStdout(proc.stdout, session);
 			return { processId: proc.pid } satisfies DapRunInTerminalResponse;
 		});
 		client.onReverseRequest("startDebugging", async rawArgs => {
@@ -1365,7 +1397,7 @@ export class DapSessionManager {
 				startArgs.configuration && typeof startArgs.configuration === "object" ? startArgs.configuration : {};
 			logger.debug("Adapter requested child debug session", {
 				adapter: session.adapter.name,
-				sessionId: session.id,
+				debugSessionId: session.id,
 				request,
 				name: typeof configuration.name === "string" ? configuration.name : undefined,
 			});
@@ -1377,7 +1409,9 @@ export class DapSessionManager {
 		});
 		client.onEvent("initialized", () => {
 			session.initializedSeen = true;
-			session.status = session.configurationDoneSent ? session.status : "configuring";
+			if (!session.configurationDoneSent && session.status === "launching") {
+				session.status = "configuring";
+			}
 		});
 		client.onEvent("stopped", body => {
 			this.#handleStoppedEvent(session, body as DapStoppedEventBody);
@@ -1430,7 +1464,7 @@ export class DapSessionManager {
 	#buildInitializeArguments(adapter: DapResolvedAdapter): DapInitializeArguments {
 		return {
 			clientID: "omp",
-			clientName: "Oh My Pi",
+			clientName: "omp",
 			adapterID: adapter.name,
 			locale: "en-US",
 			linesStartAt1: true,
@@ -1458,6 +1492,9 @@ export class DapSessionManager {
 		if (!session.needsConfigurationDone) {
 			if (session.parentSessionId) {
 				await this.#applyRootBreakpointsToSession(session, signal, timeoutMs);
+			}
+			if (session.status === "launching" || session.status === "configuring") {
+				session.status = "running";
 			}
 			return;
 		}
@@ -1520,7 +1557,7 @@ export class DapSessionManager {
 			this.#applyTopFrame(session, session.lastStackFrames[0]);
 		} catch (error) {
 			logger.debug("Failed to capture stopped frame", {
-				sessionId: session.id,
+				debugSessionId: session.id,
 				error: toErrorMessage(error),
 			});
 		}
@@ -1546,7 +1583,6 @@ export class DapSessionManager {
 	#prepareStopOutcome(session: DapSession, signal?: AbortSignal, timeoutMs: number = 30_000): Promise<unknown> {
 		const { promise, resolve, reject } = Promise.withResolvers<unknown>();
 		const rootSessionId = this.#getRootSession(session).id;
-		let timeout: NodeJS.Timeout | undefined;
 		let abortHandler: (() => void) | undefined;
 		const cleanup = () => {
 			clearTimeout(timeout);
@@ -1565,7 +1601,7 @@ export class DapSessionManager {
 			},
 		};
 		this.#treeOutcomeWaiters.add(waiter);
-		timeout = setTimeout(
+		const timeout = setTimeout(
 			() => waiter.reject(new Error(`DAP session tree outcome timed out after ${timeoutMs}ms`)),
 			timeoutMs,
 		);
@@ -1813,7 +1849,7 @@ export class DapSessionManager {
 
 	#resolveTreeOutcome(session: DapSession): void {
 		const rootId = this.#getRootSession(session).id;
-		for (const waiter of [...this.#treeOutcomeWaiters]) {
+		for (const waiter of Array.from(this.#treeOutcomeWaiters)) {
 			if (waiter.rootSessionId === rootId) {
 				waiter.resolve(undefined);
 			}
@@ -1822,7 +1858,7 @@ export class DapSessionManager {
 
 	#disposeSession(session: DapSession): void {
 		if (!this.#sessions.has(session.id)) return;
-		for (const childId of [...session.childSessionIds]) {
+		for (const childId of Array.from(session.childSessionIds)) {
 			const child = this.#sessions.get(childId);
 			if (child) this.#disposeSession(child);
 		}

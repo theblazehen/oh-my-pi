@@ -5,6 +5,7 @@ import {
 	extractFacts,
 	extractFactsSafe,
 	heuristicExtractFacts,
+	parseExtractedFactCategories,
 	parseFacts,
 } from "@oh-my-pi/pi-mnemopi/core/extraction";
 import { getExtractionStats, resetExtractionStats } from "@oh-my-pi/pi-mnemopi/core/extraction/diagnostics";
@@ -14,6 +15,7 @@ import {
 	setHostLlmBackend,
 } from "@oh-my-pi/pi-mnemopi/core/llm-backends";
 import {
+	type MnemopiLlmCompletionTask,
 	type ResolvedMnemopiRuntimeOptions,
 	withMnemopiRuntimeOptions,
 } from "@oh-my-pi/pi-mnemopi/core/runtime-options";
@@ -80,6 +82,14 @@ describe("structured extraction", () => {
 		).toEqual([]);
 	});
 
+	it("keeps plain-line facts up to the JSON path's total of 20", () => {
+		const lines = Array.from({ length: 25 }, (_, index) => `Detail ${index + 1} of the memory is kept`);
+		const output = lines.join("\n");
+
+		expect(parseExtractedFactCategories(output).facts).toEqual(lines.slice(0, 20));
+		expect(parseFacts(output)).toEqual(lines.slice(0, 5));
+	});
+
 	it("uses deterministic heuristic extraction when no LLM is configured", async () => {
 		process.env.MNEMOPI_LLM_ENABLED = "false";
 		const facts = await extractFactsSafe("My name is Ada. I work at Example Corp and I prefer dark mode.");
@@ -136,6 +146,7 @@ describe("structured extraction", () => {
 		process.env.MNEMOPI_LLM_ENABLED = "true";
 		let capturedPrompt = "";
 		let capturedTemperature = -1;
+		let capturedTask: MnemopiLlmCompletionTask | undefined;
 		const resolved: ResolvedMnemopiRuntimeOptions = {
 			llm: {
 				enabled: true,
@@ -143,6 +154,7 @@ describe("structured extraction", () => {
 				complete: (prompt, opts) => {
 					capturedPrompt = prompt;
 					capturedTemperature = opts?.temperature ?? -1;
+					capturedTask = opts?.task;
 					return "Sam works at Globex\nSam prefers dark mode";
 				},
 			},
@@ -155,7 +167,39 @@ describe("structured extraction", () => {
 		expect(facts).toEqual(["Sam works at Globex", "Sam prefers dark mode"]);
 		expect(capturedPrompt).toContain("ONLY-LINES for: Sam works at Globex and prefers dark mode.");
 		expect(capturedTemperature).toBe(0);
+		expect(capturedTask).toEqual({
+			kind: "memory-extraction",
+			input: "Sam works at Globex and prefers dark mode.",
+		});
 		expect(getExtractionStats().by_tier.host.successes).toBe(1);
+	});
+
+	it("bounds the model request from a long retained transcript while keeping its newest turn", async () => {
+		const transcript = `My name is Ada.\n${"middle ".repeat(3800)}CENTER_SHOULD_NOT_REACH_MODEL${"middle ".repeat(3900)}\nI prefer Neovim.`;
+		let modelInput = "";
+		let modelPrompt = "";
+		const facts = await withMnemopiRuntimeOptions(
+			{
+				llm: {
+					enabled: true,
+					complete: (prompt, opts) => {
+						modelInput = opts?.task?.input ?? "";
+						modelPrompt = prompt;
+						return modelInput.includes("I prefer Neovim.")
+							? '{"facts":["The user prefers Neovim"]}'
+							: '{"facts":[]}';
+					},
+				},
+			},
+			() => extractFacts(transcript),
+		);
+
+		expect(facts).toEqual(["The user prefers Neovim"]);
+		expect(modelInput.length).toBe(8192);
+		expect(modelInput).toContain("My name is Ada.");
+		expect(modelInput).not.toContain("CENTER_SHOULD_NOT_REACH_MODEL");
+		expect(modelPrompt).toContain(modelInput);
+		expect(modelPrompt).not.toContain(transcript);
 	});
 
 	it("extracts simple facts with the standalone heuristic helper", () => {

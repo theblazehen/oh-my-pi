@@ -34,19 +34,21 @@ describe("extension/hook loader process.exit guard (#3680)", () => {
 		return filePath;
 	};
 
-	const runProbe = async (probe: string) => {
-		const proc = Bun.spawn([process.execPath, "-e", probe], {
+	const runProbe = async (probe: string, preload: string[] = []) => {
+		const preloadArgs = preload.flatMap(file => ["--preload", file]);
+		const proc = Bun.spawn([process.execPath, ...preloadArgs, "-e", probe], {
 			cwd: path.resolve(import.meta.dir, "../../.."),
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
 		});
 		// Real process signals cannot use fake timers; this only bounds a wedged child.
+		// 2 s SIGKILLed healthy children (exit 137) on loaded CI runners.
 		const watchdog = setTimeout(() => {
 			try {
 				proc.kill("SIGKILL");
 			} catch {}
-		}, 2000);
+		}, 20_000);
 		try {
 			const [exitCode, stdout, stderr] = await Promise.all([
 				proc.exited,
@@ -67,6 +69,7 @@ describe("extension/hook loader process.exit guard (#3680)", () => {
 		return runProbe(`
 import { postmortem } from "@oh-my-pi/pi-utils";
 import { withHostGuard } from "@oh-my-pi/pi-coding-agent/extensibility/utils";
+postmortem.installProcessHandlers();
 
 postmortem.register("probe-cleanup", reason => {
 	process.stdout.write(\`cleanup:\${reason}\\n\`);
@@ -80,77 +83,52 @@ void withHostGuard(async () => {
 `);
 	};
 
-	it("converts a top-level process.exit in an extension into a load error", async () => {
-		const ext = writeModule("rogue-extension.ts", "process.exit(0)\n");
-		const cwd = project!.path();
-		const originalExit = process.exit;
-
-		const result = await loadExtensions([ext], cwd);
-
-		expect(process.exit).toBe(originalExit);
-		expect(result.extensions).toEqual([]);
-		expect(result.errors).toHaveLength(1);
-		expect(result.errors[0].path).toBe(ext);
-		expect(result.errors[0].error).toContain("process.exit(0)");
-	});
-
-	it("converts a top-level process.exit in a hook into a load error", async () => {
-		const hook = writeModule("rogue-hook.ts", "process.exit(42)\n");
-		const cwd = project!.path();
-		const originalExit = process.exit;
-
-		const result = await loadHooks([hook], cwd);
-
-		expect(process.exit).toBe(originalExit);
-		expect(result.hooks).toEqual([]);
-		expect(result.errors).toHaveLength(1);
-		expect(result.errors[0].path).toBe(hook);
-		expect(result.errors[0].error).toContain("process.exit(42)");
-	});
-
-	it("converts hard exits from extension and hook factories into load errors", async () => {
-		const extension = writeModule("factory-exit-extension.ts", "export default function(pi) { process.exit(31); }\n");
-		const hook = writeModule("factory-exit-hook.ts", "export default function(pi) { process.exit(32); }\n");
+	it("converts extension and hook exits into load errors without blocking siblings", async () => {
+		const topLevelExtension = writeModule("top-level-exit-extension.ts", "process.exit(0)\n");
+		const factoryExtension = writeModule(
+			"factory-exit-extension.ts",
+			"export default function(pi) { process.exit(31); }\n",
+		);
 		const reallyExitExtension = writeModule(
 			"factory-really-exit-extension.ts",
 			"export default function(pi) { process.reallyExit(33); }\n",
 		);
+		const goodExtension = writeModule(
+			"good-extension.ts",
+			"export default function(pi) { pi.registerCommand('ok', { handler: async () => {} }); }\n",
+		);
+		const topLevelHook = writeModule("top-level-exit-hook.ts", "process.exit(42)\n");
+		const factoryHook = writeModule("factory-exit-hook.ts", "export default function(pi) { process.exit(32); }\n");
 		const cwd = project!.path();
 		const originalExit = process.exit;
 		const originalReallyExit = process.reallyExit;
 
-		const extensionResult = await loadExtensions([extension], cwd);
-		const hookResult = await loadHooks([hook], cwd);
-		const reallyExitResult = await loadExtensions([reallyExitExtension], cwd);
+		const extensionResult = await loadExtensions(
+			[topLevelExtension, factoryExtension, reallyExitExtension, goodExtension],
+			cwd,
+		);
+		const hookResult = await loadHooks([topLevelHook, factoryHook], cwd);
 
 		expect(process.exit).toBe(originalExit);
 		expect(process.reallyExit).toBe(originalReallyExit);
-		expect(extensionResult.extensions).toEqual([]);
-		expect(extensionResult.errors).toHaveLength(1);
-		expect(extensionResult.errors[0].path).toBe(extension);
-		expect(extensionResult.errors[0].error).toContain("process.exit(31)");
+		expect(extensionResult.extensions.map(extension => path.basename(extension.path))).toEqual(["good-extension.ts"]);
+		expect(
+			extensionResult.errors.map(({ path: modulePath, error }) => [
+				modulePath,
+				error.match(/process\.(?:exit|reallyExit)\(\d+\)/)?.[0],
+			]),
+		).toEqual([
+			[topLevelExtension, "process.exit(0)"],
+			[factoryExtension, "process.exit(31)"],
+			[reallyExitExtension, "process.reallyExit(33)"],
+		]);
 		expect(hookResult.hooks).toEqual([]);
-		expect(hookResult.errors).toHaveLength(1);
-		expect(hookResult.errors[0].path).toBe(hook);
-		expect(hookResult.errors[0].error).toContain("process.exit(32)");
-		expect(reallyExitResult.extensions).toEqual([]);
-		expect(reallyExitResult.errors).toHaveLength(1);
-		expect(reallyExitResult.errors[0].path).toBe(reallyExitExtension);
-		expect(reallyExitResult.errors[0].error).toContain("process.reallyExit(33)");
-	});
-
-	it("loads sibling modules even when one of them tries to exit", async () => {
-		const bad = writeModule("rogue-extension.ts", "process.exit(0)\n");
-		const good = writeModule(
-			"good-extension.ts",
-			"export default function(pi) { pi.registerCommand('ok', { handler: async () => {} }); }\n",
-		);
-		const cwd = project!.path();
-
-		const result = await loadExtensions([bad, good], cwd);
-
-		expect(result.errors.map(e => e.path)).toEqual([bad]);
-		expect(result.extensions.map(e => path.basename(e.path))).toEqual(["good-extension.ts"]);
+		expect(
+			hookResult.errors.map(({ path: modulePath, error }) => [modulePath, error.match(/process\.exit\(\d+\)/)?.[0]]),
+		).toEqual([
+			[topLevelHook, "process.exit(42)"],
+			[factoryHook, "process.exit(32)"],
+		]);
 	});
 
 	it("restores process.exit after a synchronous throw inside the guarded callback", async () => {
@@ -190,14 +168,66 @@ try {
 		expect(stderr).toBe("");
 	});
 
-	it("lets host SIGINT exit once while a guarded callback remains pending", async () => {
-		const { exitCode, stdout, stderr } = await runGuardedShutdownProbe("sigint");
+	it("exits cleanly on Ctrl+D while deferred extension loading guards process.exit", async () => {
+		const { exitCode, stdout, stderr } = await runProbe(`
+import * as path from "node:path";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { withHostGuard } from "@oh-my-pi/pi-coding-agent/extensibility/utils";
+import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 
-		expect(exitCode).toBe(130);
-		expect(stdout).toBe("guard-active\ncleanup:sigint\n");
+const dir = TempDir.createSync("@omp-deferred-quit-");
+await Settings.init({ inMemory: true, cwd: dir.path() });
+initTheme();
+const auth = await AuthStorage.create(path.join(dir.path(), "auth.db"));
+const registry = new ModelRegistry(auth);
+const model = registry.find("anthropic", "claude-sonnet-4-5");
+if (!model) throw new Error("expected bundled model");
+const session = new AgentSession({
+	agent: new Agent({ initialState: { model, systemPrompt: ["test"], tools: [], messages: [] } }),
+	sessionManager: SessionManager.inMemory(dir.path()),
+	settings: Settings.isolated(),
+	modelRegistry: registry,
+});
+const mode = new InteractiveMode(session, "test");
+mode.ui.requestRender = () => {};
+mode.ui.terminal.drainInput = async () => {};
+postmortem.register("probe-cleanup", () => {
+	auth.close();
+	dir.removeSync();
+	process.stdout.write("cleanup:manual\\n");
+});
+void withHostGuard(async () => {
+	mode.handleCtrlD();
+	// A real child needs a live event-loop handle until shutdown reaches guarded quit.
+	await Bun.sleep(10_000);
+});
+`);
+
+		expect(exitCode).toBe(0);
+		expect(stdout).toContain("cleanup:manual\n");
 		expect(stderr).not.toContain("[Unhandled Rejection]");
 		expect(stderr).not.toContain("ExtensionExitError");
 	});
+
+	// Windows cannot deliver a catchable SIGINT via process.kill: libuv terminates the process outright.
+	it.skipIf(process.platform === "win32")(
+		"lets host SIGINT exit once while a guarded callback remains pending",
+		async () => {
+			const { exitCode, stdout, stderr } = await runGuardedShutdownProbe("sigint");
+
+			expect(exitCode).toBe(130);
+			expect(stdout).toBe("guard-active\ncleanup:sigint\n");
+			expect(stderr).not.toContain("[Unhandled Rejection]");
+			expect(stderr).not.toContain("ExtensionExitError");
+		},
+	);
 
 	it("lets fatal cleanup exit once while a guarded callback remains pending", async () => {
 		const { exitCode, stdout, stderr } = await runGuardedShutdownProbe("fatal");
@@ -208,6 +238,40 @@ try {
 		expect(stderr).toContain("Error: probe fatal");
 		expect(stderr).not.toContain("ExtensionExitError");
 	});
+
+	// Windows has no SIGHUP delivery: process.kill(pid, "SIGHUP") fails with ENOSYS.
+	it.skipIf(process.platform === "win32")(
+		"exits cleanly on host SIGHUP when postmortem initialized inside a guard window (#7393)",
+		async () => {
+			// Mirror the shipped bundle: install handlers while the preload guards
+			// process.reallyExit, then restore it before the SIGHUP exit path resolves
+			// the native primitive.
+			const preload = writeModule(
+				"guard-init-preload.ts",
+				"globalThis.__ompNativeReallyExit = process.reallyExit;\n" +
+					'process.reallyExit = (() => { throw new Error("guarded during init"); });\n',
+			);
+			const { exitCode, stdout, stderr } = await runProbe(
+				`
+import { postmortem } from "@oh-my-pi/pi-utils";
+postmortem.installProcessHandlers();
+postmortem.register("probe", reason => process.stdout.write(\`cleanup:\${reason}\\n\`));
+process.reallyExit = globalThis.__ompNativeReallyExit;
+process.stdout.write("armed\\n");
+process.kill(process.pid, "SIGHUP");
+// Keep the real child event loop alive so the platform can deliver SIGHUP;
+// real signal delivery cannot be driven by fake timers.
+await Bun.sleep(10_000);
+`,
+				[preload],
+			);
+
+			expect(exitCode).toBe(129);
+			expect(stdout).toBe("armed\ncleanup:sighup\n");
+			expect(stderr).not.toContain("ExtensionExitError");
+			expect(stderr).not.toContain("Unhandled Rejection");
+		},
+	);
 
 	it("only the outermost guard restores process.exit when guards nest", async () => {
 		const originalExit = process.exit;

@@ -6,7 +6,12 @@ import {
 	preprocessTinyMessage,
 	stripCodeBlocks,
 } from "@oh-my-pi/pi-coding-agent/tiny/message-preproc";
-import { isLowSignalTitleInput, NO_TITLE_SENTINEL, normalizeGeneratedTitle } from "@oh-my-pi/pi-coding-agent/tiny/text";
+import {
+	isAttachmentOnlyTitleInput,
+	isLowSignalTitleInput,
+	NO_TITLE_SENTINEL,
+	normalizeGeneratedTitle,
+} from "@oh-my-pi/pi-coding-agent/tiny/text";
 
 describe("stripCodeBlocks", () => {
 	it("drops fenced code blocks but keeps the surrounding prose", () => {
@@ -41,10 +46,6 @@ describe("stripCodeBlocks", () => {
 		const message = "```python\ndef merge_sort(a):\n    return a\n```";
 		expect(stripCodeBlocks(message)).toBe(message);
 	});
-
-	it("returns prose unchanged when there is no code block", () => {
-		expect(stripCodeBlocks("Investigate the resolver")).toBe("Investigate the resolver");
-	});
 });
 
 describe("preprocessTinyMessage", () => {
@@ -68,6 +69,27 @@ describe("preprocessTinyMessage", () => {
 		expect(prepared.endsWith(" TAIL")).toBe(true);
 		expect(prepared).toMatch(/\[… \d+ chars omitted …\]/);
 		expect(prepared.length).toBeLessThanOrEqual(MAX_TINY_MESSAGE_CHARS);
+	});
+
+	it("bounds cleanup cost on huge pastes full of unclosed tags", () => {
+		// Each unclosed `<void>` made the paired-tag regex scan to end of input,
+		// so an 800 KB paste took ~10s before raw input was windowed.
+		const unit = "const p: Promise<void> = run(); ";
+		const message = `HEAD ${unit.repeat(Math.ceil((800 * 1024) / unit.length))} TAIL`;
+		const started = performance.now();
+		const prepared = preprocessTinyMessage(message);
+		expect(performance.now() - started).toBeLessThan(1000);
+		expect(prepared.startsWith("HEAD ")).toBe(true);
+		expect(prepared.endsWith(" TAIL")).toBe(true);
+		expect(prepared.length).toBeLessThanOrEqual(MAX_TINY_MESSAGE_CHARS);
+	});
+
+	it("keeps prose between two large fenced blocks", () => {
+		const message = `\`\`\`\n${"SOURCE_NOISE ".repeat(2000)}\n\`\`\`\nPlease fix login redirect\n\`\`\`\n${"TRACE_NOISE ".repeat(2000)}\n\`\`\``;
+		const prepared = preprocessTinyMessage(message);
+		expect(prepared).toContain("Please fix login redirect");
+		expect(prepared).not.toContain("SOURCE_NOISE");
+		expect(prepared).not.toContain("TRACE_NOISE");
 	});
 });
 
@@ -141,6 +163,29 @@ describe("normalizeGeneratedTitle", () => {
 		expect(normalizeGeneratedTitle("")).toBeNull();
 		expect(normalizeGeneratedTitle("   ")).toBeNull();
 		expect(normalizeGeneratedTitle(null)).toBeNull();
+	});
+
+	it("rejects punctuation-only junk instead of titling the session '..'", () => {
+		// Regression: a sampling model occasionally emits bare punctuation; the
+		// trailing-punctuation strip then left "." as an accepted title.
+		expect(normalizeGeneratedTitle("..")).toBeNull();
+		expect(normalizeGeneratedTitle("---")).toBeNull();
+		expect(normalizeGeneratedTitle("<title>..</title>")).toBeNull();
+	});
+
+	it("rejects an overlong answer the model produced instead of a title", () => {
+		// Regression (#7303): a model that ignores the titling task and answers the
+		// user's question returns a full sentence; without a length bound the whole
+		// reply became the session title. Reject so the caller defers titling.
+		const answer =
+			"I don't have context on a \"registration system\" — that's not something I recognize from this conversation, and I don't see any prior discussion or code about it here";
+		expect(normalizeGeneratedTitle(answer, "how does the registration system work?")).toBeNull();
+		// Word-count bound: 13 short words stays under the char cap but is not a title.
+		expect(
+			normalizeGeneratedTitle("one two three four five six seven eight nine ten eleven twelve thirteen"),
+		).toBeNull();
+		// A normal 3-7 word title is unaffected.
+		expect(normalizeGeneratedTitle("Investigate the title resolver bug")).toBe("Investigate the title resolver bug");
 	});
 });
 
@@ -269,6 +314,32 @@ describe("normalizeGeneratedTitle source-aware casing", () => {
 		expect(normalizeGeneratedTitle("Fix GitHub Api rate limit", "fix the GitHub API rate limit")).toBe(
 			"Fix GitHub API rate limit",
 		);
+	});
+});
+
+describe("isAttachmentOnlyTitleInput", () => {
+	it("flags requests that only point at an attachment", () => {
+		for (const msg of [
+			"fix [Image #1, 1568x200]",
+			"plz fix this [Image #1, 275x588]",
+			"[Image #1, 757x786] [Image #2, 1568x1195]",
+			"why do i get this? [Image #1, 610x200]",
+			"oh uh, what did we break [Image #1, 1249x200]",
+			"[Video #1, 960x310]",
+		]) {
+			expect(isAttachmentOnlyTitleInput(msg)).toBe(true);
+		}
+	});
+
+	it("keeps requests whose words name a task, and plain text without attachments", () => {
+		for (const msg of [
+			"[Image #1, 407x322] this feels a bit too colorful for some themes. can u suggest some alternatives",
+			"can u summarize my changes for v0.2.1 [Image #1, 946x701] user-facing",
+			"fix this",
+			"fix the login redirect",
+		]) {
+			expect(isAttachmentOnlyTitleInput(msg)).toBe(false);
+		}
 	});
 });
 

@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { SubagentHudComponent } from "@oh-my-pi/pi-coding-agent/modes/components/subagent-hud";
-import type { ObservableSession } from "@oh-my-pi/pi-coding-agent/modes/session-observer-registry";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import type { ObservableSession } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
+import { initTheme } from "@oh-my-pi/pi-tui/theme/theme";
 import type { SgrMouseEvent } from "@oh-my-pi/pi-tui";
 
 function session(id: string): ObservableSession {
@@ -46,7 +46,7 @@ describe("subagent HUD mouse routing", () => {
 		expect(focused).toEqual(["First", "Second"]);
 	});
 
-	it("opens the manager from the header and overflow summary", () => {
+	it("opens the manager from the header and the overflow row", () => {
 		let opened = 0;
 		const component = new SubagentHudComponent({ onAgent: () => {}, onManager: () => opened++ });
 		component.update(
@@ -54,8 +54,11 @@ describe("subagent HUD mouse routing", () => {
 			100,
 		);
 
+		// The pinned list collapses to a few rows plus an expander; the expander
+		// row (2 header rows + the painted item rows) opens the hub like the
+		// header does.
 		component.routeMouse(mouse(), 1, 0);
-		component.routeMouse(mouse(), 10, 0);
+		component.routeMouse(mouse(), 5, 0);
 
 		expect(opened).toBe(2);
 	});

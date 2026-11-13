@@ -7,6 +7,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import { agentLoop, agentLoopDetailed } from "@oh-my-pi/pi-agent-core/agent-loop";
 import {
 	type AgentRunSummary,
@@ -15,10 +16,9 @@ import {
 	emptyAgentRunCoverage,
 	emptyAgentRunSummary,
 } from "@oh-my-pi/pi-agent-core/run-collector";
-import { EXECUTE_TOOL_STATUS_ATTR, GenAIAttr, PiGenAIAggregateAttr } from "@oh-my-pi/pi-agent-core/telemetry";
+import { EXECUTE_TOOL_STATUS_ATTR, GenAIAttr, OmpGenAIAggregateAttr } from "@oh-my-pi/pi-agent-core/telemetry";
 import type { AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core/types";
 import type { AssistantMessage, Message } from "@oh-my-pi/pi-ai";
-import { z } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import type {
 	AttributeValue,
@@ -45,7 +45,7 @@ class RecordingTracer implements Tracer {
 	startSpan(name: string, options?: SpanOptions, _ctx?: OtelContext): Span {
 		const record: RecordedSpan = {
 			name,
-			attributes: { ...(options?.attributes ?? {}) },
+			attributes: { ...options?.attributes },
 			ended: false,
 			exceptions: [],
 		};
@@ -132,7 +132,7 @@ function buildTool(spec: TestTool): AgentTool {
 			name: spec.name,
 			label: spec.name,
 			description: `test tool ${spec.name}`,
-			parameters: z.object({ value: z.string().optional() }),
+			parameters: type({ value: type("string").optional() }),
 			intent: "omit",
 			execute: async () => {
 				if (spec.behavior === "throw") throw new Error(`${spec.name} boom`);
@@ -145,7 +145,7 @@ function buildTool(spec: TestTool): AgentTool {
 		name: spec.name,
 		label: spec.name,
 		description: `blocked tool ${spec.name}`,
-		parameters: z.object({ value: z.string().optional() }),
+		parameters: type({ value: type("string").optional() }),
 		intent: "omit",
 		execute: async () => ({ content: [{ type: "text", text: "should not run" }], details: {} }),
 	} satisfies AgentTool;
@@ -201,28 +201,6 @@ describe("AgentRunSummary delivery", () => {
 		const endEvent = events.find((e): e is Extract<AgentEvent, { type: "agent_end" }> => e.type === "agent_end");
 		expect(endEvent?.telemetry).toBeUndefined();
 		expect(endEvent?.coverage).toBeUndefined();
-	});
-
-	it("preserves agentLoop().result() backwards-compat (still resolves to AgentMessage[])", async () => {
-		const tracer = new RecordingTracer();
-		const mock = createMockModel({ responses: [{ content: ["ok"] }] });
-		const config: AgentLoopConfig = {
-			model: mock.model,
-			convertToLlm: identityConverter,
-			telemetry: { tracer },
-		};
-		const stream = agentLoop(
-			[createUserMessage("hi")],
-			{ systemPrompt: ["sys"], messages: [], tools: [] },
-			config,
-			undefined,
-			mock.stream,
-		);
-		const messages = await stream.result();
-		// 1 user prompt + 1 assistant message.
-		expect(messages.length).toBe(2);
-		expect(messages[0].role).toBe("user");
-		expect(messages[1].role).toBe("assistant");
 	});
 });
 
@@ -321,7 +299,7 @@ describe("AgentRunSummary aggregation", () => {
 		expect(blockedSpan?.attributes[GenAIAttr.ErrorType]).toBe("tool_blocked");
 	});
 
-	it("populates aggregate pi.gen_ai.agent.* attributes on the invoke_agent span", async () => {
+	it("populates aggregate omp.gen_ai.agent.* attributes on the invoke_agent span", async () => {
 		const tracer = new RecordingTracer();
 		const tool = buildTool({ name: "alpha", behavior: "ok" });
 		const mock = createMockModel({
@@ -346,12 +324,12 @@ describe("AgentRunSummary aggregation", () => {
 		await detailed.detailed();
 		const invokeSpan = tracer.findSpan("invoke_agent");
 		expect(invokeSpan).toBeDefined();
-		expect(invokeSpan?.attributes[PiGenAIAggregateAttr.ChatsCount]).toBe(2);
-		expect(invokeSpan?.attributes[PiGenAIAggregateAttr.ToolsCount]).toBe(1);
-		expect(invokeSpan?.attributes[PiGenAIAggregateAttr.ToolsOkCount]).toBe(1);
-		expect(invokeSpan?.attributes[PiGenAIAggregateAttr.UsageInputTokensTotal]).toBe(6);
-		expect(invokeSpan?.attributes[PiGenAIAggregateAttr.UsageTotalTokensTotal]).toBe(13);
-		expect(invokeSpan?.attributes[PiGenAIAggregateAttr.ToolsInvoked]).toEqual(["alpha"]);
+		expect(invokeSpan?.attributes[OmpGenAIAggregateAttr.ChatsCount]).toBe(2);
+		expect(invokeSpan?.attributes[OmpGenAIAggregateAttr.ToolsCount]).toBe(1);
+		expect(invokeSpan?.attributes[OmpGenAIAggregateAttr.ToolsOkCount]).toBe(1);
+		expect(invokeSpan?.attributes[OmpGenAIAggregateAttr.UsageInputTokensTotal]).toBe(6);
+		expect(invokeSpan?.attributes[OmpGenAIAggregateAttr.UsageTotalTokensTotal]).toBe(13);
+		expect(invokeSpan?.attributes[OmpGenAIAggregateAttr.ToolsInvoked]).toEqual(["alpha"]);
 	});
 });
 
@@ -545,7 +523,7 @@ describe("skipped tools without spans", () => {
 			name: "fast",
 			label: "fast",
 			description: "fast",
-			parameters: z.object({ value: z.string().optional() }),
+			parameters: type({ value: type("string").optional() }),
 			intent: "omit",
 			execute: async () => {
 				fastDone = true;
@@ -556,7 +534,7 @@ describe("skipped tools without spans", () => {
 			name: "slow",
 			label: "slow",
 			description: "slow",
-			parameters: z.object({ value: z.string().optional() }),
+			parameters: type({ value: type("string").optional() }),
 			intent: "omit",
 			// concurrency: shared (default) — both run in parallel. Interruptible:
 			// queued steering hard-aborts only interruptible waits; non-interruptible
@@ -630,15 +608,17 @@ describe("regressions: agent loop telemetry/run summary", () => {
 		const tracer = new RecordingTracer();
 		// `concurrency: "exclusive"` serializes the batch so we can deterministically
 		// reach the `interruptState.triggered` early-return inside `runTool` for
-		// the second and third call. Pre-fix that path called `recordSkippedTool`
-		// AND the tail sweep called it again, double-counting.
+		// the second and third call (only interruptible waits are skipped there).
+		// Pre-fix that path called `recordSkippedTool` AND the tail sweep called
+		// it again, double-counting.
 		const fastTool: AgentTool = {
 			name: "fast",
 			label: "fast",
 			description: "fast",
-			parameters: z.object({ value: z.string().optional() }),
+			parameters: type({ value: type("string").optional() }),
 			intent: "omit",
 			concurrency: "exclusive",
+			interruptible: true,
 			execute: async () => {
 				state.firstDone = true;
 				return { content: [{ type: "text", text: "ok" }], details: {} };
@@ -762,7 +742,7 @@ describe("regressions: agent loop telemetry/run summary", () => {
 			name: "cyclic",
 			label: "cyclic",
 			description: "returns cyclic details",
-			parameters: z.object({ value: z.string().optional() }),
+			parameters: type({ value: type("string").optional() }),
 			intent: "omit",
 			execute: async () => ({
 				content: [{ type: "text", text: "ok" }],

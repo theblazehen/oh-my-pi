@@ -1,86 +1,82 @@
 # ask
 
-> Prompts the interactive user for one or more option-picker or free-form answers.
+> Asks the interactive user to fill in one HTML form and returns the submitted form data.
 
 ## Source
+
 - Entry: `packages/coding-agent/src/tools/ask.ts`
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/ask.md`
 - Key collaborators:
-  - `packages/coding-agent/src/config/settings-schema.ts` — `ask.timeout` / `ask.notify` defaults
-  - `packages/coding-agent/src/modes/theme/theme.ts` — checkbox and radio glyphs for TUI rendering
-  - `packages/coding-agent/src/tui/index.ts` — status-line rendering
+   - `packages/tui/src/html-form/parse.ts` — `parseHtmlForm`: sections, fields, hidden inputs
+   - `packages/tui/src/html-form/data.ts` — form data shape, defaults, field questions, validation
+   - `packages/tui/src/html-form/dialog.ts` — `HtmlFormDialog`, the interactive form
+   - `packages/coding-agent/src/modes/settings.ts` — `ask.timeout` / `ask.notify` defaults
+   - `packages/tui/src/tools/ask.ts` — call/result rendering
 
 ## Inputs
 
-| Field | Type | Required | Description |
-| --- | --- | --- | --- |
-| `questions` | `Question[]` | Yes | One or more questions. Empty arrays are rejected by schema and also guarded at runtime. |
+| Field  | Type     | Required | Description                                                                    |
+| ------ | -------- | -------- | ------------------------------------------------------------------------------ |
+| `html` | `string` | Yes      | One HTML `<form>`. Content outside the first `<form>` is ignored when present. |
 
-### `Question`
-
-| Field | Type | Required | Description |
-| --- | --- | --- | --- |
-| `id` | `string` | Yes | Stable identifier used in multi-question results. |
-| `question` | `string` | Yes | Prompt text shown to the user. |
-| `options` | `{ label: string; description?: string }[]` | Yes | Option labels for the picker, each with optional explanatory `description` text shown below the label. The schema does not require a minimum length; the UI always appends `Other (type your own)`, and callers must not include it. |
-| `multi` | `boolean` | No | Enables multi-select mode. Default: `false`. |
-| `recommended` | `number` | No | Zero-based recommended option index. In single-select mode the label gets ` (Recommended)` appended in the UI. |
+The form is plain semantic HTML. Controls: `<input type="radio">` (one-of), `type="checkbox"` (many-of when several share a name, a yes/no flag alone), `<select>` / `<select multiple>`, text-like inputs (`text`, `number`, `range`, `date`, `email`, `url`, …), `<textarea>`, and `type="hidden"`. `checked`, `selected` and `value` preselect answers; `required`, `min`/`max`, `minlength`/`maxlength` and `pattern` are enforced. Context renders from `<p>`, headings, lists, `<pre>`, `<table>`, and `<fieldset>`/`<legend>` groups. Pictures render from `<img src>` (an http(s) URL, a `data:` URI, a `file:` URL, or a path resolved against the session's working directory) and inline `<svg>`; an image inside a `<label>` contributes only its `alt` text. `<script>`, `<style>` and buttons are dropped.
 
 ## Outputs
+
 - Single-shot result.
-- `content[0].text` is plain text:
-  - single question: `User selected: ...` and/or `User provided custom input: ...`
-  - multiple questions: `User answers:` followed by one line per `id`
-- `details`:
-  - single question: `{ question, options, multi, selectedOptions, customInput?, timedOut? }`
-  - multiple questions: `{ results: QuestionResult[] }`, where each item includes `id`, `question`, `options`, `multi`, `selectedOptions`, and optional `customInput` and `timedOut`
-- Cancellation and headless cases throw instead of returning a structured success result.
+- `content[0].text`:
+   - submit: `User answers:` followed by the form data as indented JSON
+   - timeout: `No answer before the timeout; submitted the form's current values:` followed by the JSON
+- Form data (`HtmlFormData`): keyed by control `name`. A radio group or single `<select>` gives the chosen `value` (omitted when none); a checkbox group or `<select multiple>` gives an array; a lone checkbox gives its `value` when checked, else is omitted; `number`/`range` inputs give a number when the text parses; other text fields give their text; hidden inputs pass through. Disabled options and unnamed controls never appear.
+- "Other" answers: every radio group and checkbox group of two or more options (not `<select>`) whose options include none labelled "Other…" gets a UI-supplied free-text "Other" answer (`ChoiceField.other`). The trimmed text is a radio group's value (`"db": "MySQL 8"`) or is appended to a checkbox group's array (`["ci", "terraform"]`); blank text is no answer. The fallback adds an `Other (type your own)` row that opens `input`; collab guests get the same row with an editor; ACP adds an optional `<name>_other` string property.
+- `details: AskToolDetails`: `{ answers: { name, question, answer }[]; timedOut? }`, one entry per named field in form order. `question` is the field's label, else the text block right before it, else its section legend, else its name; `answer` shows option labels instead of values.
+- Cancellation and headless cases throw instead of returning a structured success result. The tool does not stream updates.
 
 ## Flow
-1. `AskTool.createIf()` only registers the tool when `session.hasUI` is true; headless sessions never get it.
-2. `execute()` requires `context.ui`; if missing it aborts the context and throws `ToolAbortError("Ask tool requires interactive mode")`.
-3. It reads `ask.timeout` from settings, converts seconds to milliseconds (`0` disables timeout), and disables timeout entirely while plan mode is enabled (`packages/coding-agent/src/tools/ask.ts`).
-4. If `ask.notify` is not `off`, it sends a terminal notification: `Waiting for input`.
-5. For each question, `askSingleQuestion()` drives either:
-   - single-select list + optional editor for `Other`
-   - multi-select checkbox loop + `Done selecting` sentinel + optional editor for `Other`
-6. In multi-question mode, left/right arrow handlers enable back/forward navigation between questions and preserve prior selections.
-7. If a timeout fires before any selection/custom input, the tool auto-selects the recommended option, or the first option when no valid `recommended` index exists; the result text gets an ` (auto-selected after timeout)` suffix and `details.timedOut` is set.
-8. If the user cancels without timeout, `execute()` aborts the tool context and throws `ToolAbortError("Ask tool was cancelled by the user")`.
-9. On success it formats human-readable text plus structured `details`; the TUI renderer uses `details` for rich display.
 
-## Modes / Variants
-- Single question: returns flattened `details` fields for one question.
-- Multiple questions: returns `details.results[]` and allows back/forward navigation across questions.
-- Single-select: one option or custom input.
-- Multi-select: toggled checkbox list, `Done selecting` sentinel only when forward navigation is not active.
+1. Registration requires `ask.enabled` and `AskTool.createIf()` requires `session.canPromptUser ?? session.hasUI` (or a headless fork advertising `ask`).
+2. `execute()` requires `context.hasUI` and `context.ui`. Without them a headless fork gets a `ToolError` telling its model to put open questions in its final answer; any other session aborts the context and throws `ToolAbortError("Ask tool requires interactive mode")`.
+3. The form is parsed. A form without a named control returns an error text result rather than throwing.
+4. It reads `ask.timeout` (seconds; `0` disables) and disables the timeout entirely while plan mode is enabled.
+5. If the session has a local UI and `ask.notify` is not `off`, it sends a terminal notification: `Waiting for input`. When `speech.enabled` is true, it speaks the field questions.
+6. When the UI supplies `formDialog`, the whole form opens at once: the interactive TUI shows `HtmlFormDialog` (it validates on submit; any key resets the countdown), ACP clients with form elicitation get one elicitation with a property per field. In Tern, a form with two or more top-level `<fieldset>`s shows one tab per fieldset plus a Review tab: question tabs end in a Hide/Cancel/Next bar and Submit lives only on Review. Each tab's content scrolls above that bar, which stays in view, and `app.ask.hide` (`Alt+H`) or Hide collapses the form to one row.
+7. Otherwise (RPC hosts, extension UIs without `formDialog`) it walks named fields in order:
+   - radio group / single select: one `select`, opening on the preselected option
+   - checkbox group / lone checkbox / multi-select: a checkbox `select` loop with a `Done selecting` row (hidden while a required group has nothing checked)
+   - empty single-line input: `input` with the placeholder
+   - textarea or prefilled input: `editor` with the current text
+   - text answers are re-asked with the validation error until valid
+8. A timeout submits the form's current values: in the fallback the unanswered fields keep their defaults and a checkbox group keeps what was checked so far. `details.timedOut` is set.
+9. A user cancel aborts the tool context and throws `ToolAbortError("Ask tool was cancelled by the user")`.
 
 ## Side Effects
+
 - User-visible prompts / interactive UI
-  - Opens a selection dialog via `context.ui.select(...)`.
-  - Opens a text editor dialog via `context.ui.editor(...)` for `Other`.
-  - Sends a terminal notification unless `ask.notify=off`.
+   - Uses `context.ui.formDialog(...)` when available; otherwise `context.ui.select(...)`, `input(...)` and `editor(...)`.
+   - Sends a terminal notification when the session has a local UI, unless `ask.notify=off`.
+   - Speaks the field questions through the vocalizer when `speech.enabled=true`.
 - Session state
-  - Reads plan-mode state to disable timeouts.
-  - Calls `context.abort()` on headless use or user cancellation.
+   - Reads plan-mode state to disable timeouts.
+   - Calls `context.abort()` on headless use or user cancellation.
 - Background work / cancellation
-  - Wraps UI waits in `untilAborted(...)` so abort signals interrupt pending dialogs.
+   - Wraps UI waits in `untilAborted(...)` so abort signals interrupt pending dialogs. A message the user queues closes the dialog with `ToolAbortError("Ask interrupted by message")` without aborting the turn.
 
 ## Limits & Caps
-- `questions` must contain at least 1 item (`askSchema` in `packages/coding-agent/src/tools/ask.ts`).
-- `ask.timeout` default is `0` seconds, which disables timeout (`packages/coding-agent/src/config/settings-schema.ts`). Configured non-zero values are seconds.
-- Prompt guidance says provide 2-5 options, but code only requires the `options` array field and does not enforce a minimum or maximum length (`packages/coding-agent/src/prompts/tools/ask.md`).
-- Timeout only applies to the option picker; once the user chooses `Other`, the editor has no timeout (`promptForCustomInput()` in `packages/coding-agent/src/tools/ask.ts`).
-- `AskTool.concurrency = "exclusive"`: the tool runs alone in its tool batch because the selector/editor UI surface is shared and concurrent `ask` calls would clobber each other.
+
+- Unknown parameters are rejected because `AskTool.strict=true`.
+- `ask.timeout` defaults to `0` seconds (disabled). Plan mode always disables it.
+- In the fallback, `editor` prompts (textareas, prefilled inputs) have no timeout; `select` and `input` prompts do. Prompt surfaces that report presentation/reset events start or re-arm the deadline at those events; otherwise the timer starts when the prompt is requested.
+- `AskTool.concurrency = "exclusive"`: the tool runs alone in its tool batch because the dialog surface is shared.
+- Pictures load in the background while the form is open: at most 10 MiB each, remote ones within 10 s; PNG, JPEG, GIF, WebP and SVG. One that fails shows its `alt` and the reason. Only the interactive TUI/Tern form draws them; the fallback prompts and ACP show none.
 
 ## Errors
+
 - Missing interactive UI: throws `ToolAbortError("Ask tool requires interactive mode")`.
-- User cancels picker/editor without timeout: throws `ToolAbortError("Ask tool was cancelled by the user")`.
+- User cancels: throws `ToolAbortError("Ask tool was cancelled by the user")`.
 - Abort signal during input: converted to `ToolAbortError("Ask input was cancelled")`.
-- Empty `questions` at runtime returns a text error payload instead of throwing: `Error: questions must not be empty`.
+- No named control: text error result, `details.answers` empty.
 
 ## Notes
-- `recommended` is only a UI hint; invalid indexes are ignored.
-- In single-select mode the returned `selectedOptions` value strips the appended ` (Recommended)` suffix.
-- Multi-select results preserve selection order by `Set` insertion order, not original option order after arbitrary toggles.
-- Option labels and prompt text are returned verbatim in `details`; the tool does not interpret them beyond UI affordances like `Other` and ` (Recommended)`.
+
+- `/tree` re-answer recovers the original `html` from the persisted `ask` call and reopens the form to create a sibling answer branch; calls without an `html` string (legacy `questions` sessions) fall back to a plain leaf move.
+- Extensions keep `ui.askDialog` (questions-based) for their own prompts; only the tool uses forms.

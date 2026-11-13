@@ -88,9 +88,7 @@ describe("ToolView xd:// dispatches", () => {
 	});
 
 	it("defaults a running xd://reject to discard before details arrive", () => {
-		const html = renderToStaticMarkup(
-			<ToolView name="reject" defaultOpen running args={{ reason: "" }} />,
-		);
+		const html = renderToStaticMarkup(<ToolView name="reject" defaultOpen running args={{ reason: "" }} />);
 
 		expect(html).toContain("proposed → rejected");
 	});
@@ -133,22 +131,139 @@ describe("ToolView xd:// dispatches", () => {
 		expect(html).toContain("tv-badge--ok");
 	});
 
-	it("routes the hub-family alias irc through the messaging renderer", () => {
+	it("renders every received wait message without falling back to JSON", () => {
 		const html = renderToStaticMarkup(
-			<ToolView name="irc" defaultOpen args={{ op: "send", to: "Main", message: "hi" }} result={{ content: [] }} />,
+			<ToolView
+				name="wait"
+				defaultOpen
+				args={{}}
+				result={{
+					content: [{ type: "text", text: "[42] Worker: ready\n\n[43] Reviewer: looks good" }],
+					details: {
+						op: "wait",
+						waited: [
+							{ id: "42", from: "Worker", to: "Main", body: "ready", ts: 0 },
+							{ id: "43", from: "Reviewer", to: "Main", body: "looks good", ts: 1 },
+						],
+					},
+				}}
+			/>,
 		);
-
-		expect(html).toContain("→ Main");
-		// Not the generic JSON dump of the args.
+		expect(html).toContain("← Worker");
+		expect(html).toContain("ready");
+		expect(html).toContain("← Reviewer");
+		expect(html).toContain("looks good");
 		expect(html).not.toContain("tv-out-title");
 	});
 
-	it("routes the hub-family alias job through the job renderer", () => {
+	it("renders settled wait job output", () => {
 		const html = renderToStaticMarkup(
-			<ToolView name="job" defaultOpen args={{ poll: ["a1b2"] }} result={{ content: [] }} />,
+			<ToolView
+				name="wait"
+				defaultOpen
+				args={{}}
+				result={{
+					content: [],
+					details: {
+						op: "wait",
+						jobs: [
+							{
+								id: "a1b2",
+								type: "bash",
+								status: "completed",
+								label: "build",
+								durationMs: 25,
+								resultText: "Built",
+								errorText: "",
+							},
+						],
+					},
+				}}
+			/>,
+		);
+		expect(html).toContain("Built");
+		expect(html).toContain("1 done");
+	});
+});
+
+describe("ToolView ask renderer", () => {
+	const form = `<form>
+<fieldset><legend>Storage backend</legend>
+<label><input type="radio" name="db" value="sqlite" checked> SQLite</label>
+<label><input type="radio" name="db" value="pg"> Postgres</label>
+</fieldset>
+<fieldset><legend>Notes &amp; caveats</legend><textarea name="notes"></textarea></fieldset>
+</form>`;
+
+	it("outlines a pending form by its legends and named field count", () => {
+		const html = renderToStaticMarkup(<ToolView name="ask" defaultOpen args={{ html: form }} />);
+
+		expect(html).toContain("Storage backend");
+		expect(html).toContain("Notes &amp; caveats");
+		expect(html).toContain("2 fields");
+	});
+
+	it("pairs each question with its answer and flags timed-out submissions", () => {
+		const html = renderToStaticMarkup(
+			<ToolView
+				name="ask"
+				defaultOpen
+				args={{ html: form }}
+				result={{
+					content: [{ type: "text", text: 'User answers:\n{"db":"pg","notes":""}' }],
+					details: {
+						answers: [
+							{ name: "db", question: "Storage backend", answer: "Postgres" },
+							{ name: "notes", question: "Notes & caveats", answer: "" },
+						],
+						timedOut: true,
+					},
+				}}
+			/>,
 		);
 
-		expect(html).toContain("poll a1b2");
-		expect(html).not.toContain("tv-out-title");
+		expect(html).toContain("<span>Postgres</span>");
+		expect(html).toContain("(no answer)");
+		expect(html).toContain("auto-selected after timeout");
+	});
+
+	it("renders selected option notes under the matching answer", () => {
+		const html = renderToStaticMarkup(
+			<ToolView
+				name="ask"
+				defaultOpen
+				args={{ html: form }}
+				result={{
+					content: [],
+					details: {
+						answers: [
+							{ name: "notes", question: "Notes & caveats", answer: "none" },
+							{ name: "db", question: "Storage backend", answer: "SQLite, Postgres, managed" },
+						],
+						notes: [
+							{ name: "db", question: "Storage backend", option: "Postgres, managed", text: "Team standard" },
+							{ name: "db", question: "Storage backend", option: 12, text: "ignored malformed note" },
+						],
+					},
+				}}
+			/>,
+		);
+
+		expect(html).toContain("✎ Postgres, managed: Team standard");
+		expect(html.indexOf("Team standard")).toBeGreaterThan(html.lastIndexOf("Storage backend"));
+		expect(html).not.toContain("ignored malformed note");
+	});
+
+	it("falls back to the result text when details carry no answers", () => {
+		const html = renderToStaticMarkup(
+			<ToolView
+				name="ask"
+				defaultOpen
+				args={{ html: "<form></form>" }}
+				result={{ content: [{ type: "text", text: "The form needs at least one named control." }], isError: true }}
+			/>,
+		);
+
+		expect(html).toContain("at least one named control");
 	});
 });

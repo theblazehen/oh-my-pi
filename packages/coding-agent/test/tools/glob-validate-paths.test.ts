@@ -3,7 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { RenderResultOptions } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
-import { getThemeByName, initTheme, type Theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { InternalUrlFilesystem } from "@oh-my-pi/pi-coding-agent/internal-urls/url-filesystem";
+import { getThemeByName, initTheme, type Theme } from "@oh-my-pi/pi-tui/theme";
 import {
 	expandDelimitedPathEntries,
 	parseFindPattern,
@@ -12,7 +13,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
-import { globToolRenderer } from "../../src/tools/glob";
+import { globToolRenderer } from "@oh-my-pi/pi-tui/tools/glob";
 
 let uiTheme: Theme;
 
@@ -106,6 +107,24 @@ describe("delimited path expansion", () => {
 		).toEqual(["apps/**/*.txt", "packages/**/*.txt"]);
 	});
 
+	it("splits a semicolon list whose joined string exceeds NAME_MAX (issue #7597)", async () => {
+		// Bare filenames in one directory form a single slash-free run once joined,
+		// so ~12 short entries already push the run past NAME_MAX (255). lstat on
+		// the joined string then throws ENAMETOOLONG, which used to be read as an
+		// inconclusive probe and suppress the split, collapsing the whole list to
+		// one non-existent literal path.
+		const names: string[] = [];
+		for (let i = 0; i < 20; i++) {
+			const name = `enametoolong-probe-${String(i).padStart(2, "0")}.txt`;
+			await Bun.write(path.join(tempDir, name), "needle\n");
+			names.push(name);
+		}
+		const joined = names.join("; ");
+		expect(joined.length).toBeGreaterThan(255);
+		expect(await splitDelimitedPathEntry(joined, tempDir)).toEqual(names);
+		expect(await expandDelimitedPathEntries([joined], tempDir)).toEqual(names);
+	});
+
 	it("normalizes Windows path separators before parsing find globs", async () => {
 		expect(parseFindPattern("apps\\**\\*.txt")).toEqual({
 			basePath: "apps",
@@ -127,6 +146,7 @@ describe("delimited path expansion", () => {
 			rawPaths: ["apps\\**\\*.txt"],
 			cwd: tempDir,
 			internalUrlAction: "search",
+			filesystem: new InternalUrlFilesystem({ context: {}, tier: "read" }),
 		});
 
 		expect(scope.searchPath).toBe(path.join(tempDir, "apps"));

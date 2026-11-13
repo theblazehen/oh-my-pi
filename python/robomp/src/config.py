@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     repo_allowlist_raw: str = Field("", alias="ROBOMP_REPO_ALLOWLIST")
     pr_review_enabled: bool = Field(True, alias="ROBOMP_PR_REVIEW_ENABLED")
 
+    # Release sentinel
+    release_sentinel_enabled: bool = Field(False, alias="ROBOMP_RELEASE_SENTINEL_ENABLED")
+    release_commit_prefix: str = Field("chore: bump version to ", alias="ROBOMP_RELEASE_COMMIT_PREFIX")
+    release_max_rounds: int = Field(5, alias="ROBOMP_RELEASE_MAX_ROUNDS")
+    release_task_timeout_seconds: float = Field(3600.0, alias="ROBOMP_RELEASE_TASK_TIMEOUT_SECONDS")
+    release_model: str | None = Field(None, alias="ROBOMP_RELEASE_MODEL")
+
     # gh-proxy. Set BOTH to route GitHub through the proxy; leave both empty
     # to keep PAT-on-orchestrator behavior. Mixing the two (PAT + proxy) is
     # rejected to prevent silent fallback to direct GitHub access.
@@ -142,14 +149,14 @@ class Settings(BaseSettings):
     # repo has a sync watermark.
     issue_index_sync_seconds: float = Field(900.0, alias="ROBOMP_ISSUE_INDEX_SYNC_SECONDS")
 
-    # pi-natives build-output cache. Hardlinks pre-built
+    # pi-natives build-output cache. Copies pre-built
     # `packages/natives/native/*.node` (and its companions) into new
     # workspaces keyed by the git tree-hashes of inputs that determine the
     # build output. Misses are captured automatically when a task that
     # finishes successfully has fresh artifacts. Disable to fall back to
     # per-workspace builds.
     natives_cache_enabled: bool = Field(True, alias="ROBOMP_NATIVES_CACHE_ENABLED")
-    natives_cache_root: Path = Field(Path("/data/cache/pi-natives"), alias="ROBOMP_NATIVES_CACHE_ROOT")
+    natives_cache_root: Path = Field(Path("/data/natives-cache"), alias="ROBOMP_NATIVES_CACHE_ROOT")
     natives_cache_max_entries_per_repo: int = Field(8, alias="ROBOMP_NATIVES_CACHE_MAX_ENTRIES_PER_REPO")
     natives_cache_max_bytes: int = Field(4 * 1024**3, alias="ROBOMP_NATIVES_CACHE_MAX_BYTES")
     natives_cache_gc_interval_seconds: float = Field(3600.0, alias="ROBOMP_NATIVES_CACHE_GC_INTERVAL_SECONDS")
@@ -326,6 +333,18 @@ class Settings(BaseSettings):
     def pick_model(self) -> str:
         """Random selection from the pool (uniform). One-element pools return that one."""
         return random.choice(self.model_pool)
+
+    @property
+    def release_model_pool(self) -> tuple[str, ...]:
+        """Release-specific model pool, falling back to the general pool."""
+        items = [piece.strip() for piece in (self.release_model or "").split(",") if piece.strip()]
+        return tuple(items) or self.model_pool
+
+    def pick_release_model(self) -> str:
+        """Select a release model, falling back to the general selector."""
+        if not self.release_model or not self.release_model.strip():
+            return self.pick_model()
+        return random.choice(self.release_model_pool)
 
     @field_validator("event_retry_delays_raw", mode="before")
     @classmethod

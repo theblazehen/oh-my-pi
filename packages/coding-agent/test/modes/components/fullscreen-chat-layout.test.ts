@@ -2,15 +2,15 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test
 import { stripVTControlCharacters } from "node:util";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { Component, Focusable, MouseRoutable, SgrMouseEvent } from "@oh-my-pi/pi-tui";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import { UserMessageComponent } from "@oh-my-pi/pi-tui/chat/user-message";
+import { TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-container";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { resetSettingsForTest, Settings } from "../../../src/config/settings";
-import { AssistantMessageComponent } from "../../../src/modes/components/assistant-message";
 import {
 	FullscreenChatLayout,
 	FullscreenTranscriptAggregate,
 } from "../../../src/modes/components/fullscreen-chat-layout";
-import { TranscriptContainer } from "../../../src/modes/components/transcript-container";
-import { UserMessageComponent } from "../../../src/modes/components/user-message";
-import { initTheme } from "../../../src/modes/theme/theme";
 
 class MutableLines implements Component {
 	constructor(readonly lines: string[]) {}

@@ -1,3 +1,7 @@
+import { styledSpans } from "../native/spans";
+import { backgroundChrome, sampleBackground } from "../native/tone";
+import { node, text } from "../native/describe";
+import type { DescribeContext, NativeNode } from "../native/node";
 import type { Component } from "../tui";
 import {
 	applyBackgroundToLine,
@@ -25,11 +29,18 @@ export class Text implements Component {
 	#paddingY: number; // Top/bottom padding
 	#customBgFn?: (text: string) => string;
 	#styleFn?: (text: string) => string;
-
 	#ignoreTight = false;
+	#wrapLine?: (line: string, width: number) => string[];
 
 	setIgnoreTight(ignore: boolean): this {
+		if (this.#ignoreTight === ignore) return this;
 		this.#ignoreTight = ignore;
+		this.invalidate();
+		return this;
+	}
+	/** Override row wrapping when the source carries structural prefixes. */
+	setWrapLine(wrapLine: (line: string, width: number) => string[]): this {
+		this.#wrapLine = wrapLine;
 		this.invalidate();
 		return this;
 	}
@@ -37,14 +48,26 @@ export class Text implements Component {
 	// Cache for rendered output
 	#cachedText?: string;
 	#cachedWidth?: number;
-	#cachedWidthEpoch?: number;
+	#cachedWidthConfigEpoch?: number;
 	#cachedLines?: string[];
+	#native?: { source: string; bg: string | undefined; node: NativeNode };
 
 	constructor(text: string = "", paddingX: number = 1, paddingY: number = 1, customBgFn?: (text: string) => string) {
 		this.#text = text;
 		this.#paddingX = paddingX;
 		this.#paddingY = paddingY;
 		this.#customBgFn = customBgFn;
+	}
+	/** Return bounded text and layout state for debug inspection. */
+	debugState(): Record<string, unknown> {
+		return {
+			textPreview: this.#text.slice(0, 120),
+			textLength: this.#text.length,
+			previewTruncated: this.#text.length > 120,
+			paddingX: this.#paddingX,
+			paddingY: this.#paddingY,
+			ignoreTight: this.#ignoreTight,
+		};
 	}
 
 	getText(): string {
@@ -58,7 +81,7 @@ export class Text implements Component {
 		this.#text = text;
 		this.#cachedText = undefined;
 		this.#cachedWidth = undefined;
-		this.#cachedWidthEpoch = undefined;
+		this.#cachedWidthConfigEpoch = undefined;
 		this.#cachedLines = undefined;
 		return true;
 	}
@@ -67,7 +90,7 @@ export class Text implements Component {
 		this.#customBgFn = customBgFn;
 		this.#cachedText = undefined;
 		this.#cachedWidth = undefined;
-		this.#cachedWidthEpoch = undefined;
+		this.#cachedWidthConfigEpoch = undefined;
 		this.#cachedLines = undefined;
 	}
 
@@ -81,7 +104,7 @@ export class Text implements Component {
 		this.#styleFn = styleFn;
 		this.#cachedText = undefined;
 		this.#cachedWidth = undefined;
-		this.#cachedWidthEpoch = undefined;
+		this.#cachedWidthConfigEpoch = undefined;
 		this.#cachedLines = undefined;
 		return this;
 	}
@@ -89,8 +112,33 @@ export class Text implements Component {
 	invalidate(): void {
 		this.#cachedText = undefined;
 		this.#cachedWidth = undefined;
-		this.#cachedWidthEpoch = undefined;
+		this.#cachedWidthConfigEpoch = undefined;
 		this.#cachedLines = undefined;
+	}
+
+	releaseRenderCaches(): void {
+		this.#cachedText = undefined;
+		this.#cachedWidth = undefined;
+		this.#cachedWidthConfigEpoch = undefined;
+		this.#cachedLines = undefined;
+	}
+
+	/**
+	 * Wrapped text; styling re-derived from the styled source so a theme swap
+	 * re-resolves tokens. A background fill becomes the node's tone.
+	 */
+	describe(_cx: DescribeContext): NativeNode {
+		const source = this.#styleFn ? this.#styleFn(this.#text) : this.#text;
+		const bg = sampleBackground(this.#customBgFn);
+		const cached = this.#native;
+		if (cached?.source === source && cached.bg === bg) return cached.node;
+		const spans = source.trim() === "" ? [] : styledSpans(source);
+		const described =
+			spans.length === 0
+				? node("col", { hidden: true })
+				: text(spans, { wrap: "word", tone: backgroundChrome(bg).tone });
+		this.#native = { source, bg, node: described };
+		return described;
 	}
 
 	render(width: number): readonly string[] {
@@ -99,7 +147,7 @@ export class Text implements Component {
 			this.#cachedLines &&
 			this.#cachedText === this.#text &&
 			this.#cachedWidth === width &&
-			this.#cachedWidthEpoch === getWidthConfigEpoch()
+			this.#cachedWidthConfigEpoch === getWidthConfigEpoch()
 		) {
 			return this.#cachedLines;
 		}
@@ -109,7 +157,7 @@ export class Text implements Component {
 			const result: string[] = [];
 			this.#cachedText = this.#text;
 			this.#cachedWidth = width;
-			this.#cachedWidthEpoch = getWidthConfigEpoch();
+			this.#cachedWidthConfigEpoch = getWidthConfigEpoch();
 			this.#cachedLines = result;
 			return result;
 		}
@@ -121,7 +169,10 @@ export class Text implements Component {
 		const paddingX = this.#ignoreTight ? this.#paddingX : getPaddingX(this.#paddingX);
 		const contentWidth = Math.max(1, width - paddingX * 2);
 		// Wrap text (this preserves ANSI codes but does NOT pad)
-		const wrappedLines = wrapTextWithAnsi(normalizedText, contentWidth);
+		const wrapLine = this.#wrapLine;
+		const wrappedLines = wrapLine
+			? normalizedText.split("\n").flatMap(line => wrapLine(line, contentWidth))
+			: wrapTextWithAnsi(normalizedText, contentWidth);
 
 		// Add margins and background to each line
 		const leftMargin = padding(paddingX);
@@ -157,7 +208,7 @@ export class Text implements Component {
 
 		const result = [...emptyLines, ...contentLines, ...emptyLines];
 		if (resultWidths !== undefined) {
-			// Pad rows are exactly `width` cells wide.
+			// oxlint-disable-next-line unicorn/no-new-array -- line-width allocation
 			const emptyWidths = new Array<number>(emptyLines.length).fill(width);
 			publishLineWidths(result, [...emptyWidths, ...resultWidths, ...emptyWidths]);
 		}
@@ -165,7 +216,7 @@ export class Text implements Component {
 		// Update cache
 		this.#cachedText = this.#text;
 		this.#cachedWidth = width;
-		this.#cachedWidthEpoch = getWidthConfigEpoch();
+		this.#cachedWidthConfigEpoch = getWidthConfigEpoch();
 		this.#cachedLines = result;
 
 		return result.length > 0 ? result : [""];

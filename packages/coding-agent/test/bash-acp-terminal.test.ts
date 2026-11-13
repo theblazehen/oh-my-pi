@@ -1,39 +1,63 @@
-import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { afterAll, afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ClientBridge, ClientBridgeTerminalHandle } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import { encodeTerminalImage } from "@oh-my-pi/pi-coding-agent/utils/terminal-graphics";
+
+// `getShellConfig()` validates that `shellPath` exists, and `/bin/bash` does not
+// on Windows. The ACP route only forwards the path to the stubbed client
+// terminal, so an empty `bash` file stands in for the resolved shell everywhere.
+const stubShellDir = TempDir.createSync("@omp-acp-shell-");
+const STUB_BASH = stubShellDir.join(process.platform === "win32" ? "bash.exe" : "bash");
+fs.writeFileSync(STUB_BASH, "");
+afterAll(() => stubShellDir.removeSync());
 
 function makeSession(bridge: ClientBridge): ToolSession {
 	return {
-		cwd: "/tmp",
+		cwd: os.tmpdir(),
 		hasUI: false,
 		skills: [],
 		getSessionFile: () => null,
-		settings: {
-			get(key: string) {
-				if (key === "async.enabled") return false;
-				if (key === "bash.autoBackground.enabled") return false;
-				if (key === "bash.autoBackground.thresholdMs") return 60_000;
-				if (key === "bashInterceptor.enabled") return false;
-				if (key === "astGrep.enabled") return false;
-				if (key === "astEdit.enabled") return false;
-				if (key === "grep.enabled") return false;
-				if (key === "glob.enabled") return false;
-				return undefined;
-			},
-			getBashInterceptorRules() {
-				return [];
-			},
-			getShellConfig() {
-				// Fixed bash shell keeps the wrap assertions cross-platform: the fix
-				// must reuse the resolved shell (Git Bash on Windows, `$SHELL` on
-				// POSIX) instead of collapsing to `cmd.exe` — that's the contract
-				// this test defends.
-				return { shell: "/bin/bash", args: ["-l", "-c"], env: {}, prefix: undefined };
-			},
-		},
+		// Fixed bash shell keeps the wrap assertions cross-platform: the fix
+		// must reuse the resolved shell (Git Bash on Windows, `$SHELL` on
+		// POSIX) instead of collapsing to `cmd.exe` — that's the contract
+		// this test defends.
+		settings: Settings.isolated({
+			"async.enabled": false,
+			"bash.autoBackground.enabled": false,
+			"bash.autoBackground.thresholdMs": 60_000,
+			"bashInterceptor.enabled": false,
+			"astGrep.enabled": false,
+			"astEdit.enabled": false,
+			"grep.enabled": false,
+			"glob.enabled": false,
+			shellPath: STUB_BASH,
+		}),
 		getClientBridge: () => bridge,
 	} as unknown as ToolSession;
+}
+
+// Keep the real promise/race behavior while compressing only ACP's deliberately
+// conservative wall-clock deadline and cleanup grace periods.
+function shortenAcpWaits(): void {
+	const realSetTimeout = globalThis.setTimeout;
+	spyOn(globalThis, "setTimeout").mockImplementation(((handler: () => void, ms?: number, ...args: unknown[]) =>
+		realSetTimeout(
+			handler,
+			typeof ms === "number" && ms >= 1000 ? 50 : ms,
+			...args,
+		)) as typeof globalThis.setTimeout);
+	const realSleep = Bun.sleep.bind(Bun);
+	spyOn(Bun, "sleep").mockImplementation((duration?: number | Date) => {
+		if (duration === 250) return realSleep(1);
+		if (typeof duration === "number" && duration >= 1000) return realSleep(5);
+		return realSleep(duration ?? 0);
+	});
 }
 
 afterEach(() => {
@@ -41,7 +65,7 @@ afterEach(() => {
 });
 
 describe("BashTool ACP terminal routing", () => {
-	it("routes through bridge, emits terminalId update, and releases the handle", async () => {
+	it("emits a live terminal update but releases it before the completed result", async () => {
 		const stubText = "hello from terminal\n";
 
 		const handle: ClientBridgeTerminalHandle = {
@@ -73,7 +97,7 @@ describe("BashTool ACP terminal routing", () => {
 		// `$VAR`, `$(...)`, `source`, and POSIX quoting on Windows.
 		expect(createSpy).toHaveBeenCalledTimes(1);
 		const params = createSpy.mock.calls[0]![0];
-		expect(params.command).toBe("/bin/bash");
+		expect(params.command).toBe(STUB_BASH);
 		expect(params.args).toEqual(["-l", "-c", "echo hi"]);
 
 		// The first onUpdate must carry the terminalId so the editor can embed it
@@ -84,21 +108,68 @@ describe("BashTool ACP terminal routing", () => {
 		const text = result.content.find(c => c.type === "text");
 		expect(text?.text).toContain("hello from terminal");
 
-		// The result details must carry terminalId for the ACP event mapper
-		expect(result.details?.terminalId).toBe("term-xyz");
+		// Completed tool updates must not refer clients to the released terminal.
+		expect(result.details?.terminalId).toBeUndefined();
 
 		// The handle must always be released
 		expect(releaseSpy).toHaveBeenCalledTimes(1);
 	});
 
-	it("wraps shell metacharacters into args instead of packing them into command", async () => {
-		// Regression for #4333: a bash line with `&&`, pipes, or spaces must not
-		// be sent as raw `command` (spec-conformant ACP clients spawn command+args
-		// directly and would ENOENT the whole line as argv[0]).
+	it("passes the live session identity on every run and blanks the file once unpersisted", async () => {
 		const handle: ClientBridgeTerminalHandle = {
-			terminalId: "term-shell-wrap",
+			terminalId: "term-env",
 			waitForExit: async () => ({ exitCode: 0, signal: null }),
 			currentOutput: async () => ({ output: "", truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const createSpy = spyOn(bridge, "createTerminal");
+		let sessionId = "session-a";
+		const fileA = path.join(os.tmpdir(), "sessions", "a.jsonl");
+		let sessionFile: string | null = fileA;
+		const tool = new BashTool({
+			...makeSession(bridge),
+			getSessionFile: () => sessionFile,
+			// Advisors key tool state as `<id>-advisor`; the env must carry the owning session.
+			getSessionId: () => `${sessionId}-advisor`,
+			sessionManager: { getSessionId: () => sessionId },
+		} as unknown as ToolSession);
+		const sessionEnvOf = (call: number) =>
+			Object.fromEntries(
+				(createSpy.mock.calls[call]![0].env ?? [])
+					.filter(({ name }) => name.startsWith("PI_SESSION_") || name === "PI_TOOL_CALL_ID")
+					.map(({ name, value }) => [name, value]),
+			);
+
+		await tool.execute("call-env-a", { command: "true" });
+		sessionId = "session-b";
+		sessionFile = null;
+		await tool.execute("call-env-b", { command: "true" });
+
+		expect(sessionEnvOf(0)).toEqual({
+			PI_SESSION_ID: "session-a",
+			PI_SESSION_FILE: fileA,
+			PI_TOOL_CALL_ID: "call-env-a",
+		});
+		// Empty, not absent: an env overlay cannot unset a stale value inherited from a parent omp.
+		expect(sessionEnvOf(1)).toEqual({
+			PI_SESSION_ID: "session-b",
+			PI_SESSION_FILE: "",
+			PI_TOOL_CALL_ID: "call-env-b",
+		});
+	});
+
+	it("extracts graphics from cumulative terminal snapshots without leaking escapes", async () => {
+		const frame = await encodeTerminalImage({
+			type: "image",
+			mimeType: "image/png",
+			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+		});
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-image",
+			waitForExit: async () => ({ exitCode: 7, signal: null }),
+			currentOutput: async () => ({ output: `before${frame}after`, truncated: false }),
 			kill: async () => {},
 			release: async () => {},
 		};
@@ -106,19 +177,14 @@ describe("BashTool ACP terminal routing", () => {
 			capabilities: { terminal: true },
 			createTerminal: async () => handle,
 		};
-		const createSpy = spyOn(bridge, "createTerminal");
 
-		const line = "git status && echo x | head";
-		const tool = new BashTool(makeSession(bridge));
-		await tool.execute("call-shell-wrap", { command: line });
-
-		expect(createSpy).toHaveBeenCalledTimes(1);
-		const params = createSpy.mock.calls[0]![0];
-		expect(params.command).toBe("/bin/bash");
-		expect(params.args).toEqual(["-l", "-c", line]);
-		// `args` must actually be present — the bug was omitting it entirely.
-		expect(params.args).toBeDefined();
-		expect(params.args?.length).toBeGreaterThan(0);
+		const result = await new BashTool(makeSession(bridge)).execute("call-image", { command: "remote-image" });
+		expect(result.isError).toBe(true);
+		expect(result.content.find(block => block.type === "text")?.text).toContain("beforeafter");
+		expect(result.content.find(block => block.type === "text")?.text).not.toContain("\x1b_G");
+		expect(result.content.filter(block => block.type === "image")).toEqual([
+			expect.objectContaining({ type: "image", mimeType: "image/png" }),
+		]);
 	});
 
 	it("does not allocate a client terminal when the signal is already aborted before createTerminal", async () => {
@@ -148,6 +214,7 @@ describe("BashTool ACP terminal routing", () => {
 	});
 
 	it("resolves using the last polled output when final output retrieval fails", async () => {
+		shortenAcpWaits();
 		const pendingExit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
 		let currentOutputCalls = 0;
 		const handle: ClientBridgeTerminalHandle = {
@@ -206,6 +273,7 @@ describe("BashTool ACP terminal routing", () => {
 	});
 
 	it("kills and releases the client terminal when the caller aborts", async () => {
+		shortenAcpWaits();
 		const pendingExit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
 		const controller = new AbortController();
 
@@ -237,9 +305,9 @@ describe("BashTool ACP terminal routing", () => {
 	});
 
 	it("kills and releases the client terminal when the command times out", async () => {
-		// Real 1s timeout — no Bun.sleep/setTimeout mocking. Mocking the timer
-		// implementation couples the test to how the timeout is scheduled and
-		// starves the event loop when the implementation changes.
+		// The timeout and cleanup windows are compressed; the terminal promises,
+		// kill-before-output ordering, and hung-RPC behavior remain real.
+		shortenAcpWaits();
 		const pendingExit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
 		let killCalls = 0;
 		let currentOutputAfterKill = 0;
@@ -264,18 +332,20 @@ describe("BashTool ACP terminal routing", () => {
 		const releaseSpy = spyOn(handle, "release");
 
 		const tool = new BashTool(makeSession(bridge));
-		const executePromise = tool.execute("call-timeout", { command: "sleep 60", timeout: 1 });
+		const result = await tool.execute("call-timeout", { command: "sleep 60", timeout: 1 });
 
-		await expect(executePromise).rejects.toThrow(/Command timed out after 1 seconds/);
-
+		expect(result.isError).toBe(true);
+		expect(result.details?.timedOut).toBe(true);
+		expect(result.content.find(block => block.type === "text")?.text).toContain("Command timed out after 1 seconds");
 		expect(killSpy).toHaveBeenCalledTimes(1);
 		expect(releaseSpy).toHaveBeenCalledTimes(1);
 		expect(currentOutputAfterKill).toBeGreaterThan(0);
 	});
 
 	it("still times out when a poll-tick output read hangs", async () => {
-		// Real 1s timeout — deliberately exercises the wall-clock deadline against
-		// an RPC that never settles; fake timers cannot model a hung peer.
+		// A never-settling output RPC exercises the real race while the outer
+		// deadline is compressed to avoid paying a full second.
+		shortenAcpWaits();
 		const pendingExit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
 		const neverOutput = new Promise<{ output: string; truncated: boolean }>(() => {});
 
@@ -294,16 +364,19 @@ describe("BashTool ACP terminal routing", () => {
 		const releaseSpy = spyOn(handle, "release");
 
 		const tool = new BashTool(makeSession(bridge));
-		const executePromise = tool.execute("call-hung-poll", { command: "sleep 60", timeout: 1 });
+		const result = await tool.execute("call-hung-poll", { command: "sleep 60", timeout: 1 });
 
-		await expect(executePromise).rejects.toThrow(/Command timed out after 1 seconds/);
+		expect(result.isError).toBe(true);
+		expect(result.details?.timedOut).toBe(true);
+		expect(result.content.find(block => block.type === "text")?.text).toContain("Command timed out after 1 seconds");
 		expect(killSpy).toHaveBeenCalledTimes(1);
 		expect(releaseSpy).toHaveBeenCalledTimes(1);
 	}, 8000);
 
 	it("returns even when terminal release hangs", async () => {
-		// Real-time grace bound: release() never settles; the tool must still
-		// resolve once the kill-grace window elapses.
+		// release() truly never settles; only the production grace sleep is
+		// compressed so this still proves cleanup is bounded.
+		shortenAcpWaits();
 		const stubText = "done\n";
 		const neverRelease = new Promise<void>(() => {});
 

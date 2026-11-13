@@ -1,6 +1,6 @@
 # Session tree architecture (current)
 
-Reference: [session.md](../docs/session.md)
+Reference: [session.md](./session.md)
 
 This document describes how session tree navigation works today: in-memory tree model, leaf movement rules, branching behavior, and extension/event integration.
 
@@ -15,14 +15,14 @@ The session is stored as an append-only entry log, but runtime behavior is tree-
 
 Key files:
 
-- `src/session/session-manager.ts` — tree data model, traversal, leaf movement, branch/session extraction
-- `src/session/session-context.ts` — `buildSessionContext` context reconstruction (resolved root→leaf LLM context, compaction/branch-summary replay)
-- `src/session/agent-session.ts` — `/tree` navigation flow, summarization, hook/event emission
-- `src/modes/components/tree-selector.ts` — interactive tree UI behavior and filtering
-- `src/modes/controllers/selector-controller.ts` — selector orchestration for `/tree` and `/branch`
-- `src/slash-commands/builtin-registry.ts` — command routing (`/tree`, `/branch`)
-- `src/modes/controllers/input-controller.ts` — double-escape behavior and `app.session.tree`/`app.session.fork` keybinding wiring
-- `src/session/messages.ts` — conversion of `branch_summary`, `compaction`, and `custom_message` entries into LLM context messages
+- `packages/coding-agent/src/session/session-manager.ts` — tree data model, traversal, leaf movement, branch/session extraction
+- `packages/coding-agent/src/session/session-context.ts` — `buildSessionContext` context reconstruction (resolved root→leaf LLM context, compaction/branch-summary replay)
+- `packages/coding-agent/src/session/agent-session.ts` — `/tree` navigation flow, summarization, hook/event emission
+- `packages/tui/src/overlays/tree-selector.ts` — interactive tree UI behavior and filtering
+- `packages/coding-agent/src/modes/controllers/selector-controller.ts` — selector orchestration for `/tree` and `/branch`
+- `packages/coding-agent/src/slash-commands/builtin-session.ts` — command routing (`/tree`, `/branch`)
+- `packages/coding-agent/src/modes/controllers/input-controller.ts` — double-escape behavior and `app.session.tree`/`app.session.fork` keybinding wiring
+- `packages/coding-agent/src/session/messages.ts` — conversion of `branch_summary`, `compaction`, and `custom_message` entries into LLM context messages
 
 ## Tree data model in `SessionManager`
 
@@ -38,9 +38,9 @@ Tree APIs:
 
 - `getBranch(fromId?)` walks parent links to root and returns root→node path
 - `getTree()` returns `SessionTreeNode[]` (`entry`, `children`, `label`)
-  - parent links become children arrays
-  - entries with missing parents are treated as roots
-  - children are sorted oldest→newest by timestamp
+   - parent links become children arrays
+   - entries with missing, null, or self parents are treated as roots
+   - children are sorted oldest→newest by timestamp
 - `getChildren(parentId)` returns direct children
 - `getLabel(id)` resolves current label from the index's `#labels` map
 
@@ -71,34 +71,37 @@ There are three leaf movement primitives:
 
 Flow:
 
-1. Validate target and compute abandoned path (`collectEntriesForBranchSummary`)
-2. Emit `session_before_tree` with `TreePreparation`
-3. Optionally summarize abandoned entries (hook-provided summary or built-in summarizer)
-4. Compute new leaf target:
-   - selecting a **user** message: leaf moves to its parent, and message text is returned for editor prefill
-   - selecting a **custom_message**: same rule as user message (leaf = parent, text prefills editor)
-   - selecting any other entry: leaf = selected entry id
-5. Apply leaf move:
+1. Validate the target and compute the abandoned path (`collectEntriesForBranchSummary`).
+2. For an interactive selection of an `ask` tool result whose original form `html` can be recovered, return a `reopenAsk` request without mutating the tree. The selector re-opens the form, then calls `navigateTree` again with the replacement result; that second call appends a new sibling `toolResult` at the original answer's parent.
+3. Emit `session_before_tree` with `TreePreparation`.
+4. Optionally summarize abandoned entries (hook-provided summary or built-in summarizer).
+5. Compute the new leaf target:
+   - selecting a **user** message or user-invoked skill/collaboration custom prompt: leaf moves to its parent; the original draft and image attachments are returned for editor restoration
+   - selecting another **custom_message** other than a skill-prompt injection: same parent/prefill rule (text only)
+   - selecting an agent/autoload skill-prompt injection or any other entry: leaf = selected entry id
+6. Apply leaf move:
    - with summary: `branchWithSummary(newLeafId, ...)`
    - without summary and `newLeafId === null`: `resetLeaf()`
    - otherwise: `branch(newLeafId)`
-6. Rebuild agent context from new leaf and emit `session_tree`
+7. Rebuild agent context from the new leaf, reset branch-scoped todo/advisor/checkpoint state, close Codex provider sessions whose history was rewritten, and emit `session_tree`.
 
 Important: summary entries are attached at the **new navigation position**, not on the abandoned branch tail.
 
-## `/branch` behavior (new session file)
+## `/branch` and programmatic file branching
 
-`/branch` and `/tree` are intentionally different:
+Both user-facing commands stay in the current session file:
 
-- `/tree` navigates within the current session file.
-- `/branch` creates a new session branch file (or in-memory replacement for non-persistent mode).
+- `/tree` opens the entry-tree selector with filters, labels, and optional summaries.
+- `/branch` (alias `/rewind`) opens the fullscreen transcript rewind selector.
+- Transcript rewind calls `navigateTree(entryId, { summarize: false })`. User-request targets rewind past the prompt and replace the editor draft; other targets land on the selected entry.
+- `doubleEscapeAction` controls only the empty-editor double-Escape shortcut: `rewind` (default), `tree`, or `none`. It does not change `/branch` routing.
 
-User-facing `/branch` flow (`SelectorController.showUserMessageSelector` → `AgentSession.branch`):
+The separate `AgentSession.branch(entryId)` API, used by extension/hook command contexts, still creates a new file (or an in-memory replacement):
 
-- Branch source must be a **user message**.
-- Selected user text is extracted for editor prefill.
-- If selected user message is root (`parentId === null`): start a new session via `newSession({ parentSession: previousSessionFile })`.
-- Otherwise: `createBranchedSession(selectedEntry.parentId)` to fork history up to the selected prompt boundary.
+- Source must be a **user message**.
+- Returns selected user text and image attachments for draft restoration.
+- A root prompt starts `newSession({ parentSession: previousSessionFile })`, carrying the prior title and title source.
+- Otherwise it calls `createBranchedSession(selectedEntry.parentId)` to copy history up to the prompt boundary.
 
 `SessionManager.createBranchedSession(leafId)` specifics:
 
@@ -112,17 +115,17 @@ User-facing `/branch` flow (`SelectorController.showUserMessageSelector` → `Ag
 
 `buildSessionContext()` (in `session-context.ts`, exposed via `SessionManager.buildSessionContext()`) resolves the active root→leaf path and builds effective LLM context state:
 
-- Tracks latest thinking/model/service-tier/mode/TTSR/MCP-selection state on path.
-- Handles latest compaction on path:
-  - emits compaction summary first
-  - replays kept messages from `firstKeptEntryId` to compaction point
-  - then replays post-compaction messages
+- Tracks latest configured/effective thinking, role-model, per-family service-tier, mode/data, and injected-TTSR state on the path.
+- Handles the latest compaction on the path that the reading model (`options.model`) can replay:
+   - emits compaction summary first
+   - replays kept messages from `firstKeptEntryId` to compaction point
+   - then replays post-compaction messages
 - Includes `branch_summary` and `custom_message` entries as `AgentMessage` objects.
 
 `session/messages.ts` then maps these message types for model input:
 
 - `branchSummary` and `compactionSummary` become user-role templated context messages
-- `custom`/`hookMessage` become developer-role content messages (via agent-core's `convertMessageToLlm`)
+- Ordinary `custom`/`hookMessage` content uses developer-role conversion; user-invoked skill prompts become attributed user messages, and steering user messages use their dedicated wrapper. Image-bearing custom content has a separate conversion path.
 
 So tree movement changes context by changing the active leaf path, not by mutating old entries.
 
@@ -138,38 +141,40 @@ Tree selector behavior (`tree-selector.ts`):
 
 - Flattens tree for navigation, keeps active-path highlighting, and prioritizes displaying the active branch first.
 - Supports filter modes: `default`, `no-tools`, `user-only`, `labeled-only`, `all`.
-  - `default` suppresses `label`, `custom`, `model_change`, and `thinking_level_change`; it is not a complete "hide all internal entries" filter.
+   - `default` suppresses settings/bookkeeping entries: `label`, `custom`, model/thinking/service-tier/title changes, `model_usage`, credential pins, session initialization, TTSR injections, mode changes, and reset boundaries.
+   - `user-only` includes ordinary user messages and user-invoked skill/collaboration custom prompts.
 - Supports free-text search over rendered semantic content.
 - `Shift+L` opens inline label editing and writes via `appendLabelChange`.
 
 Command routing:
 
-- `/tree` always opens tree selector.
-- `/branch` opens user-message selector unless `doubleEscapeAction=tree`, in which case it also uses tree selector UX.
+- `/tree` always opens the tree selector.
+- `/branch` (alias `/rewind`) always opens the transcript rewind selector and performs same-file navigation.
 
 ## Extension and hook touchpoints for tree operations
 
 Command-time extension API (`ExtensionCommandContext`):
 
-- `branch(entryId)` — create branched session file
-- `navigateTree(targetId, { summarize? })` — move within current tree/file
+- `branch(entryId)` — create a branched session file; returns `{ cancelled }`
+- `navigateTree(targetId, { summarize? })` — move within the current tree/file; returns `{ cancelled }`
 
+`HookCommandContext` exposes the same `branch` and `navigateTree` actions, but intentionally omits extension-only session switching/reload/compaction actions.
 Events around tree navigation:
 
 - `session_before_tree`
-  - receives `TreePreparation`:
-    - `targetId`
-    - `oldLeafId`
-    - `commonAncestorId`
-    - `entriesToSummarize`
-    - `userWantsSummary`
-  - may cancel navigation
-  - may provide summary payload used instead of built-in summarizer
-  - receives abort `signal` (Escape cancellation path)
+   - receives `TreePreparation`:
+      - `targetId`
+      - `oldLeafId`
+      - `commonAncestorId`
+      - `entriesToSummarize`
+      - `userWantsSummary`
+   - may cancel navigation
+   - may provide summary payload used instead of built-in summarizer
+   - receives abort `signal` (Escape cancellation path)
 - `session_tree`
-  - emits `newLeafId`, `oldLeafId`
-  - includes `summaryEntry` when a summary was created
-  - `fromExtension` indicates summary origin
+   - emits `newLeafId`, `oldLeafId`
+   - includes `summaryEntry` when a summary was created
+   - `fromExtension` indicates summary origin
 
 Adjacent but related lifecycle hooks:
 
@@ -180,30 +185,30 @@ Adjacent but related lifecycle hooks:
 
 - `branch()` cannot target `null`; use `resetLeaf()` for root-before-first-entry state.
 - `branchWithSummary()` supports `null` target and records `fromId: "root"`.
-- Selecting current leaf in tree selector is a no-op.
-- Summarization requires an active model; if absent, summarize navigation fails fast.
+- Selecting the current leaf in `/tree` is normally a UI no-op, except interactive `ask` re-answer. Direct `navigateTree()` and transcript rewind can still rewind past a current-leaf user message.
+- Requested summarization requires an active model. Built-in summary generation also requires a provider credential; hook-supplied summaries and navigation with no abandoned entries do not invoke that credential check.
 - If summarization is aborted, navigation is cancelled and leaf is unchanged.
-- In-memory sessions never return a branch file path from `createBranchedSession`.
-- Tree context reconstruction includes service-tier and MCP tool-selection state, but those entries do not become LLM messages.
+- In-memory sessions never return a branch file path from `createBranchedSession`, though their in-memory entries are replaced.
+- Tree context reconstruction includes role models, configured/effective thinking, per-family service tiers, mode data, and injected TTSR state; state entries do not themselves become LLM messages.
 
 ## Plan approval session naming
 
-When a user approves a plan from plan mode (`InteractiveMode.#approvePlan`), the approval handler seeds the session name from the plan's title so the resulting (fresh or compacted) session does not stay unnamed.
+When a user approves a plan from plan mode (`InteractiveMode.#approvePlan`), the dispatch path seeds the session name from the plan's title so the resulting fresh, preserved, or compacted session does not stay unnamed.
 
 Trigger:
 
 - Plan approval reaches `#approvePlan(...)` with `options.title` populated from the plan-approval details.
-- This runs for every approval choice (`Approve and execute`, `Approve and compact context`, `Approve and keep context`); the synthetic `plan-approved` prompt is what otherwise bypasses the input-controller's title-generation path.
+- This applies to each approval choice that reaches execution dispatch. If approval-time compaction is explicitly cancelled, execution is not dispatched and the naming block is not reached; the next operator turn continues from the preserved plan reference.
 
 Naming source:
 
 - The normalized plan title is humanized via `humanizePlanTitle(title)` (`packages/coding-agent/src/plan-mode/approved-plan.ts`):
-  - replaces runs of `-`/`_` with a single space
-  - trims whitespace
-  - capitalizes the first character
-  - returns `""` for whitespace-only / separator-only input
+   - replaces runs of `-`/`_` with a single space
+   - trims whitespace
+   - capitalizes the first character
+   - returns `""` for whitespace-only / separator-only input
 - The humanized name is applied only when the current session has no name (`!sessionManager.getSessionName()`). It then calls `sessionManager.setSessionName(name, "auto")`, which also refuses to overwrite user-named sessions.
-- On successful apply, the terminal title (`setSessionTerminalTitle`) and the editor border color are refreshed to reflect the new name.
+- The naming write is awaited before the execution prompt is queued.
 
 Examples (from `humanizePlanTitle`):
 

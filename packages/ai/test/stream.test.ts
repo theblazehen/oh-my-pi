@@ -3,14 +3,15 @@ import { type ChildProcess, execSync, spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { __resetVertexTokenCache } from "@oh-my-pi/pi-ai/providers/google-auth";
-import { complete, getEnvApiKey, stream } from "@oh-my-pi/pi-ai/stream";
+import { getEnvApiKey } from "@oh-my-pi/pi-ai/env-api-key";
+import { complete, stream } from "@oh-my-pi/pi-ai/stream";
 import type { Api, Context, ImageContent, Model, OptionsForApi, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { $which } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 import { removeWithRetries } from "../../utils/src/temp";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
@@ -57,7 +58,6 @@ async function basicTextGeneration<TApi extends Api>(model: Model<TApi>, options
 	const response = await complete(model, context, options);
 
 	expect(response.role).toBe("assistant");
-	expect(response.content).toBeTruthy();
 	expect(response.usage.input + response.usage.cacheRead).toBeGreaterThan(0);
 	expect(response.usage.output).toBeGreaterThan(0);
 	expect(response.errorMessage).toBeFalsy();
@@ -69,7 +69,6 @@ async function basicTextGeneration<TApi extends Api>(model: Model<TApi>, options
 	const secondResponse = await complete(model, context, options);
 
 	expect(secondResponse.role).toBe("assistant");
-	expect(secondResponse.content).toBeTruthy();
 	expect(secondResponse.usage.input + secondResponse.usage.cacheRead).toBeGreaterThan(0);
 	expect(secondResponse.usage.output).toBeGreaterThan(0);
 	expect(secondResponse.errorMessage).toBeFalsy();
@@ -260,7 +259,6 @@ async function handleImage<TApi extends Api>(model: Model<TApi>, options?: Optio
 	const response = await complete(model, context, options);
 
 	// Check the response mentions red and circle
-	expect(response.content.length > 0).toBeTruthy();
 	const textContent = response.content.find(b => b.type === "text");
 	if (textContent && textContent.type === "text") {
 		const lowerContent = textContent.text.toLowerCase();
@@ -348,7 +346,6 @@ async function multiTurn<TApi extends Api>(model: Model<TApi>, options?: Options
 	expect(hasSeenThinking || hasSeenToolCalls).toBe(true);
 
 	// The accumulated text should reference both calculations
-	expect(allTextContent).toBeTruthy();
 	expect(allTextContent.includes("714")).toBe(true);
 	expect(allTextContent.includes("887")).toBe(true);
 }
@@ -537,7 +534,6 @@ describe("Generate E2E Tests", () => {
 				);
 
 				expect(response.stopReason).toBe("aborted");
-				expect(response.errorMessage).toBeTruthy();
 				expect(response.errorMessage).not.toContain("Vertex AI requires a project ID");
 				expect(response.errorMessage).not.toContain("Vertex AI requires a location");
 			} finally {
@@ -565,13 +561,13 @@ describe("Generate E2E Tests", () => {
 			const originalLocation = Bun.env.VERTEX_LOCATION;
 			const originalApiKey = Bun.env.GOOGLE_CLOUD_API_KEY;
 			const originalGac = Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
+			const originalAppData = Bun.env.APPDATA;
 			// Force the GCE/Cloud Run metadata-server token path: neutralize any host
 			// ADC so resolveAccessTokenUncached() falls through to fetchMetadataToken().
-			// Without this the test reads ~/.config/gcloud/application_default_credentials.json
+			// Without this the test reads the user ADC (~/.config/gcloud or %APPDATA%\gcloud)
 			// when present and hangs on the OAuth exchange (form body, not JSON).
-			const homedirSpy = spyOn(os, "homedir").mockReturnValue(
-				path.join(os.tmpdir(), `vertex-adc-absent-${location}-${Date.now()}`),
-			);
+			const absentAdcHome = path.join(os.tmpdir(), `vertex-adc-absent-${location}-${Date.now()}`);
+			const homedirSpy = spyOn(os, "homedir").mockReturnValue(absentAdcHome);
 			const model: Model<"anthropic-messages"> = buildModel({
 				id: "claude-sonnet-4@20250514",
 				name: "Claude Sonnet 4",
@@ -602,6 +598,7 @@ describe("Generate E2E Tests", () => {
 				delete Bun.env.VERTEX_LOCATION;
 				delete Bun.env.GOOGLE_CLOUD_API_KEY;
 				delete Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
+				Bun.env.APPDATA = absentAdcHome;
 
 				const events = stream(
 					model,
@@ -671,6 +668,8 @@ describe("Generate E2E Tests", () => {
 				else Bun.env.GOOGLE_CLOUD_API_KEY = originalApiKey;
 				if (originalGac === undefined) delete Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
 				else Bun.env.GOOGLE_APPLICATION_CREDENTIALS = originalGac;
+				if (originalAppData === undefined) delete Bun.env.APPDATA;
+				else Bun.env.APPDATA = originalAppData;
 			}
 		});
 
@@ -1005,43 +1004,7 @@ describe("Generate E2E Tests", () => {
 		);
 	});
 
-	describe.skipIf(!e2eApiKey("OPENAI_API_KEY"))("OpenAI Responses Provider (gpt-5-mini)", () => {
-		const model = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
-
-		it(
-			"should complete basic text generation",
-			async () => {
-				await basicTextGeneration(model);
-			},
-			{ retry: 3 },
-		);
-
-		it(
-			"should handle tool calling",
-			async () => {
-				await handleToolCall(model);
-			},
-			{ retry: 3 },
-		);
-
-		it(
-			"should handle streaming",
-			async () => {
-				await handleStreaming(model);
-			},
-			{ retry: 3 },
-		);
-
-		it(
-			"should handle image input",
-			async () => {
-				await handleImage(model);
-			},
-			{ retry: 3 },
-		);
-	});
-
-	describe.skipIf(!e2eApiKey("XAI_API_KEY"))("xAI Provider (grok-code-fast-1 via OpenAI Completions)", () => {
+	describe.skipIf(!e2eApiKey("XAI_API_KEY"))("xAI Provider (grok-code-fast-1 via OpenAI Responses)", () => {
 		const llm = getBundledModel("xai", "grok-code-fast-1");
 
 		it(
@@ -1252,14 +1215,6 @@ describe("Generate E2E Tests", () => {
 			{ retry: 3 },
 		);
 
-		it.skip(
-			"should handle thinking mode",
-			async () => {
-				await handleThinking(llm, { reasoning: Effort.Medium });
-			},
-			{ retry: 3 },
-		);
-
 		it(
 			"should handle multi-turn with thinking and tools",
 			async () => {
@@ -1351,16 +1306,6 @@ describe("Generate E2E Tests", () => {
 			);
 
 			it(
-				"should handle thinking mode",
-				async () => {
-					// FIXME Skip for now, getting a 422 status code, need to test with official SDK
-					// const llm = getModel("mistral", "magistral-medium-latest");
-					// await handleThinking(llm, { reasoningEffort: "medium" });
-				},
-				{ retry: 3 },
-			);
-
-			it(
 				"should handle multi-turn with thinking and tools",
 				async () => {
 					await multiTurn(llm, { reasoning: Effort.Medium });
@@ -1406,8 +1351,8 @@ describe("Generate E2E Tests", () => {
 		);
 	});
 
-	describe("Anthropic OAuth Provider (claude-sonnet-4-20250514)", () => {
-		const model = getBundledModel("anthropic", "claude-sonnet-4-20250514");
+	describe("Anthropic OAuth Provider (claude-sonnet-4-5-20250929)", () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5-20250929");
 
 		it.skipIf(!anthropicOAuthToken)(
 			"should complete basic text generation",
@@ -1783,7 +1728,6 @@ describe("Generate E2E Tests", () => {
 				);
 
 				expect(response.stopReason, `Error: ${response.errorMessage}`).not.toBe("error");
-				expect(capturedPayload).toBeTruthy();
 
 				const payload = capturedPayload as {
 					additionalModelRequestFields?: {

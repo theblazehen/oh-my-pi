@@ -3,12 +3,16 @@
  *
  * Creates a .tar.gz archive with session data, logs, system info, and optional profiling data.
  */
+
+import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { WorkProfile } from "@oh-my-pi/pi-natives";
-import { APP_NAME, getLogPath, getLogsDir, getReportsDir, isEnoent } from "@oh-my-pi/pi-utils";
-import { writeArchive } from "../utils/zip";
-import type { CpuProfile, HeapSnapshot } from "./profiler";
+import { APP_NAME, getLogPath, getLogsDir, getReportsDir, isEnoent, localDay, logger } from "@oh-my-pi/pi-utils";
+import { writeArchive } from "@oh-my-pi/pi-utils/ar";
+import { readSessionHeaderId } from "../session/session-loader";
+import { collectSubSessions } from "../session/sub-sessions";
+import type { CpuProfile, MemoryStats } from "./profiler";
 import { collectSystemInfo, sanitizeEnv } from "./system-info";
 
 /** Maximum number of log lines to load into memory at once. */
@@ -16,6 +20,14 @@ const MAX_LOG_LINES = 5000;
 
 /** Maximum bytes to read from the tail of a log file (2 MB). */
 const MAX_LOG_BYTES = 2 * 1024 * 1024;
+
+/** The last `n` lines of `text`, dropping its first line when that line is cut. */
+function lastLines(text: string, startsMidLine: boolean, n: number): string {
+	const lines = text.split("\n");
+	if (startsMidLine) lines.shift();
+	return lines.slice(-n).join("\n");
+}
+
 /** Read last N lines from a file, reading at most `maxBytes` from the tail. */
 async function readLastLines(filePath: string, n: number, maxBytes = MAX_LOG_BYTES): Promise<string> {
 	try {
@@ -23,12 +35,7 @@ async function readLastLines(filePath: string, n: number, maxBytes = MAX_LOG_BYT
 		const size = file.size;
 		const start = Math.max(0, size - maxBytes);
 		const content = start > 0 ? await file.slice(start, size).text() : await file.text();
-		const lines = content.split("\n");
-		// If we sliced mid-file, drop the first (partial) line
-		if (start > 0 && lines.length > 0) {
-			lines.shift();
-		}
-		return lines.slice(-n).join("\n");
+		return lastLines(content, start > 0, n);
 	} catch (err) {
 		if (isEnoent(err)) return "";
 		throw err;
@@ -42,8 +49,8 @@ export interface ReportBundleOptions {
 	settings?: Record<string, unknown>;
 	/** CPU profile (for performance reports) */
 	cpuProfile?: CpuProfile;
-	/** Heap snapshot (for memory reports) */
-	heapSnapshot?: HeapSnapshot;
+	/** Numeric memory statistics, never raw heap contents */
+	memoryStats?: MemoryStats;
 	/** Work profile (for work scheduling reports) */
 	workProfile?: WorkProfile;
 	/** Raw provider SSE diagnostics captured by the session buffer */
@@ -66,16 +73,17 @@ export interface DebugLogSource {
  *
  * Bundle contents:
  * - session.jsonl: Current session transcript
- * - artifacts/: Session artifacts directory
- * - subagents/: Subagent sessions + artifacts
+ * - artifacts/: Current session's artifacts subtree (recursive), including any
+ *   subagent session transcripts nested under it
  * - logs.txt: Recent log entries
+ * - session-logs.txt: Today's log records of this session and its subagents
  * - system.json: OS, arch, CPU, memory, versions
  * - env.json: Sanitized environment variables
  * - config.json: Resolved settings
  * - profile.cpuprofile: CPU profile (performance report only)
  * - raw-sse.txt: Recent raw provider SSE diagnostics (when captured)
  * - profile.md: Markdown CPU profile (performance report only)
- * - heap.heapsnapshot: Heap snapshot (memory report only)
+ * - memory.json: Numeric process and heap statistics (memory report only)
  * - work.folded: Work profile folded stacks (work report only)
  * - work.md: Work profile summary (work report only)
  * - work.svg: Work profile flamegraph (work report only)
@@ -87,7 +95,7 @@ export async function createReportBundle(options: ReportBundleOptions): Promise<
 	const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 	const outputPath = path.join(reportsDir, `omp-report-${timestamp}.tar.gz`);
 
-	const data: Record<string, string> = {};
+	const data: Record<string, string | Uint8Array> = {};
 	const files: string[] = [];
 
 	// Collect system info
@@ -103,15 +111,6 @@ export async function createReportBundle(options: ReportBundleOptions): Promise<
 	if (options.settings) {
 		data["config.json"] = JSON.stringify(options.settings, null, 2);
 		files.push("config.json");
-	}
-
-	// Recent logs (last 1000 lines) across every same-day process. PID-qualified
-	// filenames mean a report generated from a later invocation must still gather
-	// the crashed process's log, so read all of today's files, not just our own.
-	const logs = await collectSameDayLogs(1000);
-	if (logs) {
-		data["logs.txt"] = logs;
-		files.push("logs.txt");
 	}
 
 	// Recent raw provider SSE diagnostics
@@ -130,14 +129,27 @@ export async function createReportBundle(options: ReportBundleOptions): Promise<
 			// Session file might not exist yet
 		}
 
-		// Artifacts directory (same path without .jsonl)
+		// Artifacts subtree (same path without .jsonl). Recursing captures the
+		// current session's nested subagent transcripts and their artifacts while
+		// staying inside this session's own directory — unrelated co-located
+		// sessions in the sessions root are never touched (#8648).
 		const artifactsDir = options.sessionFile.slice(0, -6);
 		await addDirectoryToArchive(data, files, artifactsDir, "artifacts");
+	}
 
-		// Look for subagent sessions in the same directory
-		const sessionDir = path.dirname(options.sessionFile);
-		const sessionBasename = path.basename(options.sessionFile, ".jsonl");
-		await addSubagentSessions(data, files, sessionDir, sessionBasename);
+	// Recent logs (last 1000 lines) across every same-day process. PID-qualified
+	// filenames mean a report generated from a later invocation must still gather
+	// the crashed process's log, so read all of today's files, not just our own.
+	// Every record those files hold for this session or its subagents goes to
+	// session-logs.txt, however far back in the file it sits.
+	const { tails, sessionLines } = await collectSameDayLogs(1000, await collectSessionIds(options.sessionFile));
+	if (tails) {
+		data["logs.txt"] = tails;
+		files.push("logs.txt");
+	}
+	if (sessionLines) {
+		data["session-logs.txt"] = sessionLines;
+		files.push("session-logs.txt");
 	}
 
 	// CPU profile
@@ -148,10 +160,10 @@ export async function createReportBundle(options: ReportBundleOptions): Promise<
 		files.push("profile.md");
 	}
 
-	// Heap snapshot
-	if (options.heapSnapshot) {
-		data["heap.heapsnapshot"] = options.heapSnapshot.data;
-		files.push("heap.heapsnapshot");
+	// Memory statistics exclude heap contents, which can contain credentials.
+	if (options.memoryStats) {
+		data["memory.json"] = JSON.stringify(options.memoryStats, null, 2);
+		files.push("memory.json");
 	}
 
 	// Work profile
@@ -172,84 +184,75 @@ export async function createReportBundle(options: ReportBundleOptions): Promise<
 	return { path: outputPath, files };
 }
 
-/** Add all files from a directory to the archive */
+/** Recursively add every file under a directory to the archive. */
 async function addDirectoryToArchive(
-	data: Record<string, string>,
+	data: Record<string, string | Uint8Array>,
 	files: string[],
 	dirPath: string,
 	archivePrefix: string,
 ): Promise<void> {
+	let entries: Dirent[];
 	try {
-		const entries = await fs.readdir(dirPath, { withFileTypes: true });
-		for (const entry of entries) {
-			if (!entry.isFile()) continue;
-			const filePath = path.join(dirPath, entry.name);
-			const archivePath = `${archivePrefix}/${entry.name}`;
-			try {
-				const content = await Bun.file(filePath).text();
-				data[archivePath] = content;
-				files.push(archivePath);
-			} catch {
-				// Skip files we can't read
-			}
-		}
+		entries = await fs.readdir(dirPath, { withFileTypes: true });
 	} catch {
 		// Directory doesn't exist
+		return;
 	}
-}
-
-/** Find and add subagent session files */
-async function addSubagentSessions(
-	data: Record<string, string>,
-	files: string[],
-	sessionDir: string,
-	parentBasename: string,
-): Promise<void> {
-	// Subagent sessions are named with task IDs in the same directory
-	// They follow the pattern: {timestamp}_{sessionId}.jsonl
-	// We look for any sessions created after the parent session
-	try {
-		const entries = await fs.readdir(sessionDir, { withFileTypes: true });
-		const sessionFiles = entries
-			.filter(e => e.isFile() && e.name.endsWith(".jsonl") && e.name !== `${parentBasename}.jsonl`)
-			.map(e => e.name);
-
-		// Limit to most recent 10 subagent sessions
-		const sortedFiles = sessionFiles.sort().slice(-10);
-
-		for (const filename of sortedFiles) {
-			const filePath = path.join(sessionDir, filename);
-			const archivePath = `subagents/${filename}`;
-			try {
-				const content = await Bun.file(filePath).text();
-				data[archivePath] = content;
-				files.push(archivePath);
-
-				// Also add artifacts for this subagent session
-				const artifactsDir = filePath.slice(0, -6);
-				await addDirectoryToArchive(data, files, artifactsDir, `subagents/${filename.slice(0, -6)}`);
-			} catch {
-				// Skip files we can't read
-			}
+	for (const entry of entries) {
+		const entryPath = path.join(dirPath, entry.name);
+		const archivePath = `${archivePrefix}/${entry.name}`;
+		if (entry.isDirectory()) {
+			await addDirectoryToArchive(data, files, entryPath, archivePath);
+			continue;
 		}
-	} catch {
-		// Directory doesn't exist
+		if (!entry.isFile()) continue;
+		try {
+			data[archivePath] = await Bun.file(entryPath).text();
+			files.push(archivePath);
+		} catch {
+			// Skip files we can't read
+		}
 	}
 }
 
 /** Get recent log entries for display (tail-limited to avoid OOM on large files). */
 export async function getLogText(): Promise<string> {
+	// The file transport batches writes; include this process's latest records.
+	logger.flush();
 	return readLastLines(getLogPath(), MAX_LOG_LINES);
+}
+
+/**
+ * Ids of the session and its subagents, found the way `/export` finds subagent
+ * transcripts, so other JSONL artifacts never pull in an unrelated session.
+ */
+async function collectSessionIds(sessionFile: string | undefined): Promise<Set<string>> {
+	const ids = new Set<string>();
+	if (!sessionFile) return ids;
+	const ownId = await readSessionHeaderId(sessionFile).catch(() => undefined);
+	if (ownId) ids.add(ownId);
+	const subSessions = await collectSubSessions(sessionFile).catch(() => ({}));
+	for (const sub of Object.values(subSessions)) if (sub.header) ids.add(sub.header.id);
+	return ids;
 }
 
 /**
  * Concatenate the tail of every same-day process log so a report generated
  * after a crash still captures the fatal PID's `omp.<date>.<pid>.log`. Files
  * are ordered oldest-first by mtime and separated by a filename header.
+ * `sessionLines` holds every record of those files whose `sessionId` is in
+ * `sessionIds`, in the same file order, capped at the last {@link MAX_LOG_LINES}.
  */
-async function collectSameDayLogs(linesPerFile: number): Promise<string> {
+async function collectSameDayLogs(
+	linesPerFile: number,
+	sessionIds: ReadonlySet<string>,
+): Promise<{ tails: string; sessionLines: string }> {
+	logger.flush();
 	const logsDir = getLogsDir();
-	const today = new Date().toISOString().slice(0, 10);
+	// Log files are named with the local day (see localDay / RotatingFileSink),
+	// so match them with the local day too — the UTC key misses the live log
+	// between local midnight and UTC midnight.
+	const today = localDay(new Date());
 	const sameDay: Array<{ name: string; mtimeMs: number }> = [];
 	try {
 		const entries = await fs.readdir(logsDir, { withFileTypes: true });
@@ -265,16 +268,46 @@ async function collectSameDayLogs(linesPerFile: number): Promise<string> {
 			}
 		}
 	} catch {
-		return "";
+		return { tails: "", sessionLines: "" };
 	}
 	sameDay.sort((a, b) => a.mtimeMs - b.mtimeMs);
 
 	const chunks: string[] = [];
+	const sessionLines: string[] = [];
 	for (const { name } of sameDay) {
-		const text = await readLastLines(path.join(logsDir, name), linesPerFile);
+		const filePath = path.join(logsDir, name);
+		if (sessionIds.size === 0) {
+			const text = await readLastLines(filePath, linesPerFile);
+			if (text) chunks.push(`===== ${name} =====\n${text}`);
+			continue;
+		}
+		// One read serves both files, so the tail and the session lines agree;
+		// the tail keeps the same byte cap as a tail read.
+		let bytes: Uint8Array;
+		try {
+			bytes = await Bun.file(filePath).bytes();
+		} catch (err) {
+			if (isEnoent(err)) continue; // Rotated away since the listing.
+			throw err;
+		}
+		const tailStart = Math.max(0, bytes.length - MAX_LOG_BYTES);
+		const decoder = new TextDecoder();
+		const text = lastLines(decoder.decode(bytes.subarray(tailStart)), tailStart > 0, linesPerFile);
 		if (text) chunks.push(`===== ${name} =====\n${text}`);
+		const lines = decoder.decode(bytes).split("\n");
+		for (const line of lines) {
+			if (!line.includes('"sessionId":')) continue;
+			try {
+				const { sessionId } = JSON.parse(line) as { sessionId?: unknown };
+				if (typeof sessionId === "string" && sessionIds.has(sessionId)) sessionLines.push(line);
+			} catch {
+				// A torn last line of a live file.
+			}
+		}
+		// Keep only what can reach the archive, file by file.
+		if (sessionLines.length > MAX_LOG_LINES) sessionLines.splice(0, sessionLines.length - MAX_LOG_LINES);
 	}
-	return chunks.join("\n\n");
+	return { tails: chunks.join("\n\n"), sessionLines: sessionLines.join("\n") };
 }
 
 const LOG_FILE_PATTERN = new RegExp(`^${APP_NAME}\\.(\\d{4}-\\d{2}-\\d{2})\\.\\d+\\.log(?:\\.\\d+)?$`);
@@ -303,6 +336,7 @@ export async function createDebugLogSource(): Promise<DebugLogSource> {
 	let cursor = 0;
 
 	const getInitialText = async (): Promise<string> => {
+		logger.flush();
 		return readLastLines(todayPath, MAX_LOG_LINES);
 	};
 
