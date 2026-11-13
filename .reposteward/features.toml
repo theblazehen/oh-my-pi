@@ -1,0 +1,156 @@
+# RepoSteward fork feature inventory: one [[feature]] per feature of this fork.
+# Only id (unique) and decision = "keep" | "drop" are read strictly; everything else is free text.
+# A dropped feature is not carried through upstream merges. Edit freely: RepoSteward keeps entries as
+# written and appends the features it finds.
+schema = 1
+
+[[feature]]
+id = "fullscreen-chat-viewport-pinned-chrome"
+title = "Fullscreen chat viewport: pinned chrome, follow, scroll, bounded rows"
+behavior = "Fullscreen chat viewport: pinned chrome, follow, scroll, bounded rows: `FullscreenChatLayout` (packages/coding-agent/src/modes/components/fullscreen-chat-layout.ts) is a fullscreen chat viewport: it renders exactly `getTerminalRows()` physical lines, pins `beforeEditor` rows + the editor host at the bottom, and scrolls only the transcript. Follow-bottom is on by default; scrolling up detaches follow so appended content does not move the window, and Ctrl+End (`\\x1b[8^`) re-arms follow. Retained transcript rows are bounded by `maxTranscriptRows` (head dropped) while a scrolled view keeps its absolute position. `FullscreenTranscriptAggregate` re-concatenates its children on every render so rows appended to a persistent child array reference are visible."
+why = {text = "inferred from the fork's commits: snapshot", source = "inferred"}
+decision = "keep"
+evidence = {commits = ["173d7abe54d80565dc96c4c6c47ff740018cd46b"], patch_ids = ["da2799f076b21ee8cfc1f1f52cf369796eb6a3b1"], paths = ["packages/coding-agent/src/modes/components/fullscreen-chat-layout.ts"]}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L1)"
+
+[[feature]]
+id = "per-overlay-sgr-mouse-tracking-modes"
+title = "Per-overlay SGR mouse tracking modes (drag vs motion) and teardown"
+behavior = "Per-overlay SGR mouse tracking modes (drag vs motion) and teardown: Mouse reporting is scoped to the topmost fullscreen overlay and tracks an exact mode: `mouseTracking: \"drag\"` enables ESC[?1002h + ESC[?1006h (press/drag/release, native selection off), `\"motion\"` enables ESC[?1003h + ESC[?1006h, `true` = the legacy motion default, `false` disables reporting. Changing the topmost overlay rewrites the exact modes without re-entering the alternate screen, and teardown (overlay hide, `stop()`, `emergencyTerminalRestore`) writes ESC[?1006l ESC[?1003l ESC[?1002l (no longer ESC[?1000l) before leaving the alternate screen."
+why = {text = "inferred from the fork's commits: snapshot", source = "inferred"}
+decision = "keep"
+evidence = {commits = ["173d7abe54d80565dc96c4c6c47ff740018cd46b"], patch_ids = ["da2799f076b21ee8cfc1f1f52cf369796eb6a3b1"], paths = ["packages/tui/src/terminal.ts", "packages/tui/src/tui.ts"]}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L6)"
+
+[[feature]]
+id = "sgr-mouse-decoding-button-identity-and"
+title = "SGR mouse decoding: button identity and modifier state"
+behavior = "SGR mouse decoding: button identity and modifier state: Decoded SGR mouse events carry physical button identity and modifier state: `SgrMouseEvent.buttonId` is 0/1/2 (or null for wheel and no-button motion), `shift`/`alt`/`ctrl` decode from bits 4/8/16 independently of button and motion bits, and `leftClick` is true only for a non-release, non-motion, non-wheel report with buttonId 0 — so a left press keeps buttonId 0 while the drag and release reports are not clicks."
+why = {text = "inferred from the fork's commits: snapshot", source = "inferred"}
+decision = "keep"
+evidence = {commits = ["173d7abe54d80565dc96c4c6c47ff740018cd46b"], patch_ids = ["da2799f076b21ee8cfc1f1f52cf369796eb6a3b1"], paths = ["packages/tui/src/mouse.ts"]}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L7)"
+
+[[feature]]
+id = "fullscreen-chat-input-scroll-keys-wheel"
+title = "Fullscreen chat input: scroll keys, wheel rows, drag-copy, mouse routing, focus forwarding"
+behavior = "Fullscreen chat input: scroll keys, wheel rows, drag-copy, mouse routing, focus forwarding: `FullscreenChatLayout.handleInput` consumes only dedicated scroll input (shift+PageUp/PageDown, wheel, Ctrl+End), scrolling the transcript by `wheelScrollRows` rows per wheel event (default 2), and delegates every other key to the editor. Application-owned drag selection highlights rows during the drag and copies ANSI-stripped transcript text once on release via `copyText`; a click copies nothing and pinned chrome rows never begin a selection. Presses on pinned `beforeEditor` rows are routed to the `MouseRoutable` component whose rendered rows contain the point (component-local coordinates). `focused` / `setUseTerminalCursor` are forwarded to the active editor, and `setEditor` transfers both to the replacement."
+why = {text = "the owner no longer uses the fullscreen/HUD work, the task-fork context, the 29-minute poll wait or the configurable compaction timeout", source = "owner"}
+decision = "drop"
+evidence = {commits = ["173d7abe54d80565dc96c4c6c47ff740018cd46b"], patch_ids = ["da2799f076b21ee8cfc1f1f52cf369796eb6a3b1"], paths = ["packages/coding-agent/src/modes/components/fullscreen-chat-layout.ts"]}
+decided = {by = "theblazehen", on = "2026-11-13"}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L2)"
+
+[[feature]]
+id = "subagent-hud-clickable-roster-with-row"
+title = "Subagent HUD clickable roster with row-accurate hit targets"
+behavior = "Subagent HUD clickable roster with row-accurate hit targets: `SubagentHudComponent` (packages/coding-agent/src/modes/components/subagent-hud.ts) renders the anchored subagent roster of detached, active subagent sessions (max 8 rows plus an overflow line) and maps physical render rows to click targets: line 1 (header, which carries the \"←←\" return hint) and the overflow line call `onManager`, row 2..N call `onAgent(id)` with the matching session id. Release, drag-motion, non-left-button and out-of-range rows are ignored. With no running detached subagents the HUD renders no lines."
+why = {text = "the owner no longer uses the fullscreen/HUD work, the task-fork context, the 29-minute poll wait or the configurable compaction timeout", source = "owner"}
+decision = "drop"
+evidence = {commits = ["173d7abe54d80565dc96c4c6c47ff740018cd46b"], patch_ids = ["da2799f076b21ee8cfc1f1f52cf369796eb6a3b1"], paths = ["packages/coding-agent/src/modes/components/subagent-hud.ts"]}
+decided = {by = "theblazehen", on = "2026-11-13"}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L3)"
+
+[[feature]]
+id = "extension-widget-hud-placement-2"
+title = "Extension widget \\\"hud\\\" placement (+1)"
+behavior = "Extension widget \\\"hud\\\" placement: Extensions can place widgets in a new \"hud\" region: `WidgetPlacement` becomes `\"hud\" | \"aboveEditor\" | \"belowEditor\"`, `ExtensionUiController.setHookWidget` routes `placement: \"hud\"` into `hookWidgetContainerHud` (rendered with a trailing spacer), the RPC `setWidget` request accepts `widgetPlacement: \"hud\"`, moving a key to another placement removes its hud copy, and `clearHookWidgets` clears everything including hud.; Fullscreen screen-mode settings (screenMode, maxTranscriptRows, wheelScrollRows): Three `tui.*` settings exist in the settings schema: `tui.screenMode` (enum `retained` | `fullscreen`, default `retained`), `tui.maxTranscriptRows` (number, default 10000), `tui.wheelScrollRows` (number, default 2), all under UI tab `appearance`, group `Display`, with labels \"Screen Mode\", \"Fullscreen Transcript Rows\", \"Fullscreen Wheel Speed\". With `tui.screenMode: fullscreen`, interactive mode mounts the chat transcript + HUD containers inside a fullscreen overlay backed by `FullscreenChatLayout` (mouseTracking \"drag\"), passing `tui.maxTranscriptRows`/`tui.wheelScrollRows` into the layout; the default retained mode keeps the normal inline UI."
+why = {text = "the owner no longer uses the fullscreen/HUD work, the task-fork context, the 29-minute poll wait or the configurable compaction timeout", source = "owner"}
+decision = "drop"
+evidence = {commits = ["173d7abe54d80565dc96c4c6c47ff740018cd46b"], patch_ids = ["da2799f076b21ee8cfc1f1f52cf369796eb6a3b1"], paths = ["packages/coding-agent/src/config/settings-schema.ts", "packages/coding-agent/src/extensibility/extensions/types.ts", "packages/coding-agent/src/modes/controllers/extension-ui-controller.ts", "packages/coding-agent/src/modes/interactive-mode.ts", "packages/coding-agent/src/modes/rpc/rpc-types.ts"]}
+decided = {by = "theblazehen", on = "2026-11-13"}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L4, L5)"
+
+[[feature]]
+id = "fullscreen-overlay-keeps-the-focused"
+title = "Fullscreen overlay keeps the focused component's hardware cursor (+1)"
+behavior = "Fullscreen overlay keeps the focused component's hardware cursor: A focused fullscreen overlay component that renders the cursor marker gets a visible hardware cursor at the marker's cell: after the frame settles the terminal cursor position equals the marker's row/column (e.g. row 7, col 10 in a 40x8 virtual terminal). Previously the alternate-screen path discarded focused cursor markers, leaving editors with no visible cursor.; Fullscreen image budget, byte-exact image rows, and settle repaint: Fullscreen paint fidelity in packages/tui: terminal image rows are indivisible protocol payloads, so both the fullscreen overlay compositor (`TUI`) and `ScrollView` pass them through byte-exact instead of splicing resets/padding/scrollbar suffixes; fullscreen component rendering is bracketed by `imageBudget.beginPass()`/`endPass()`; and a render requested during the post-full-paint settle timer is repainted when the settle elapses even if no further input arrives."
+why = {text = "the owner no longer uses the fullscreen/HUD work, the task-fork context, the 29-minute poll wait or the configurable compaction timeout", source = "owner"}
+decision = "drop"
+evidence = {commits = ["173d7abe54d80565dc96c4c6c47ff740018cd46b"], patch_ids = ["da2799f076b21ee8cfc1f1f52cf369796eb6a3b1"], paths = ["packages/tui/CHANGELOG.md", "packages/tui/src/components/scroll-view.ts", "packages/tui/src/tui.ts"]}
+decided = {by = "theblazehen", on = "2026-11-13"}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L8, L9)"
+
+[[feature]]
+id = "task-tool-source-parameter-schema"
+title = "Task tool `source` parameter: schema, validation, batch inheritance (+2)"
+behavior = "Task tool `source` parameter: schema, validation, batch inheritance: The `task` tool takes an optional `source` parameter (\"fresh\" | \"fork\") in the flat form, the batch form's top level, and each batch item. Values outside that set are rejected with `<label> has an invalid \\`source\\` value \"<v>\". Use \"fresh\" or \"fork\".` where label is `The call` or `Task N (\\`name\\`)`. In a batch, a top-level `source` is inherited by items that do not set their own; an item's own `source` wins. Absent means fresh.; Fork context is captured and frozen at task scheduling time: When a task spawn is scheduled, `captureForkContext` (packages/coding-agent/src/task/index.ts) locates the last completed assistant message in the parent branch, re-requests the branch ending at that leaf, and hands the executor a deep-cloned `ForkContextSnapshot { sourceFile, sourceLeafId, entries }`. The snapshot therefore ends at the last completed assistant turn: it excludes the in-flight task tool call and anything the live parent appends later (later messages, leaf resets, compactions). With no assistant in the branch it falls back to the branch tail id.; Async batch aggregate keeps completed results in input order: In `T"
+why = {text = "inferred from the fork's commits: feat(coding-agent): add forked task context; feat(coding-agent): harden fork context and subprocess runtime", source = "inferred"}
+decision = "keep"
+evidence = {commits = ["242bbbf5c9cc4db9092a9e463c189a21a03eece7", "b6d99817da1b36544091a491bcc1392ec96410e3"], patch_ids = ["180c32f33420ea1713ea4020a462b0b0a90f83ab", "eda9ffeed921fae1a1f55ed6cdc6c2a86ba78d1e"], paths = ["packages/coding-agent/src/prompts/tools/task.md", "packages/coding-agent/src/task/executor.ts", "packages/coding-agent/src/task/index.ts", "packages/coding-agent/src/task/structured-subagent.ts"]}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L10, L11, L21)"
+
+[[feature]]
+id = "sessionmanager-branch-scoped-fork"
+title = "SessionManager branch-scoped fork (forkFrom sourceLeafId + forkBranch)"
+behavior = "SessionManager branch-scoped fork (forkFrom sourceLeafId + forkBranch): `SessionManager.forkFrom` (packages/coding-agent/src/session/session-manager.ts) accepts `sourceLeafId` in its options: when present it walks parents from that leaf and clones only that branch (rejecting an explicit `undefined` with \"Fork source leaf is unavailable\", a missing entry, and a parent cycle), when `null` it produces a header-only session with no history, and the clone keeps `parentSession` plus the source `providerPromptCacheKey` under a new session id while leaving the source file untouched. `SessionManager#forkBranch(options)` flushes the current transcript (or drains storage) and delegates to `forkFrom` with the same storage, throwing \"Cannot fork a session without a persisted transcript\" when there is no file."
+why = {text = "inferred from the fork's commits: feat(coding-agent): add forked task context", source = "inferred"}
+decision = "keep"
+evidence = {commits = ["b6d99817da1b36544091a491bcc1392ec96410e3"], patch_ids = ["180c32f33420ea1713ea4020a462b0b0a90f83ab"], paths = ["packages/coding-agent/src/session/session-manager.ts"]}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L14)"
+
+[[feature]]
+id = "cold-revive-of-a-persisted-subagent"
+title = "Cold revive of a persisted subagent keeps provider prompt-cache lineage"
+behavior = "Cold revive of a persisted subagent keeps provider prompt-cache lineage: `createPersistedSubagentReviverFactory` (packages/coding-agent/src/task/persisted-revive.ts) reads `providerPromptCacheKey` from the reopened session header and passes it to `createAgentSession` as `providerPromptCacheKey` with `providerPromptCacheKeySource: \"fork\"`, preserving provider cache lineage across a cold revive; both are omitted when the header has no key."
+why = {text = "inferred from the fork's commits: feat(coding-agent): add forked task context", source = "inferred"}
+decision = "keep"
+evidence = {commits = ["b6d99817da1b36544091a491bcc1392ec96410e3"], patch_ids = ["180c32f33420ea1713ea4020a462b0b0a90f83ab"], paths = ["packages/coding-agent/src/task/persisted-revive.ts"]}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L15)"
+
+[[feature]]
+id = "worker-subprocess-niceness-policy-omp"
+title = "Worker subprocess niceness policy (OMP_SUBPROCESS_NICE)"
+behavior = "Worker subprocess niceness policy (OMP_SUBPROCESS_NICE): `applySubprocessNiceness(selector, isMainThread, configuredValue)` (packages/coding-agent/src/cli/process-niceness.ts, called from `runCli` before a worker-host entrypoint) lowers real OMP worker subprocesses to `DEFAULT_SUBPROCESS_NICE = 19`; the interactive CLI and Bun worker threads are untouched, `OMP_SUBPROCESS_NICE=inherit` opts out, a valid integer in [-20, 19] overrides, invalid values warn `Invalid OMP_SUBPROCESS_NICE=…; expected \"inherit\" or an integer from -20 to 19. Subprocess priority was not changed.` without changing priority, and a failing setter only warns."
+why = {text = "inferred from the fork's commits: feat(coding-agent): harden fork context and subprocess runtime", source = "inferred"}
+decision = "keep"
+evidence = {commits = ["242bbbf5c9cc4db9092a9e463c189a21a03eece7"], patch_ids = ["eda9ffeed921fae1a1f55ed6cdc6c2a86ba78d1e"], paths = ["packages/coding-agent/src/cli.ts", "packages/coding-agent/src/cli/process-niceness.ts"]}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L16)"
+
+[[feature]]
+id = "headless-browser-gpu-launch-policy-on"
+title = "Headless browser GPU launch policy on Linux"
+behavior = "Headless browser GPU launch policy on Linux: `buildHeadlessLaunchArgs(viewport, additionalArgs = [])` (packages/coding-agent/src/tools/browser/launch.ts) adds `--use-angle=vulkan` and `--enable-features=Vulkan` only on Linux when `/dev/dri` contains an accessible `renderD<N>` node; with no accessible render node (or on darwin/win32) the GPU args are absent and `--disable-software-rasterizer` is never added. Caller-supplied args are appended after the policy defaults, deduplicated, and `launchHeadlessBrowser` passes `opts.args` through this path."
+why = {text = "inferred from the fork's commits: feat(coding-agent): harden fork context and subprocess runtime", source = "inferred"}
+decision = "keep"
+evidence = {commits = ["242bbbf5c9cc4db9092a9e463c189a21a03eece7"], patch_ids = ["eda9ffeed921fae1a1f55ed6cdc6c2a86ba78d1e"], paths = ["packages/coding-agent/src/tools/browser/launch.ts"]}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L17)"
+
+[[feature]]
+id = "fork-seeding-scrubs-parent-control-state"
+title = "Fork seeding scrubs parent control state and provider replay (+1)"
+behavior = "Fork seeding scrubs parent control state and provider replay: `scrubTaskForkEntries` + `seedForkContext` in packages/coding-agent/src/task/executor.ts turn the frozen parent snapshot into the child's native history: only conversation-bearing entries survive (messages, custom_message, branch_summary), every parent `compaction` entry is dropped, `todo`/`checkpoint`/`rewind` tool calls and their results are removed, eager task/todo preludes and runtime/config entry types vanish, every inherited assistant turn is provider-neutralized (redactedThinking dropped, thinking signature cleared, providerPayload removed, empty turns dropped), and dangling tool calls/orphan results are removed with `parentId`s relinked. Entries are deep-independent clones ingested as replicated entries; after a fork run the child session calls `clearCheckpointRuntimeState()` and `setTodoPhases([])` so no parent bookkeeping is inherited.; Fork vs fresh execution paths and explicit fork failure modes: In `runSubprocess` (packages/coding-agent/src/task/executor.ts) the requested context source defaults to \"fresh\". A fresh run keeps the previous child session path (open the child transcript or an in-memory manager) "
+why = {text = "the owner no longer uses the fullscreen/HUD work, the task-fork context, the 29-minute poll wait or the configurable compaction timeout", source = "owner"}
+decision = "drop"
+evidence = {commits = ["242bbbf5c9cc4db9092a9e463c189a21a03eece7", "b6d99817da1b36544091a491bcc1392ec96410e3"], patch_ids = ["180c32f33420ea1713ea4020a462b0b0a90f83ab", "eda9ffeed921fae1a1f55ed6cdc6c2a86ba78d1e"], paths = ["packages/coding-agent/src/session/agent-session.ts", "packages/coding-agent/src/task/executor.ts"]}
+decided = {by = "theblazehen", on = "2026-11-13"}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L12, L13)"
+
+[[feature]]
+id = "fixed-29-minute-async-poll-wait-option"
+title = "Fixed 29-minute async poll wait option"
+behavior = "Fixed 29-minute async poll wait option: `async.pollWaitDuration` gains a \"29m\" option (1_740_000 ms) in the settings schema/picker (default stays \"smart\"), wired through `WAIT_DURATION_MS` in packages/coding-agent/src/tools/hub/jobs.ts so `resolvePollWindow` returns a fixed `{ waitMs: 1_740_000, smart: false }` window instead of consulting the adaptive smart-poll schedule."
+why = {text = "the owner no longer uses the fullscreen/HUD work, the task-fork context, the 29-minute poll wait or the configurable compaction timeout", source = "owner"}
+decision = "drop"
+evidence = {commits = ["242bbbf5c9cc4db9092a9e463c189a21a03eece7"], patch_ids = ["eda9ffeed921fae1a1f55ed6cdc6c2a86ba78d1e"], paths = ["packages/coding-agent/src/config/settings-schema.ts", "packages/coding-agent/src/tools/hub/jobs.ts"]}
+decided = {by = "theblazehen", on = "2026-11-13"}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L18)"
+
+[[feature]]
+id = "configurable-provider-native-compaction"
+title = "Configurable provider-native compaction timeout"
+behavior = "Configurable provider-native compaction timeout: Provider-native compaction timeout is configurable: `compaction.remoteTimeoutSeconds` (packages/coding-agent/src/config/settings-schema.ts) is a number defaulting to 600 (ten minutes, UI options 180/300/600/900/1800) and flows into `CompactionSettings.remoteTimeoutSeconds`; `compact()` converts it to `timeoutMs` for both the V2 streaming request and the V1 native remote compaction request. Direct helper callers that pass no timeout keep the previous 180-second default (`V2_COMPACTION_TIMEOUT_MS` / `REMOTE_COMPACTION_TIMEOUT_MS`)."
+why = {text = "the owner no longer uses the fullscreen/HUD work, the task-fork context, the 29-minute poll wait or the configurable compaction timeout", source = "owner"}
+decision = "drop"
+evidence = {commits = ["51a65f6e780b10549d965a8a866b1265ee42593c"], patch_ids = ["637d9e9a496dbdc76beef36bfc1828940980b74e"], paths = ["packages/agent/src/compaction/compaction.ts", "packages/coding-agent/src/config/settings-schema.ts"]}
+decided = {by = "theblazehen", on = "2026-11-13"}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L19)"
+
+[[feature]]
+id = "remappable-app-prewalk-exit-shortcut-alt"
+title = "Remappable app.prewalk.exit shortcut (Alt+W)"
+behavior = "Remappable app.prewalk.exit shortcut (Alt+W): The editor exposes a remappable `app.prewalk.exit` action bound to `alt+w`: it is declared in KEYBINDINGS (config/keybindings.ts) with description \"Exit prewalk and return to the default model\", included in CustomEditor's ConfigurableEditorAction defaults, dispatched through `CustomEditor.onExitPrewalk` (consumed before the display-reset shortcut, and only when a handler is installed), and documented in the generated hotkeys markdown and docs/keybindings.md."
+why = {text = "inferred from the fork's commits: feat(coding-agent): preserve personal workflow tweaks", source = "inferred"}
+decision = "keep"
+evidence = {commits = ["b772c0471ee3928d74855463de55a7604e9559c6"], patch_ids = ["f0fab8fdae48e35bfb65d3e4048378ab98556a37"], paths = ["docs/keybindings.md", "packages/coding-agent/src/config/keybindings.ts", "packages/coding-agent/src/modes/components/custom-editor.ts", "packages/coding-agent/src/modes/utils/hotkeys-markdown.ts"]}
+notes = "found by RepoSteward run repo-20261111T015133Z-2ad7 (its obligations L20)"
