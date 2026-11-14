@@ -1,0 +1,25 @@
+#!/bin/sh
+# Cargo's rustc (see `[build] rustc` in .cargo/config.toml).
+#
+# rust-toolchain.toml is the canonical pin, and rustup applies it — but only when
+# rustup resolves the toolchain from a directory that sees the pin. Cargo invokes
+# this wrapper with the working directory set to the crate being built, so
+# rustup's own shim would resolve the toolchain from that crate directory and miss
+# the workspace pin, falling back to the default/active toolchain (e.g. a stable
+# one), which then rejects the workspace's `-Z` flags: "the option `Z` is only
+# accepted on the nightly compiler". Naming the channel explicitly with
+# `rustup run` makes the build use the pinned toolchain whatever the working
+# directory or RUSTUP_TOOLCHAIN is. Without rustup, the rustc on PATH is used as
+# before, so a host that installs Rust another way is unaffected.
+channel=nightly-2026-11-08
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." 2>/dev/null && pwd)
+if [ -n "$root" ] && [ -r "$root/rust-toolchain.toml" ]; then
+	pinned=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$root/rust-toolchain.toml" | head -n 1)
+	if [ -n "$pinned" ]; then
+		channel=$pinned
+	fi
+fi
+if rustup_bin=$(command -v rustup 2>/dev/null); then
+	exec "$rustup_bin" run "$channel" rustc "$@"
+fi
+exec rustc "$@"
