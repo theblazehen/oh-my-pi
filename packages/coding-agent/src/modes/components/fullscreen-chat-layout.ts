@@ -30,7 +30,10 @@ export interface FullscreenChatLayoutOptions {
 	requestRender?: () => void;
 	/** Number of transcript rows moved by one wheel report. */
 	wheelScrollRows?: number;
-	/** Maximum number of rendered transcript physical rows retained by the viewport. */
+	/**
+	 * Maximum number of rendered transcript physical rows retained by the viewport.
+	 * A configured value that is not finite or is below 1 is clamped to 1.
+	 */
 	maxTranscriptRows?: number;
 	/** Receives plain text when an application-owned drag selection is released. */
 	copyText?: (text: string) => void;
@@ -111,10 +114,12 @@ export class FullscreenChatLayout implements Component, Focusable, OverlayFocusO
 			options.wheelScrollRows !== undefined && Number.isFinite(options.wheelScrollRows)
 				? Math.max(1, Math.trunc(options.wheelScrollRows))
 				: 2;
+		// A configured limit that is not finite or is below 1 clamps to 1: an
+		// unusable value must not silently widen retention to the default.
 		this.#maxTranscriptRows =
-			options.maxTranscriptRows !== undefined && Number.isFinite(options.maxTranscriptRows)
-				? Math.max(1, Math.trunc(options.maxTranscriptRows))
-				: 10_000;
+			options.maxTranscriptRows === undefined
+				? 10_000
+				: Math.max(1, Math.trunc(Number.isFinite(options.maxTranscriptRows) ? options.maxTranscriptRows : 1));
 		this.#copyText = options.copyText ?? (() => {});
 	}
 
