@@ -1020,6 +1020,29 @@ export const cfgAsyncWidgets = register({
 	},
 });
 
+export const cfgAsyncPollWaitDuration = register({
+	id: "async.pollWaitDuration",
+	type: "enum",
+	values: ["5s", "10s", "30s", "1m", "5m", "29m", "smart"] as const,
+	default: "smart",
+	ui: {
+		tab: "tools",
+		group: "Execution",
+		label: "Max Poll Time",
+		description:
+			"How long a `wait` call watches background jobs before returning the current state. A fixed value waits that exact duration every time. `smart` adapts: it starts at 5s and lengthens with each back-to-back wait (up to 5m), then resets to 5s after about a minute without waiting.",
+		options: [
+			{ value: "5s", label: "5 seconds" },
+			{ value: "10s", label: "10 seconds" },
+			{ value: "30s", label: "30 seconds" },
+			{ value: "1m", label: "1 minute" },
+			{ value: "5m", label: "5 minutes" },
+			{ value: "29m", label: "29 minutes" },
+			{ value: "smart", label: "Smart", description: "Default — adaptive 5s→5m, resets when you stop polling" },
+		],
+	},
+});
+
 export const cfgToolsXdev = register({
 	id: "tools.xdev",
 	type: "boolean",
