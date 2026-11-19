@@ -2642,6 +2642,10 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.pendingShellContainer,
 				this.pendingMessagesContainer,
 				this.todoContainer,
+				// Extension widgets placed in the live HUD ride with the pinned HUD rows
+				// above the editor (the fullscreen layout's `beforeEditor` list), so in
+				// retained mode they mount here in the transcript region.
+				this.hookWidgetContainerHud,
 				this.subagentContainer,
 				this.btwContainer,
 				this.reportContainer,
