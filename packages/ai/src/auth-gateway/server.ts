@@ -11,6 +11,7 @@
  * Endpoints:
  *   GET  /healthz                          → unauth; ok + version
  *   GET  /v1/usage                         → aggregated provider usage (5-min per-credential cache via AuthStorage)
+ *   GET  /v1/usage/history                 → recorded usage-limit snapshots (broker history; sinceMs/provider filters)
  *   GET  /v1/credentials/check             → per-credential auth probe (diagnose 401s in a multi-account pool)
  *   GET  /v1/models                        → list known models from the registry
  *   POST /v1/chat/completions              → OpenAI chat-completions in/out
@@ -721,6 +722,24 @@ async function handleUsage(opts: AuthGatewayRouteOptions, signal: AbortSignal): 
 }
 
 /**
+ * `GET /v1/usage/history` — recorded usage-limit snapshots, oldest first, with
+ * the broker's `sinceMs`/`provider` filters. Pacing widgets read it to see how
+ * much of each window was used since a point in time.
+ */
+async function handleUsageHistory(opts: AuthGatewayRouteOptions, url: URL, signal: AbortSignal): Promise<Response> {
+	const sinceMs = Number.parseInt(url.searchParams.get("sinceMs") ?? "", 10);
+	const query = {
+		sinceMs: Number.isFinite(sinceMs) ? sinceMs : undefined,
+		provider: url.searchParams.get("provider") || undefined,
+	};
+	const entries = opts.usageHistory ? await opts.usageHistory(query, signal) : opts.storage.usage.history(query);
+	return json(200, {
+		generatedAt: Date.now(),
+		entries: entries.filter(entry => !opts.excludeProviders?.has(entry.provider)),
+	});
+}
+
+/**
  * Per-credential health probe surfaced on `GET /v1/credentials/check`. Tells
  * the caller exactly which row in their broker is producing 401s — the
  * aggregate `/v1/usage` endpoint silently drops failed credentials, which is
@@ -790,6 +809,7 @@ const VIDEO_JOB_PATH = /^\/v1\/videos\/([^/]+)(\/content)?$/;
 // Dynamic video IDs and unknown paths may carry credentials.
 const LOGGABLE_PATHS: Record<string, true> = {
 	"/v1/usage": true,
+	"/v1/usage/history": true,
 	"/v1/credentials/check": true,
 	"/v1/pi/stream": true,
 	"/v1/systemone": true,
@@ -859,6 +879,9 @@ export function createAuthGatewayRouter(opts: AuthGatewayRouteOptions): AuthGate
 			// same client struct.
 			if (req.method === "GET" && pathname === "/v1/usage") {
 				return await handleUsage(opts, req.signal);
+			}
+			if (req.method === "GET" && pathname === "/v1/usage/history") {
+				return await handleUsageHistory(opts, new URL(req.url), req.signal);
 			}
 
 			// Per-credential auth probe — diagnoses which row in a multi-account

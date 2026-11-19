@@ -374,6 +374,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		resolveModel: (id: string) => resolveGatewayModel(id, modelById, routable),
 		listModels: () => modelById.values(),
 		excludeProviders: new Set(cfgDisabledProviders.get(settings)),
+		usageHistory: async (query, signal) => (await client.fetchUsageHistory(query, signal)).entries,
 	});
 	process.stdout.write(`auth-gateway listening on ${handle.url}\n`);
 	if (gatewayToken) {

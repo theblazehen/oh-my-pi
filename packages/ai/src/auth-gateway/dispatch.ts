@@ -14,7 +14,7 @@ import * as AIError from "../error";
 import { classifyGatewayError, type GatewayErrorClassification } from "../error/gateway";
 import { isUsageLimitOutcome } from "../error/rate-limit";
 import type { Api, FetchImpl, Model, Usage } from "../types";
-import type { ClientUsageIdentity } from "../usage";
+import type { ClientUsageIdentity, UsageHistoryEntry, UsageHistoryQuery } from "../usage";
 import { extractProviderRetryHint } from "../utils/retry-after";
 import type { AuthGatewayServerOptions } from "./types";
 
@@ -34,6 +34,12 @@ export interface AuthGatewayRouteOptions {
 	listModels?: () => Iterable<Model<Api>>;
 	/** Providers the host does not serve; `/v1/usage` and `/v1/credentials/check` leave their accounts out. */
 	excludeProviders?: ReadonlySet<string>;
+	/**
+	 * Recorded usage-limit snapshots for `/v1/usage/history`. A broker-backed
+	 * store keeps no durable history of its own, so `serve` reads the broker's;
+	 * without this the route serves the store's local history.
+	 */
+	usageHistory?: (query: UsageHistoryQuery, signal: AbortSignal) => Promise<UsageHistoryEntry[]>;
 	/** Upstream transport for every provider call; defaults to global `fetch`. Test seam. */
 	fetch?: FetchImpl;
 }
