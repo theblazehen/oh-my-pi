@@ -448,8 +448,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 	});
 
 	it("caps caller-requested effort at task.maxEffort", async () => {
-		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
-		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
+		const model = getBundledModel("openai-codex", "gpt-5.6-luna");
+		if (!model) throw new Error("Expected gpt-5.6-luna model to exist");
 		const settings = Settings.isolated({ "task.maxEffort": "low" });
 		settings.setModelRole("task", `${model.provider}/${model.id}`);
 		const session = yieldEmittingSession();
@@ -472,8 +472,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 	});
 
 	it("rejects a spawn when task.maxEffort is below the model floor", async () => {
-		const baseModel = getBundledModel("openai-codex", "gpt-5.6-sol");
-		if (!baseModel) throw new Error("Expected gpt-5.6-sol model to exist");
+		const baseModel = getBundledModel("openai-codex", "gpt-5.6-luna");
+		if (!baseModel) throw new Error("Expected gpt-5.6-luna model to exist");
 		const model = {
 			...baseModel,
 			id: "mock-high-only",
@@ -501,8 +501,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 	});
 
 	it("preserves the model's full effort range by default", async () => {
-		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
-		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
+		const model = getBundledModel("openai-codex", "gpt-5.6-luna");
+		if (!model) throw new Error("Expected gpt-5.6-luna model to exist");
 		const settings = Settings.isolated();
 		settings.setModelRole("task", `${model.provider}/${model.id}`);
 		const session = yieldEmittingSession();
@@ -855,8 +855,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 	});
 
 	it("seeds from frozen entries directly, dropping the parent compaction and keeping ordered raw text", async () => {
-		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
-		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
+		const model = getBundledModel("openai-codex", "gpt-5.6-luna");
+		if (!model) throw new Error("Expected gpt-5.6-luna model to exist");
 		const textOnlyModel = { ...model, input: ["text"] } as Model;
 		const settings = Settings.isolated();
 		settings.setModelRole("task", `${textOnlyModel.provider}/${textOnlyModel.id}`);
@@ -985,8 +985,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 	});
 
 	it("drops every parent compaction — Snapcompact, remote, and LLM — keeping full ordered raw text", async () => {
-		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
-		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
+		const model = getBundledModel("openai-codex", "gpt-5.6-luna");
+		if (!model) throw new Error("Expected gpt-5.6-luna model to exist");
 		const textOnlyModel = { ...model, input: ["text"] } as Model;
 		const settings = Settings.isolated();
 		settings.setModelRole("task", `${textOnlyModel.provider}/${textOnlyModel.id}`);
@@ -1146,8 +1146,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 	});
 
 	it("provider-neutralizes every inherited assistant while dropping its compaction, keeping visible evidence", async () => {
-		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
-		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
+		const model = getBundledModel("openai-codex", "gpt-5.6-luna");
+		if (!model) throw new Error("Expected gpt-5.6-luna model to exist");
 		const textOnlyModel = { ...model, input: ["text"] } as Model;
 		const settings = Settings.isolated();
 		settings.setModelRole("task", `${textOnlyModel.provider}/${textOnlyModel.id}`);
@@ -1439,8 +1439,8 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 	});
 
 	it("forks native context for a text-only resolved model with raw child entries and built context", async () => {
-		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
-		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
+		const model = getBundledModel("openai-codex", "gpt-5.6-luna");
+		if (!model) throw new Error("Expected gpt-5.6-luna model to exist");
 		const textOnlyModel = { ...model, input: ["text"] } as Model;
 		const settings = Settings.isolated();
 		settings.setModelRole("task", `${textOnlyModel.provider}/${textOnlyModel.id}`);
@@ -1731,7 +1731,7 @@ describe("runSubprocess per-agent service-tier overrides", () => {
 	}
 
 	it("applies the dispatch-resolved override to the effective model selected by task policy", async () => {
-		const effectiveModel = getBundledModel("openai-codex", "gpt-5.6-sol");
+		const effectiveModel = getBundledModel("openai-codex", "gpt-5.6-luna");
 		const definitionModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!effectiveModel || !definitionModel) throw new Error("Expected bundled service-tier models to exist");
 		const session = yieldEmittingSession();
@@ -1752,8 +1752,8 @@ describe("runSubprocess per-agent service-tier overrides", () => {
 	});
 
 	it("keeps tier.subagent when dispatch resolved no override for the agent", async () => {
-		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
-		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
+		const model = getBundledModel("openai-codex", "gpt-5.6-luna");
+		if (!model) throw new Error("Expected gpt-5.6-luna model to exist");
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
 
@@ -1776,8 +1776,8 @@ describe("runSubprocess per-agent service-tier overrides", () => {
 	});
 
 	it("drops inherited live tiers a family can't realize instead of failing the spawn", async () => {
-		const model = getBundledModel("openai-codex", "gpt-5.6-sol");
-		if (!model) throw new Error("Expected gpt-5.6-sol model to exist");
+		const model = getBundledModel("openai-codex", "gpt-5.6-luna");
+		if (!model) throw new Error("Expected gpt-5.6-luna model to exist");
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
 
@@ -1822,7 +1822,7 @@ describe("runSubprocess per-agent service-tier overrides", () => {
 
 	it("resolves the override against the auth-fallback model rather than the requested one", async () => {
 		const requested = getBundledModel("anthropic", "claude-sonnet-4-5");
-		const parentModel = getBundledModel("openai-codex", "gpt-5.6-sol");
+		const parentModel = getBundledModel("openai-codex", "gpt-5.6-luna");
 		if (!requested || !parentModel) throw new Error("Expected bundled service-tier models to exist");
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
@@ -1848,7 +1848,7 @@ describe("runSubprocess per-agent service-tier overrides", () => {
 	});
 
 	it("scopes a concrete override to the model the session resolves instead of broadcasting it", async () => {
-		const openAIModel = getBundledModel("openai-codex", "gpt-5.6-sol");
+		const openAIModel = getBundledModel("openai-codex", "gpt-5.6-luna");
 		const anthropicModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!openAIModel || !anthropicModel) throw new Error("Expected bundled service-tier models to exist");
 		const session = yieldEmittingSession();

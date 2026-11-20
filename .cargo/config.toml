@@ -16,3 +16,10 @@ PCRE2_SYS_STATIC = "1"
 # boolean, while older nightlies took `"DoNotEmbed"`.
 [unstable]
 embed-metadata = false
+# Resolve the compiler through rustup (`.cargo/rustc`, `.cargo/rustdoc`) so the toolchain
+# rust-toolchain.toml pins is used even when a distribution/Nix rustc comes first on PATH: cargo
+# would otherwise take that one and reject the workspace's `rust-version`. Without rustup the
+# wrappers fall back to the tool of that name on PATH.
+[build]
+rustc = ".cargo/rustc"
+rustdoc = ".cargo/rustdoc"

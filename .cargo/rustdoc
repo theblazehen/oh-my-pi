@@ -1,0 +1,17 @@
+#!/bin/sh
+# Cargo's rustdoc (see `[build] rustdoc` in .cargo/config.toml): resolves through
+# rustup exactly as `.cargo/rustc` does, so `cargo doc` and doctests use the
+# toolchain rust-toolchain.toml pins rather than the default/active toolchain that
+# rustup's shim would pick from the crate directory Cargo invokes it in.
+channel=nightly-2026-11-08
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." 2>/dev/null && pwd)
+if [ -n "$root" ] && [ -r "$root/rust-toolchain.toml" ]; then
+	pinned=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$root/rust-toolchain.toml" | head -n 1)
+	if [ -n "$pinned" ]; then
+		channel=$pinned
+	fi
+fi
+if rustup_bin=$(command -v rustup 2>/dev/null); then
+	exec "$rustup_bin" run "$channel" rustdoc "$@"
+fi
+exec rustdoc "$@"
