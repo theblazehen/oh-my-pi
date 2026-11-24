@@ -35,7 +35,7 @@ export function json(status: number, body: unknown, headers?: Record<string, str
  */
 export function gatewayResponseHeaders(
 	model: Model<Api>,
-	info: { requestId: string; costUsd?: number; startedAt?: number },
+	info: { requestId: string; costUsd?: number; startedAt?: number; queueWaitMs?: number },
 ): Record<string, string> {
 	const headers: Record<string, string> = {
 		"x-request-id": info.requestId,
@@ -49,6 +49,8 @@ export function gatewayResponseHeaders(
 		headers["x-litellm-response-duration-ms"] = elapsed;
 		headers["openai-processing-ms"] = elapsed;
 	}
+	// Time spent waiting for a provider slot under `--concurrency`; included in the duration above.
+	if (info.queueWaitMs !== undefined) headers["x-queue-wait-ms"] = info.queueWaitMs.toString();
 	return headers;
 }
 

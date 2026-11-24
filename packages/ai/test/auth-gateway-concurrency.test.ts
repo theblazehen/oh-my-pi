@@ -26,14 +26,14 @@ describe("GatewayConcurrencyLimiter", () => {
 		const admitted: string[] = [];
 		const third = limiter.acquire(model, signal).then(r => (admitted.push("third"), r));
 		const fourth = limiter.acquire(model, signal).then(r => (admitted.push("fourth"), r));
-		expect(limiter.snapshot().get("ratecloud/flash")).toEqual({ active: 2, waiting: 2 });
+		expect(limiter.snapshot().get("ratecloud/flash")).toMatchObject({ limit: 2, active: 2, waiting: 2 });
 
 		if (typeof first !== "function" || typeof second !== "function") throw new Error("expected slots");
 		first();
 		first(); // a second release of the same slot must not free another
 		const thirdRelease = await third;
 		expect(admitted).toEqual(["third"]);
-		expect(limiter.snapshot().get("ratecloud/flash")).toEqual({ active: 2, waiting: 1 });
+		expect(limiter.snapshot().get("ratecloud/flash")).toMatchObject({ active: 2, waiting: 1 });
 
 		second();
 		const fourthRelease = await fourth;
@@ -55,14 +55,14 @@ describe("GatewayConcurrencyLimiter", () => {
 		if (typeof held !== "function") throw new Error("expected slot");
 		held();
 		expect(typeof (await next)).toBe("function");
-		expect(limiter.snapshot().get("ratecloud/flash")).toEqual({ active: 1, waiting: 0 });
+		expect(limiter.snapshot().get("ratecloud/flash")).toMatchObject({ active: 1, waiting: 0, oldestWaitMs: 0 });
 	});
 
 	it("sheds a waiter after the queue timeout without taking a slot", async () => {
 		const limiter = new GatewayConcurrencyLimiter(new Map([["ratecloud", 1]]), 20);
 		await limiter.acquire(model, new AbortController().signal);
 		expect(await limiter.acquire(model, new AbortController().signal)).toBe("queue_timeout");
-		expect(limiter.snapshot().get("ratecloud/flash")).toEqual({ active: 1, waiting: 0 });
+		expect(limiter.snapshot().get("ratecloud/flash")).toMatchObject({ active: 1, waiting: 0 });
 	});
 
 	it("keeps separate pools per model and leaves unlisted providers unlimited", async () => {
@@ -172,6 +172,48 @@ describe("auth-gateway concurrency admission", () => {
 			expect(shed.headers.get("rate_limit_type")).toBe("max_parallel_requests");
 			expect((await held).status).toBe(200);
 			expect(mock.calls).toHaveLength(1);
+		} finally {
+			await gw.close();
+		}
+	});
+
+	it("reports the queue on /v1/concurrency and the wait on x-queue-wait-ms", async () => {
+		const limiter = new GatewayConcurrencyLimiter(new Map([["openrouter", 1]]));
+		const started = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			provider: "openrouter",
+			id: "mock/flash",
+			responses: [
+				async () => {
+					started.resolve();
+					await finish.promise;
+					return { content: ["first"] };
+				},
+			],
+			handler: { content: ["second"] },
+		});
+		const gw = await boot(limiter, mock);
+		try {
+			const first = chat(gw.url, false);
+			await started.promise;
+			const second = chat(gw.url, false);
+			// The second request is queued once the pool reports a waiter.
+			let pool: { limit: number; active: number; waiting: number } | undefined;
+			while (pool?.waiting !== 1) {
+				const body = (await (await fetch(`${gw.url}/v1/concurrency`)).json()) as {
+					limits: Record<string, number>;
+					models: Record<string, { limit: number; active: number; waiting: number }>;
+				};
+				expect(body.limits).toEqual({ openrouter: 1 });
+				pool = body.models["openrouter/mock/flash"];
+			}
+			expect(pool).toMatchObject({ limit: 1, active: 1, waiting: 1 });
+			finish.resolve();
+			expect((await first).headers.get("x-queue-wait-ms")).toBe("0");
+			const queued = await second;
+			expect(queued.status).toBe(200);
+			expect(Number(queued.headers.get("x-queue-wait-ms"))).toBeGreaterThan(0);
 		} finally {
 			await gw.close();
 		}

@@ -25,11 +25,23 @@ export type GatewaySlotRelease = () => void;
 
 interface Waiter {
 	grant: (release: GatewaySlotRelease) => void;
+	/** `Date.now()` when the request joined the queue. */
+	readonly since: number;
 }
 
 interface Pool {
+	readonly limit: number;
 	active: number;
 	readonly waiters: Waiter[];
+}
+
+/** One `provider/model` pool as `GET /v1/concurrency` reports it. */
+export interface GatewayConcurrencyPoolSnapshot {
+	limit: number;
+	active: number;
+	waiting: number;
+	/** How long the oldest queued request has waited; 0 with an empty queue. */
+	oldestWaitMs: number;
 }
 
 /**
@@ -75,7 +87,7 @@ export class GatewayConcurrencyLimiter {
 		const key = `${model.provider}/${model.id}`;
 		let pool = this.#pools.get(key);
 		if (!pool) {
-			pool = { active: 0, waiters: [] };
+			pool = { limit, active: 0, waiters: [] };
 			this.#pools.set(key, pool);
 		}
 		if (pool.active < limit) {
@@ -98,6 +110,7 @@ export class GatewayConcurrencyLimiter {
 			signal.removeEventListener("abort", onAbort);
 		};
 		const waiter: Waiter = {
+			since: Date.now(),
 			grant: release => {
 				cleanup();
 				resolve(release);
@@ -108,10 +121,23 @@ export class GatewayConcurrencyLimiter {
 		return promise;
 	}
 
-	/** Requests holding a slot and requests waiting for one, per `provider/model`. */
-	snapshot(): Map<string, { active: number; waiting: number }> {
-		const out = new Map<string, { active: number; waiting: number }>();
-		for (const [key, pool] of this.#pools) out.set(key, { active: pool.active, waiting: pool.waiters.length });
+	/** Configured slots per model, keyed by provider. */
+	get limits(): ReadonlyMap<string, number> {
+		return this.#limits;
+	}
+
+	/** Pools with requests running or queued, per `provider/model`; idle pools are absent. */
+	snapshot(now = Date.now()): Map<string, GatewayConcurrencyPoolSnapshot> {
+		const out = new Map<string, GatewayConcurrencyPoolSnapshot>();
+		for (const [key, pool] of this.#pools) {
+			const oldest = pool.waiters[0];
+			out.set(key, {
+				limit: pool.limit,
+				active: pool.active,
+				waiting: pool.waiters.length,
+				oldestWaitMs: oldest ? now - oldest.since : 0,
+			});
+		}
 		return out;
 	}
 

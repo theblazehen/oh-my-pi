@@ -12,6 +12,7 @@
  *   GET  /healthz                          → unauth; ok + version
  *   GET  /v1/usage                         → aggregated provider usage (5-min per-credential cache via AuthStorage)
  *   GET  /v1/usage/history                 → recorded usage-limit snapshots (broker history; sinceMs/provider filters)
+ *   GET  /v1/concurrency                   → per-model slot limits, running and queued requests (--concurrency)
  *   GET  /v1/credentials/check             → per-credential auth probe (diagnose 401s in a multi-account pool)
  *   GET  /v1/models                        → list known models from the registry
  *   POST /v1/chat/completions              → OpenAI chat-completions in/out
@@ -256,6 +257,26 @@ function concurrencyShedResponse(formatError: (status: number, type: string, mes
 	return response;
 }
 
+/** One line per chat request once its provider slot is released: queue wait and slot time, for load analysis. */
+function logRequestSettled(fields: {
+	requestId: string;
+	model: Model<Api>;
+	queueWaitMs: number;
+	admittedAt: number;
+	outcome: string;
+	peer: string;
+}): void {
+	logger.info("auth-gateway request settled", {
+		requestId: fields.requestId,
+		resolvedProvider: fields.model.provider,
+		resolvedModel: fields.model.id,
+		queueWaitMs: fields.queueWaitMs,
+		durationMs: Math.round(performance.now() - fields.admittedAt),
+		outcome: fields.outcome,
+		peer: fields.peer,
+	});
+}
+
 /** Route that serves each non-chat catalog kind the gateway advertises. */
 const KIND_ROUTES: Partial<Record<ModelKind, string>> = {
 	judge: "POST /v1/systemone",
@@ -380,9 +401,21 @@ async function handleFormatEndpoint(
 	if ("status" in apiKey) return route.module.formatError(apiKey.status, apiKey.type, apiKey.message);
 
 	// Wait for a provider slot before anything that must be released.
+	const queueStartedAt = performance.now();
 	const admission = bootOpts.concurrency ? await bootOpts.concurrency.acquire(model, controller.signal) : undefined;
+	const queueWaitMs = Math.round(performance.now() - queueStartedAt);
 	if (admission === "aborted") return clientClosedResponse(route);
-	if (admission === "queue_timeout") return concurrencyShedResponse(route.module.formatError);
+	if (admission === "queue_timeout") {
+		logger.warn("auth-gateway queue timeout", {
+			requestId,
+			resolvedProvider: model.provider,
+			resolvedModel: model.id,
+			queueWaitMs,
+			peer,
+		});
+		return concurrencyShedResponse(route.module.formatError);
+	}
+	const admittedAt = performance.now();
 
 	const streamOpts = buildStreamOptions(parsed, model.api, controller.signal);
 	if (bootOpts.fetch) streamOpts.fetch = bootOpts.fetch;
@@ -419,13 +452,16 @@ async function handleFormatEndpoint(
 		resolvedProvider: model.provider,
 		resolvedModel: model.id,
 		stream: parsed.stream,
+		queueWaitMs,
 		peer,
 	});
 
 	if (!parsed.stream) {
+		let outcome = "thrown";
 		try {
 			if (controller.signal.aborted) return clientClosedResponse(route);
 			const message = await completeSimple(model, parsed.context, streamOpts);
+			outcome = message.stopReason;
 			recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined);
 			if (message.stopReason === "aborted" || message.stopReason === "error") {
 				const errorMessage =
@@ -446,7 +482,7 @@ async function handleFormatEndpoint(
 			return json(
 				200,
 				route.module.encodeResponse(message, parsed.modelId),
-				gatewayResponseHeaders(model, { requestId, costUsd: message.usage.cost.total, startedAt }),
+				gatewayResponseHeaders(model, { requestId, costUsd: message.usage.cost.total, startedAt, queueWaitMs }),
 			);
 		} catch (error) {
 			if (controller.signal.aborted) return clientClosedResponse(route);
@@ -462,6 +498,7 @@ async function handleFormatEndpoint(
 			// client gone — is done with the provider state here.
 			lease.release();
 			admission?.();
+			logRequestSettled({ requestId, model, queueWaitMs, admittedAt, outcome, peer });
 		}
 	}
 
@@ -469,6 +506,7 @@ async function handleFormatEndpoint(
 	// event stream and is released when the turn settles. Until that handoff
 	// happens, the `finally` below owns it.
 	let streamOwnsLease = false;
+	let outcome = "failed";
 	try {
 		let events: AssistantMessageEventStream;
 		try {
@@ -482,13 +520,15 @@ async function handleFormatEndpoint(
 		if (controller.signal.aborted) return clientClosedResponse(route);
 		void events
 			.result()
-			.then(message =>
-				recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined),
-			)
+			.then(message => {
+				outcome = message.stopReason;
+				recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined);
+			})
 			.catch(() => {})
 			.finally(() => {
 				lease.release();
 				admission?.();
+				logRequestSettled({ requestId, model, queueWaitMs, admittedAt, outcome, peer });
 			});
 		streamOwnsLease = true;
 
@@ -503,7 +543,7 @@ async function handleFormatEndpoint(
 		return new Response(sseStream, {
 			status: 200,
 			headers: {
-				...gatewayResponseHeaders(model, { requestId }),
+				...gatewayResponseHeaders(model, { requestId, queueWaitMs }),
 				"Content-Type": "text/event-stream; charset=utf-8",
 				"Cache-Control": "no-cache",
 				Connection: "keep-alive",
@@ -587,9 +627,21 @@ async function handlePiNative(
 	if ("status" in apiKey) return piNative.formatError(apiKey.status, apiKey.type, apiKey.message);
 
 	// Wait for a provider slot before anything that must be released.
+	const queueStartedAt = performance.now();
 	const admission = bootOpts.concurrency ? await bootOpts.concurrency.acquire(model, controller.signal) : undefined;
+	const queueWaitMs = Math.round(performance.now() - queueStartedAt);
 	if (admission === "aborted") return aborted();
-	if (admission === "queue_timeout") return concurrencyShedResponse(piNative.formatError);
+	if (admission === "queue_timeout") {
+		logger.warn("auth-gateway queue timeout", {
+			requestId,
+			resolvedProvider: model.provider,
+			resolvedModel: model.id,
+			queueWaitMs,
+			peer,
+		});
+		return concurrencyShedResponse(piNative.formatError);
+	}
+	const admittedAt = performance.now();
 
 	// Per-session provider learning, owned by this gateway instance. The map is
 	// non-serializable, so `parseRequest` cannot accept one from the wire and
@@ -648,13 +700,16 @@ async function handlePiNative(
 		resolvedProvider: model.provider,
 		resolvedModel: model.id,
 		stream: parsed.stream,
+		queueWaitMs,
 		peer,
 	});
 
 	if (!parsed.stream) {
+		let outcome = "thrown";
 		try {
 			if (controller.signal.aborted) return aborted();
 			const message = await completeSimple(model, parsed.context, streamOpts);
+			outcome = message.stopReason;
 			recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined);
 			if (message.stopReason === "aborted" || message.stopReason === "error") {
 				const errorMessage =
@@ -675,7 +730,7 @@ async function handlePiNative(
 			return json(
 				200,
 				{ message },
-				gatewayResponseHeaders(model, { requestId, costUsd: message.usage.cost.total, startedAt }),
+				gatewayResponseHeaders(model, { requestId, costUsd: message.usage.cost.total, startedAt, queueWaitMs }),
 			);
 		} catch (error) {
 			if (controller.signal.aborted) return aborted();
@@ -687,6 +742,7 @@ async function handlePiNative(
 			// client gone — is done with the provider state here.
 			lease.release();
 			admission?.();
+			logRequestSettled({ requestId, model, queueWaitMs, admittedAt, outcome, peer });
 		}
 	}
 
@@ -694,6 +750,7 @@ async function handlePiNative(
 	// event stream and is released when the turn settles. Until that handoff
 	// happens, the `finally` below owns it.
 	let streamOwnsLease = false;
+	let outcome = "failed";
 	try {
 		let events: AssistantMessageEventStream;
 		try {
@@ -707,13 +764,15 @@ async function handlePiNative(
 		if (controller.signal.aborted) return aborted();
 		void events
 			.result()
-			.then(message =>
-				recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined),
-			)
+			.then(message => {
+				outcome = message.stopReason;
+				recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined);
+			})
 			.catch(() => {})
 			.finally(() => {
 				lease.release();
 				admission?.();
+				logRequestSettled({ requestId, model, queueWaitMs, admittedAt, outcome, peer });
 			});
 		streamOwnsLease = true;
 
@@ -728,7 +787,7 @@ async function handlePiNative(
 		return new Response(sseStream, {
 			status: 200,
 			headers: {
-				...gatewayResponseHeaders(model, { requestId }),
+				...gatewayResponseHeaders(model, { requestId, queueWaitMs }),
 				"Content-Type": "text/event-stream; charset=utf-8",
 				"Cache-Control": "no-cache",
 				Connection: "keep-alive",
@@ -741,6 +800,20 @@ async function handlePiNative(
 			admission?.();
 		}
 	}
+}
+
+/**
+ * `GET /v1/concurrency` — configured slot limits and, per `provider/model`
+ * pool that has requests running or queued, how many hold a slot, how many
+ * wait, and how long the oldest has waited. Idle pools are absent.
+ */
+function handleConcurrency(opts: AuthGatewayRouteOptions): Response {
+	const limiter = opts.concurrency;
+	return json(200, {
+		generatedAt: Date.now(),
+		limits: limiter ? Object.fromEntries(limiter.limits) : {},
+		models: limiter ? Object.fromEntries(limiter.snapshot()) : {},
+	});
 }
 
 /**
@@ -849,6 +922,7 @@ const VIDEO_JOB_PATH = /^\/v1\/videos\/([^/]+)(\/content)?$/;
 const LOGGABLE_PATHS: Record<string, true> = {
 	"/v1/usage": true,
 	"/v1/usage/history": true,
+	"/v1/concurrency": true,
 	"/v1/credentials/check": true,
 	"/v1/pi/stream": true,
 	"/v1/systemone": true,
@@ -918,6 +992,9 @@ export function createAuthGatewayRouter(opts: AuthGatewayRouteOptions): AuthGate
 			// same client struct.
 			if (req.method === "GET" && pathname === "/v1/usage") {
 				return await handleUsage(opts, req.signal);
+			}
+			if (req.method === "GET" && pathname === "/v1/concurrency") {
+				return handleConcurrency(opts);
 			}
 			if (req.method === "GET" && pathname === "/v1/usage/history") {
 				return await handleUsageHistory(opts, new URL(req.url), req.signal);
