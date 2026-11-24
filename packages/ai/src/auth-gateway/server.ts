@@ -241,6 +241,21 @@ function clientClosedResponse(route: { module: FormatModule }): Response {
 	return route.module.formatError(499, "request_aborted", "client closed request");
 }
 
+/**
+ * A request the concurrency queue held past its timeout, marked the way
+ * LiteLLM marks admission 429s so omp clients skip transport retries and back
+ * off at turn level.
+ */
+function concurrencyShedResponse(formatError: (status: number, type: string, message: string) => Response): Response {
+	const response = formatError(
+		429,
+		"rate_limit_error",
+		"Every concurrent slot for this model stayed busy past the gateway queue timeout",
+	);
+	response.headers.set("rate_limit_type", "max_parallel_requests");
+	return response;
+}
+
 /** Route that serves each non-chat catalog kind the gateway advertises. */
 const KIND_ROUTES: Partial<Record<ModelKind, string>> = {
 	judge: "POST /v1/systemone",
@@ -364,6 +379,11 @@ async function handleFormatEndpoint(
 	if (controller.signal.aborted) return clientClosedResponse(route);
 	if ("status" in apiKey) return route.module.formatError(apiKey.status, apiKey.type, apiKey.message);
 
+	// Wait for a provider slot before anything that must be released.
+	const admission = bootOpts.concurrency ? await bootOpts.concurrency.acquire(model, controller.signal) : undefined;
+	if (admission === "aborted") return clientClosedResponse(route);
+	if (admission === "queue_timeout") return concurrencyShedResponse(route.module.formatError);
+
 	const streamOpts = buildStreamOptions(parsed, model.api, controller.signal);
 	if (bootOpts.fetch) streamOpts.fetch = bootOpts.fetch;
 	// Per-session provider learning (sticky strict-tools / fast-mode / thinking
@@ -441,6 +461,7 @@ async function handleFormatEndpoint(
 			// Every non-streaming outcome — answered, upstream error, thrown,
 			// client gone — is done with the provider state here.
 			lease.release();
+			admission?.();
 		}
 	}
 
@@ -465,7 +486,10 @@ async function handleFormatEndpoint(
 				recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined),
 			)
 			.catch(() => {})
-			.finally(() => lease.release());
+			.finally(() => {
+				lease.release();
+				admission?.();
+			});
 		streamOwnsLease = true;
 
 		const sseStream = route.module.encodeStream(events, parsed.modelId, parsed.options, {
@@ -490,7 +514,10 @@ async function handleFormatEndpoint(
 			},
 		});
 	} finally {
-		if (!streamOwnsLease) lease.release();
+		if (!streamOwnsLease) {
+			lease.release();
+			admission?.();
+		}
 	}
 }
 
@@ -558,6 +585,11 @@ async function handlePiNative(
 	const apiKey = await resolveGatewayApiKey(bootOpts.storage, model, sessionId, controller.signal, peer);
 	if (controller.signal.aborted) return aborted();
 	if ("status" in apiKey) return piNative.formatError(apiKey.status, apiKey.type, apiKey.message);
+
+	// Wait for a provider slot before anything that must be released.
+	const admission = bootOpts.concurrency ? await bootOpts.concurrency.acquire(model, controller.signal) : undefined;
+	if (admission === "aborted") return aborted();
+	if (admission === "queue_timeout") return concurrencyShedResponse(piNative.formatError);
 
 	// Per-session provider learning, owned by this gateway instance. The map is
 	// non-serializable, so `parseRequest` cannot accept one from the wire and
@@ -654,6 +686,7 @@ async function handlePiNative(
 			// Every non-streaming outcome — answered, upstream error, thrown,
 			// client gone — is done with the provider state here.
 			lease.release();
+			admission?.();
 		}
 	}
 
@@ -678,7 +711,10 @@ async function handlePiNative(
 				recordGatewayUsage(bootOpts.storage, model, client, message.usage, message.timestamp || undefined),
 			)
 			.catch(() => {})
-			.finally(() => lease.release());
+			.finally(() => {
+				lease.release();
+				admission?.();
+			});
 		streamOwnsLease = true;
 
 		const sseStream = piNative.encodeStream(events, parsed.modelId, parsed.options, {
@@ -700,7 +736,10 @@ async function handlePiNative(
 			},
 		});
 	} finally {
-		if (!streamOwnsLease) lease.release();
+		if (!streamOwnsLease) {
+			lease.release();
+			admission?.();
+		}
 	}
 }
 

@@ -39,6 +39,8 @@ import {
 	type AuthGatewayApiKey,
 	type AuthGatewayApiKeyScope,
 	DEFAULT_AUTH_GATEWAY_BIND,
+	GatewayConcurrencyLimiter,
+	parseGatewayConcurrencyLimits,
 	startAuthGateway,
 } from "@oh-my-pi/pi-ai/auth-gateway";
 import { type GeneratedProvider, getBundledModels, getEffectiveTokenCost } from "@oh-my-pi/pi-catalog/models";
@@ -73,6 +75,8 @@ export interface AuthGatewayCommandArgs {
 		bind?: string;
 		/** `serve`: explicitly trusted models.yml; absent leaves local model overrides disabled. */
 		models?: string;
+		/** `serve`: per-model concurrent request limits as `provider=limit` pairs; excess requests queue. */
+		concurrency?: string;
 		regenerate?: boolean;
 		/** Named API key `token` prints, creates, rotates (`regenerate`) or removes (`revoke`). */
 		name?: string;
@@ -315,6 +319,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		);
 	}
 	const bind = flags.bind ?? DEFAULT_AUTH_GATEWAY_BIND;
+	const concurrencyLimits = flags.concurrency ? parseGatewayConcurrencyLimits(flags.concurrency) : undefined;
 	const gatewayToken = flags.noAuth ? null : await ensureToken();
 	const apiKeysFile = getGatewayApiKeysFilePath();
 	let apiKeys: readonly AuthGatewayApiKey[] = flags.noAuth ? [] : await readGatewayApiKeys(apiKeysFile);
@@ -375,6 +380,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		listModels: () => modelById.values(),
 		excludeProviders: new Set(cfgDisabledProviders.get(settings)),
 		usageHistory: async (query, signal) => (await client.fetchUsageHistory(query, signal)).entries,
+		concurrency: concurrencyLimits ? new GatewayConcurrencyLimiter(concurrencyLimits) : undefined,
 	});
 	process.stdout.write(`auth-gateway listening on ${handle.url}\n`);
 	if (gatewayToken) {

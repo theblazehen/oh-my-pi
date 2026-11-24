@@ -30,6 +30,10 @@ export default class AuthGateway extends Command {
 		models: Flags.string({
 			description: "Explicitly trusted models.yml for custom providers and routing overrides (serve)",
 		}),
+		concurrency: Flags.string({
+			description:
+				"Per-model concurrent request limits for `serve`, as provider=limit pairs (e.g. ratecloud=4,arliai=2); excess requests wait in arrival order",
+		}),
 		regenerate: Flags.boolean({ description: "Regenerate the gateway bearer token, or the --name key (token)" }),
 		name: Flags.string({
 			description:
@@ -59,6 +63,7 @@ export default class AuthGateway extends Command {
 		'# Serve the same routes as JSON lines on stdin/stdout with your own credentials\n  echo \'{"id":1,"path":"/v1/chat/completions","body":{"model":"@smol","messages":[{"role":"user","content":"hi"}]}}\' | omp auth-gateway stdio',
 		"# Boot on a non-default port\n  omp auth-gateway serve --bind=127.0.0.1:4000",
 		"# Add operator-configured providers with broker-held keys\n  omp auth-gateway serve --models=/etc/omp/gateway-models.yml",
+		"# Queue requests beyond a provider's 4 concurrent slots per model\n  omp auth-gateway serve --concurrency=ratecloud=4",
 		"# Trust client IP headers from a trusted reverse proxy\n  omp auth-gateway serve --trust-proxy-headers",
 		"# Print the gateway bearer token (creates one on first run)\n  omp auth-gateway token",
 		"# Rotate the gateway bearer token\n  omp auth-gateway token --regenerate",
@@ -88,6 +93,7 @@ export default class AuthGateway extends Command {
 				regenerate: flags.regenerate,
 				name: flags.name,
 				revoke: flags.revoke,
+				concurrency: flags.concurrency,
 				scope: flags.scope as AuthGatewayApiKeyScope | undefined,
 				noAuth: flags["no-auth"],
 				trustProxyHeaders: flags["trust-proxy-headers"],

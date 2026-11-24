@@ -17,6 +17,7 @@ import type { Api, FetchImpl, Model, Usage } from "../types";
 import type { ClientUsageIdentity, UsageHistoryEntry, UsageHistoryQuery } from "../usage";
 import { extractProviderRetryHint } from "../utils/retry-after";
 import type { AuthGatewayServerOptions } from "./types";
+import type { GatewayConcurrencyLimiter } from "./concurrency";
 
 export type ModelResolver = (modelId: string) => Model<Api> | undefined;
 
@@ -42,6 +43,8 @@ export interface AuthGatewayRouteOptions {
 	usageHistory?: (query: UsageHistoryQuery, signal: AbortSignal) => Promise<UsageHistoryEntry[]>;
 	/** Upstream transport for every provider call; defaults to global `fetch`. Test seam. */
 	fetch?: FetchImpl;
+	/** Per-model slot limits for chat routes; absent admits every request at once. */
+	concurrency?: GatewayConcurrencyLimiter;
 }
 
 /** The HTTP server's options: the routes' plus its listener and inbound auth. */
