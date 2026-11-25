@@ -6,6 +6,7 @@ import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import {
 	GatewayConcurrencyLimiter,
 	parseGatewayConcurrencyLimits,
+	parseGatewayQueueTimeout,
 	startAuthGateway,
 } from "@oh-my-pi/pi-ai/auth-gateway";
 import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
@@ -85,6 +86,14 @@ describe("GatewayConcurrencyLimiter", () => {
 		expect(() => parseGatewayConcurrencyLimits("ratecloud=0")).toThrow();
 		expect(() => parseGatewayConcurrencyLimits("ratecloud=1.5")).toThrow();
 		expect(() => parseGatewayConcurrencyLimits("=4")).toThrow();
+	});
+
+	it("accepts --queue-timeout only as whole seconds the open socket survives", () => {
+		expect(parseGatewayQueueTimeout("240")).toBe(240_000);
+		expect(parseGatewayQueueTimeout("250")).toBe(250_000);
+		expect(() => parseGatewayQueueTimeout("251")).toThrow();
+		expect(() => parseGatewayQueueTimeout("0")).toThrow();
+		expect(() => parseGatewayQueueTimeout("1.5")).toThrow();
 	});
 });
 

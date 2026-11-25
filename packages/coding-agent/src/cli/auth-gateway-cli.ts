@@ -41,6 +41,7 @@ import {
 	DEFAULT_AUTH_GATEWAY_BIND,
 	GatewayConcurrencyLimiter,
 	parseGatewayConcurrencyLimits,
+	parseGatewayQueueTimeout,
 	startAuthGateway,
 } from "@oh-my-pi/pi-ai/auth-gateway";
 import { type GeneratedProvider, getBundledModels, getEffectiveTokenCost } from "@oh-my-pi/pi-catalog/models";
@@ -77,6 +78,8 @@ export interface AuthGatewayCommandArgs {
 		models?: string;
 		/** `serve`: per-model concurrent request limits as `provider=limit` pairs; excess requests queue. */
 		concurrency?: string;
+		/** `serve`: seconds a queued request may wait for a slot before it is shed. */
+		queueTimeout?: string;
 		regenerate?: boolean;
 		/** Named API key `token` prints, creates, rotates (`regenerate`) or removes (`revoke`). */
 		name?: string;
@@ -320,6 +323,10 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	}
 	const bind = flags.bind ?? DEFAULT_AUTH_GATEWAY_BIND;
 	const concurrencyLimits = flags.concurrency ? parseGatewayConcurrencyLimits(flags.concurrency) : undefined;
+	if (flags.queueTimeout !== undefined && !concurrencyLimits) {
+		throw new Error("--queue-timeout only applies with --concurrency");
+	}
+	const queueTimeoutMs = flags.queueTimeout === undefined ? undefined : parseGatewayQueueTimeout(flags.queueTimeout);
 	const gatewayToken = flags.noAuth ? null : await ensureToken();
 	const apiKeysFile = getGatewayApiKeysFilePath();
 	let apiKeys: readonly AuthGatewayApiKey[] = flags.noAuth ? [] : await readGatewayApiKeys(apiKeysFile);
@@ -380,7 +387,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		listModels: () => modelById.values(),
 		excludeProviders: new Set(cfgDisabledProviders.get(settings)),
 		usageHistory: async (query, signal) => (await client.fetchUsageHistory(query, signal)).entries,
-		concurrency: concurrencyLimits ? new GatewayConcurrencyLimiter(concurrencyLimits) : undefined,
+		concurrency: concurrencyLimits ? new GatewayConcurrencyLimiter(concurrencyLimits, queueTimeoutMs) : undefined,
 	});
 	process.stdout.write(`auth-gateway listening on ${handle.url}\n`);
 	if (gatewayToken) {

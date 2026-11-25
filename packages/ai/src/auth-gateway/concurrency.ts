@@ -17,6 +17,24 @@ import type { Api, Model } from "../types";
 /** Waiting longer than this sheds the request; well inside clients' first-event watchdogs. */
 export const DEFAULT_GATEWAY_QUEUE_TIMEOUT_MS = 120_000;
 
+/**
+ * Longest allowed queue wait. A queued request has sent no response bytes yet,
+ * so the server's 255 s socket idle timeout and Bun's ~300 s pre-response fetch
+ * timeout on clients would cut it first.
+ */
+export const MAX_GATEWAY_QUEUE_TIMEOUT_MS = 250_000;
+
+/** Parse `--queue-timeout` seconds into milliseconds, within 1..250 s. */
+export function parseGatewayQueueTimeout(spec: string): number {
+	const seconds = Number(spec.trim());
+	if (!/^\d+$/.test(spec.trim()) || seconds < 1 || seconds * 1000 > MAX_GATEWAY_QUEUE_TIMEOUT_MS) {
+		throw new Error(
+			`Invalid --queue-timeout "${spec}": expected whole seconds from 1 to ${MAX_GATEWAY_QUEUE_TIMEOUT_MS / 1000}`,
+		);
+	}
+	return seconds * 1000;
+}
+
 /** Why a request was not admitted. */
 export type GatewayAdmissionRejection = "queue_timeout" | "aborted";
 
