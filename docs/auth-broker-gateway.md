@@ -178,7 +178,7 @@ omp auth-gateway keys                                   # names and scopes, neve
 ```
 
 - **Presenting a key.** Clients send it as `Authorization: Bearer <key>` (OpenAI SDKs, Claude Code's `ANTHROPIC_AUTH_TOKEN`) or `x-api-key: <key>` (Anthropic SDKs, Claude Code's `ANTHROPIC_API_KEY`). The unnamed operator token is accepted the same way.
-- **Scope.** An `inference` key reaches only the inference routes and `/v1/models`; every other route — `/v1/usage` and `/v1/credentials/check`, which report account identities and usage, and any route the gateway adds later — answers `403`. A `full` key and the unnamed operator token reach every route.
+- **Scope.** An `inference` key reaches only the inference routes and `/v1/models`; every other route — `/v1/usage`, `/v1/usage/clients` and `/v1/credentials/check`, which report account identities and usage, and any route the gateway adds later — answers `403`. A `full` key and the unnamed operator token reach every route.
 - **Attribution.** Usage from a request a named key admitted is recorded under install id `gateway-key:<name>` with hostname `<name>`, whatever `x-omp-*` identity headers the client sends (its `x-omp-app` label is kept). `omp usage clients` therefore reports per-key burn.
 - **Live reload.** `serve` re-reads the keys file every 10 s, so new, rotated, re-scoped, and revoked keys apply without a restart. Writes are atomic; a malformed file is logged and the previous key set stays in force. `--no-auth` ignores the file.
 - **What scope does not cover.** Inference responses carry no account identity from the gateway itself, but upstream provider error text is relayed as-is and can name provider-side identifiers (for example a Google Cloud project number).
@@ -205,6 +205,7 @@ omp auth-gateway keys                                   # names and scopes, neve
 | ------ | ----------------------- | ------ | ------------------------------------------------------------ |
 | `GET`  | `/healthz`              | none   | Liveness + version                                           |
 | `GET`  | `/v1/usage`             | bearer | Aggregate `UsageReport[]` (proxied through `AuthStorage`)    |
+| `GET`  | `/v1/usage/clients`     | bearer | Per-client usage since optional `sinceMs` (broker's summary); named keys appear as `gateway-key:<name>` |
 | `GET`  | `/v1/models`            | bearer | Registry catalog filtered to providers with credentials |
 | `GET`  | `/v1/credentials/check` | bearer | Per-credential auth health probe                             |
 | `POST` | `/v1/chat/completions`  | bearer | OpenAI Chat Completions wire format                          |

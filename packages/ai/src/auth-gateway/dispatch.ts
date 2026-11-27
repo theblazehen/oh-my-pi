@@ -14,7 +14,7 @@ import * as AIError from "../error";
 import { classifyGatewayError, type GatewayErrorClassification } from "../error/gateway";
 import { isUsageLimitOutcome } from "../error/rate-limit";
 import type { Api, FetchImpl, Model, Usage } from "../types";
-import type { ClientUsageIdentity, UsageHistoryEntry, UsageHistoryQuery } from "../usage";
+import type { ClientUsageClientSummary, ClientUsageIdentity, UsageHistoryEntry, UsageHistoryQuery } from "../usage";
 import { extractProviderRetryHint } from "../utils/retry-after";
 import type { AuthGatewayServerOptions } from "./types";
 import type { GatewayConcurrencyLimiter } from "./concurrency";
@@ -41,6 +41,12 @@ export interface AuthGatewayRouteOptions {
 	 * without this the route serves the store's local history.
 	 */
 	usageHistory?: (query: UsageHistoryQuery, signal: AbortSignal) => Promise<UsageHistoryEntry[]>;
+	/**
+	 * Per-client usage aggregates since a time for `/v1/usage/clients`, read from
+	 * the broker for the same reason as {@link usageHistory}; without this the
+	 * route serves the store's local summary.
+	 */
+	clientUsage?: (sinceMs: number, signal: AbortSignal) => Promise<ClientUsageClientSummary[]>;
 	/** Upstream transport for every provider call; defaults to global `fetch`. Test seam. */
 	fetch?: FetchImpl;
 	/** Per-model slot limits for chat routes; absent admits every request at once. */

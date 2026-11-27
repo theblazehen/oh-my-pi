@@ -121,6 +121,7 @@ describe("auth-gateway named API keys", () => {
 
 		const inference = { "x-api-key": "laptop-key" };
 		expect((await get("/v1/usage", inference)).status).toBe(403);
+		expect((await get("/v1/usage/clients", inference)).status).toBe(403);
 		expect((await get("/v1/credentials/check", inference)).status).toBe(403);
 		expect((await get("/v1/not-a-route", inference)).status).toBe(403);
 		expect((await get("/v1/models", inference)).status).toBe(200);

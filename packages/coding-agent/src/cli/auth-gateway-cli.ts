@@ -387,6 +387,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		listModels: () => modelById.values(),
 		excludeProviders: new Set(cfgDisabledProviders.get(settings)),
 		usageHistory: async (query, signal) => (await client.fetchUsageHistory(query, signal)).entries,
+		clientUsage: async (sinceMs, signal) => (await client.fetchClientUsageSummary({ sinceMs }, signal)).clients,
 		concurrency: concurrencyLimits ? new GatewayConcurrencyLimiter(concurrencyLimits, queueTimeoutMs) : undefined,
 	});
 	process.stdout.write(`auth-gateway listening on ${handle.url}\n`);
